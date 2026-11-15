@@ -28,13 +28,27 @@ what a value means, is a major bump. Readers accept their own major and any mino
 own. This addition keeps every existing enum value unchanged (``ProductFamily`` gains no
 ``unknown``: ambiguity lives only in findings, so it can never reach a product or offer) and
 adds only new types, so the contract schema stays 1.0.
+
+Which version governs what: enums shared with the contract (``ProductFamily``,
+``LoanPurpose``, ``RateAvailability``, ``SourceRelationshipKind``, ``FetchMethod``,
+``EvidenceKind``) stay under the contract ``schema_version``; changing one is a contract
+change, whatever this module says. The taxonomy version governs only what this module and the
+four new enums define: ``ProductScope``, ``OutOfScopeProduct``, ``CollectionMethod``,
+``FindingReviewState``, ``PURPOSES_BY_FAMILY``, the collection mapping, and the finding
+rules. A finding records both: ``schema_version`` (the record shape) and ``taxonomy_version``
+(the vocabulary it was written under). Both are required, never defaulted from the reader.
+
+Limits, by design: an ``unknown`` finding may carry no evidence, since it asserts nothing; every
+other finding must keep at least one citation. This layer does not check that a finding's
+evidence belongs to its ``source_id`` (no artifact store or fetch run is in scope here); the
+pipeline that creates findings must bind them.
 """
 
 import re
 from collections.abc import Mapping
-from typing import Annotated, Self
+from typing import Annotated, Any, Self
 
-from pydantic import Field, model_validator
+from pydantic import AfterValidator, BeforeValidator, Field, model_validator
 
 from cu_rates.contracts.base import (
     CharterNumber,
@@ -99,6 +113,12 @@ def evidence_kinds_for(method: CollectionMethod) -> frozenset[EvidenceKind]:
     return frozenset(kind for (_, kind), candidate in _COLLECTION.items() if candidate is method)
 
 
+def _reject_padding(value: Any) -> Any:
+    if isinstance(value, str) and value != value.strip():
+        raise ValueError("taxonomy_version must not have surrounding whitespace")
+    return value
+
+
 def _check_taxonomy_version(value: str) -> str:
     match = _VERSION_RE.fullmatch(value)
     if match is None:
@@ -108,6 +128,11 @@ def _check_taxonomy_version(value: str) -> str:
             f"unsupported taxonomy version {value}; this package reads up to {TAXONOMY_VERSION}"
         )
     return value
+
+
+TaxonomyVersion = Annotated[
+    str, BeforeValidator(_reject_padding), AfterValidator(_check_taxonomy_version)
+]
 
 
 class ProductFinding(VersionedModel):
@@ -120,7 +145,7 @@ class ProductFinding(VersionedModel):
     """
 
     finding_id: Identifier
-    taxonomy_version: Text = TAXONOMY_VERSION
+    taxonomy_version: TaxonomyVersion
     institution_charter: CharterNumber
     source_id: Identifier
     product_id: Identifier | None = None
@@ -136,11 +161,6 @@ class ProductFinding(VersionedModel):
     reviewed_by: Text | None = None
     reviewed_at: UtcDatetime | None = None
     review_rationale: Text | None = None
-
-    @model_validator(mode="after")
-    def _version_supported(self) -> Self:
-        _check_taxonomy_version(self.taxonomy_version)
-        return self
 
     @model_validator(mode="after")
     def _scope_fixes_classification(self) -> Self:

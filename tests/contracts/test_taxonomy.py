@@ -5,6 +5,7 @@ checked to occur in the fixture bytes only so each finding cites text that is re
 """
 
 import hashlib
+import inspect
 import json
 from datetime import timedelta
 from decimal import Decimal
@@ -28,12 +29,14 @@ from cu_rates.contracts import (
     InstitutionSourceRelationship,
     LoanPurpose,
     MatchState,
+    NormalizedOffer,
     OutOfScopeProduct,
     PostIntroState,
     ProductFamily,
     ProductFinding,
     ProductScope,
     Provenance,
+    PublicationContext,
     PurchaseMortgageDetails,
     RateAvailability,
     RateSource,
@@ -91,6 +94,7 @@ def cited(case_id: str, phrase: str) -> Provenance:
 def finding(**overrides: Any) -> ProductFinding:
     kwargs: dict[str, Any] = {
         "schema_version": SV,
+        "taxonomy_version": TAXONOMY_VERSION,
         "finding_id": "finding-1",
         "institution_charter": CHARTER,
         "source_id": SOURCE_ID,
@@ -230,10 +234,17 @@ def test_who_hosts_a_source_does_not_choose_how_it_is_collected(
         min_interval_seconds=60,
         timeout_seconds=30,
     )
-    assert rel.kind is kind
-    assert (
-        collection_method(profile.method, source.evidence_kind) is not CollectionMethod.UNSUPPORTED
+    # The relationship is a different record and cannot reach the classifier: the method
+    # follows only the profile's fetch method and the source's evidence kind.
+    assert list(inspect.signature(collection_method).parameters) == [
+        "fetch_method",
+        "evidence_kind",
+    ]
+    assert rel.kind is kind and (rel.provider_id is not None) is hosted
+    assert collection_method(profile.method, source.evidence_kind) is (
+        collection_method(fetch, evidence)
     )
+    assert collection_method(fetch, evidence) is not CollectionMethod.UNSUPPORTED
 
 
 def test_relationship_and_collection_live_on_different_records() -> None:
@@ -241,13 +252,16 @@ def test_relationship_and_collection_live_on_different_records() -> None:
     assert "evidence_kind" not in InstitutionSourceRelationship.model_fields
     assert "kind" not in RateSource.model_fields and "provider_id" not in RateSource.model_fields
     assert "provider_id" not in FetchProfile.model_fields
-    provider = ServiceProvider(
-        schema_version=SV,
-        provider_id="vendor-1",
-        name="Example Platform",
-        kind=ProviderKind.LOAN_PLATFORM,
-    )
-    assert provider.provider_id == "vendor-1"  # provider ownership stays on the relationship
+    # Provider ownership lives on the relationship (and on ServiceProvider itself), never on
+    # the finding, the source, or the fetch profile.
+    assert "provider_id" in InstitutionSourceRelationship.model_fields
+    assert "provider_id" not in ProductFinding.model_fields
+    with pytest.raises(ValidationError, match="require a provider_id"):
+        relationship(kind=SourceRelationshipKind.PROVIDER_HOSTED, provider_id=None)
+    with pytest.raises(ValidationError, match="cannot name a provider"):
+        relationship(kind=SourceRelationshipKind.FIRST_PARTY, provider_id="vendor-1")
+    assert ServiceProvider.model_fields["provider_id"] is not None
+    assert ProviderKind.LOAN_PLATFORM in ProviderKind
 
 
 # --- findings: evidence without an offer ------------------------------------------------
@@ -357,11 +371,15 @@ def test_a_proposed_finding_carries_no_review_fields_and_unknown_cannot_be_verif
         finding(scope=ProductScope.UNKNOWN, family=None, rate_availability=None, **reviewed())
 
 
-def test_taxonomy_version_is_checked_and_findings_round_trip() -> None:
+def test_taxonomy_version_is_required_and_checked_and_findings_round_trip() -> None:
     assert finding().taxonomy_version == TAXONOMY_VERSION == "1.0"
-    for bad in ("2.0", "1.1", "1", "01.0", "x"):
+    for bad in ("2.0", "1.1", "1", "01.0", "x", " 1.0", "1.0 ", "1.0\n", ""):
         with pytest.raises(ValidationError, match="taxonomy"):
             finding(taxonomy_version=bad)
+    payload = finding().model_dump(mode="json")
+    del payload["taxonomy_version"]  # a record never silently claims the reader's version
+    with pytest.raises(ValidationError, match="taxonomy_version"):
+        ProductFinding.model_validate(payload)
     original = finding(**reviewed())
     assert ProductFinding.model_validate_json(original.model_dump_json()) == original
 
@@ -384,10 +402,12 @@ def row_matches(row: dict[str, Any], scenario_term: int) -> tuple[DimensionMatch
 
 def test_athol_style_is_a_static_html_public_mortgage_table() -> None:
     entry = case("athol-style")
+    row = entry["rows"][0]  # the catalog's own family and purpose, not re-typed here
     found = finding(
         label="Fixed-rate first mortgages",
+        family=ProductFamily(row["product_family"]),
         rate_availability=RateAvailability.PUBLIC_RATE,
-        purposes=(LoanPurpose.PURCHASE,),
+        purposes=(LoanPurpose(row["purpose"]),),
         evidence=(cited("athol-style", "6.375%"), cited("athol-style", "6.441%")),
     )
     assert found.evidence[0].artifact_id == entry["artifact_id"]
@@ -426,10 +446,6 @@ def test_a_stated_target_is_not_a_match_and_a_match_is_not_approval() -> None:
 
 def test_stoughton_style_yields_only_out_of_scope_findings_and_no_mortgage_claim() -> None:
     entry = case("stoughton-style")
-    kinds = {
-        "vehicle": OutOfScopeProduct.VEHICLE,
-        "unsecured_personal": OutOfScopeProduct.UNSECURED_PERSONAL,
-    }
     findings = [
         finding(
             finding_id=f"finding-{row['row_id']}",
@@ -437,7 +453,7 @@ def test_stoughton_style_yields_only_out_of_scope_findings_and_no_mortgage_claim
             scope=ProductScope.OUT_OF_SCOPE,
             family=None,
             rate_availability=None,
-            out_of_scope_product=kinds[row["product_family"]],
+            out_of_scope_product=OutOfScopeProduct(row["product_family"]),
             evidence=(cited("stoughton-style", f'id="{row["row_id"]}"'),),
         )
         for row in entry["rows"]
@@ -450,7 +466,10 @@ def test_stoughton_style_yields_only_out_of_scope_findings_and_no_mortgage_claim
     )
     assert entry["institution_offering"] == "not_inferred"
     assert all(f.rate_availability is None and f.family is None for f in findings)
-    assert {f.out_of_scope_product for f in findings} == set(kinds.values())
+    assert {f.out_of_scope_product for f in findings} == {
+        OutOfScopeProduct.VEHICLE,
+        OutOfScopeProduct.UNSECURED_PERSONAL,
+    }
 
 
 def test_worcester_style_keeps_quote_partner_link_and_second_mortgage_apart() -> None:
@@ -458,8 +477,12 @@ def test_worcester_style_keeps_quote_partner_link_and_second_mortgage_apart() ->
     quote_phrase = (
         "Call for a quote. This page does not advertise a first-mortgage note rate or APR."
     )
-    first = finding(evidence=(cited("worcester-style", quote_phrase),))
+    first = finding(
+        rate_availability=RateAvailability(entry["first_mortgage"]["availability"]),
+        evidence=(cited("worcester-style", quote_phrase),),
+    )
     assert first.rate_availability is RateAvailability.QUOTE_ONLY
+    assert entry["first_mortgage"]["published_rate"] is False
     assert finding(evidence=first.evidence, **reviewed()).verified_quote_only
 
     partner = finding(
@@ -476,10 +499,11 @@ def test_worcester_style_keeps_quote_partner_link_and_second_mortgage_apart() ->
         and partner.rate_availability is RateAvailability.UNKNOWN
     )
 
+    row = entry["second_mortgage_table"]["rows"][0]
     second = finding(
         finding_id="finding-second",
         label="Closed-end fixed second mortgages",
-        family=ProductFamily.HOME_EQUITY_LOAN,
+        family=ProductFamily(row["product_family"]),
         rate_availability=RateAvailability.PUBLIC_RATE,
         evidence=(cited("worcester-style", "7.250%"), cited("worcester-style", "7.418%")),
     )
@@ -492,8 +516,11 @@ def test_a_heloc_formula_without_a_verified_index_value_stays_incomplete() -> No
     assert post.state is PostIntroState.INCOMPLETE and "index_rate" in post.missing_inputs
 
 
-def test_findings_never_alter_publication_of_an_offer() -> None:
-    offer = purchase_offer()
-    before = evaluate_publication(offer, context(offer))
-    finding(**reviewed(), evidence=(cited("worcester-style", "7.250%"),))
-    assert evaluate_publication(offer, context(offer)) == before
+def test_a_finding_cannot_become_an_offer_or_enter_the_publication_context() -> None:
+    """Structural, not behavioral: nothing in publication can accept a finding."""
+    verified = finding(**reviewed())
+    with pytest.raises(ValidationError):
+        NormalizedOffer.model_validate(verified.model_dump())
+    assert not any("finding" in name for name in PublicationContext.model_fields)
+    for model in (PublicationContext, NormalizedOffer):
+        assert not any("ProductFinding" in str(f.annotation) for f in model.model_fields.values())
