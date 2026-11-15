@@ -1,0 +1,217 @@
+{
+  "schema_version": "1.0",
+  "offer_id": "offer-v1-001",
+  "institution_charter": 12345,
+  "product_id": "prod-30yr-fixed",
+  "source_id": "src-rates-page",
+  "status": "published",
+  "details": {
+    "kind": "purchase_mortgage",
+    "term_months": 360,
+    "rate_type": "fixed",
+    "arm": null,
+    "lock_days": 30
+  },
+  "scenario_id": "purchase_30y_fixed",
+  "scenario_matches": [
+    {
+      "dimension": "points",
+      "state": "matches",
+      "source_text": "0 points"
+    },
+    {
+      "dimension": "ltv",
+      "state": "unstated",
+      "source_text": null
+    }
+  ],
+  "note_rate": {
+    "value": "6.125",
+    "provenance": {
+      "artifact_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "locator": {
+        "kind": "html",
+        "selector_type": "css",
+        "selector": "#rates tr:nth-child(2) td.rate",
+        "normalized_text_sha256": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+      },
+      "source_text": "6.125%",
+      "extraction": {
+        "git_sha": "0123456789abcdef0123456789abcdef01234567",
+        "parser": {
+          "name": "synthetic-html",
+          "version": "1.0.0"
+        },
+        "configuration_sha256": "1111222233334444111122223333444411112222333344441111222233334444",
+        "normalization_version": "norm-1",
+        "rule_id": null
+      }
+    }
+  },
+  "apr": {
+    "value": "6.250",
+    "provenance": {
+      "artifact_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "locator": {
+        "kind": "json",
+        "pointer": "/rates/0/apr",
+        "response_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      },
+      "source_text": "6.250% APR",
+      "extraction": {
+        "git_sha": "0123456789abcdef0123456789abcdef01234567",
+        "parser": {
+          "name": "synthetic-html",
+          "version": "1.0.0"
+        },
+        "configuration_sha256": "1111222233334444111122223333444411112222333344441111222233334444",
+        "normalization_version": "norm-1",
+        "rule_id": null
+      }
+    }
+  },
+  "points": {
+    "value": "0",
+    "provenance": {
+      "artifact_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "locator": {
+        "kind": "pdf",
+        "page": 1,
+        "bbox": {
+          "x0": "72",
+          "y0": "540.5",
+          "x1": "180",
+          "y1": "552"
+        },
+        "extracted_text_sha256": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+      },
+      "source_text": "0 points",
+      "extraction": {
+        "git_sha": "0123456789abcdef0123456789abcdef01234567",
+        "parser": {
+          "name": "synthetic-html",
+          "version": "1.0.0"
+        },
+        "configuration_sha256": "1111222233334444111122223333444411112222333344441111222233334444",
+        "normalization_version": "norm-1",
+        "rule_id": null
+      }
+    }
+  },
+  "conditions": [],
+  "tiers": [],
+  "headline_is_as_low_as": false,
+  "effective_at": "2026-11-14T12:00:00Z",
+  "observed_at": "2026-11-15T12:00:00Z",
+  "published_at": "2026-11-15T07:30:00-05:00",
+  "valid_until": "2026-11-18T12:00:00Z",
+  "supporting_evidence": [
+    {
+      "artifact_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "locator": {
+        "kind": "rendered_dom",
+        "selector_type": "css",
+        "selector": "main .rate-table",
+        "frame_path": [],
+        "rendered_text_sha256": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+        "response_ids": [
+          "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+        ]
+      },
+      "source_text": "Rates as of 11/14/2026",
+      "extraction": {
+        "git_sha": "0123456789abcdef0123456789abcdef01234567",
+        "parser": {
+          "name": "synthetic-html",
+          "version": "1.0.0"
+        },
+        "configuration_sha256": "1111222233334444111122223333444411112222333344441111222233334444",
+        "normalization_version": "norm-1",
+        "rule_id": null
+      }
+    }
+  ],
+  "field_provenance": [
+    {
+      "path": "details.term_months",
+      "provenance": {
+        "artifact_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "locator": {
+          "kind": "rendered_dom",
+          "selector_type": "css",
+          "selector": "main .rate-table",
+          "frame_path": [],
+          "rendered_text_sha256": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+          "response_ids": [
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+          ]
+        },
+        "source_text": "30-year",
+        "extraction": {
+          "git_sha": "0123456789abcdef0123456789abcdef01234567",
+          "parser": {
+            "name": "synthetic-html",
+            "version": "1.0.0"
+          },
+          "configuration_sha256": "1111222233334444111122223333444411112222333344441111222233334444",
+          "normalization_version": "norm-1",
+          "rule_id": null
+        }
+      }
+    },
+    {
+      "path": "details.rate_type",
+      "provenance": {
+        "artifact_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "locator": {
+          "kind": "rendered_dom",
+          "selector_type": "css",
+          "selector": "main .rate-table",
+          "frame_path": [],
+          "rendered_text_sha256": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+          "response_ids": [
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+          ]
+        },
+        "source_text": "Fixed",
+        "extraction": {
+          "git_sha": "0123456789abcdef0123456789abcdef01234567",
+          "parser": {
+            "name": "synthetic-html",
+            "version": "1.0.0"
+          },
+          "configuration_sha256": "1111222233334444111122223333444411112222333344441111222233334444",
+          "normalization_version": "norm-1",
+          "rule_id": null
+        }
+      }
+    },
+    {
+      "path": "details.lock_days",
+      "provenance": {
+        "artifact_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "locator": {
+          "kind": "rendered_dom",
+          "selector_type": "css",
+          "selector": "main .rate-table",
+          "frame_path": [],
+          "rendered_text_sha256": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+          "response_ids": [
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+          ]
+        },
+        "source_text": "30-day lock",
+        "extraction": {
+          "git_sha": "0123456789abcdef0123456789abcdef01234567",
+          "parser": {
+            "name": "synthetic-html",
+            "version": "1.0.0"
+          },
+          "configuration_sha256": "1111222233334444111122223333444411112222333344441111222233334444",
+          "normalization_version": "norm-1",
+          "rule_id": null
+        }
+      }
+    }
+  ]
+}
