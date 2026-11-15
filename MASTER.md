@@ -137,10 +137,10 @@ $350,000 first lien; $50,000 second-lien line; 80% CLTV; 780 credit score; no
 relationship discount. Rankings use post-intro variable APR and group identical
 draw/repayment structures.
 
-Approved anonymous calculators may receive only a ZIP code inside the verified
-footprint. A source requiring a name, contact data, street address, consent, or lead
-submission remains quote-only. Form-generated quotes are labeled and never power
-statewide summary claims.
+Approved anonymous calculators may receive only the canonical scenario values and a ZIP
+code inside the verified footprint. A source requiring a name, contact data, street
+address, consent, or lead submission remains quote-only. Form-generated quotes are
+labeled and never power statewide summary claims.
 
 ## 5. Non-negotiable data principles
 
@@ -160,8 +160,8 @@ statewide summary claims.
 11. **Bounded freshness:** collect daily; degrade after 72 hours without successful
     re-observation and withdraw rate comparisons after 96 hours.
 12. **Independent expiry:** the web layer enforces `valid_until` even if workers fail.
-13. **Emergency withdrawal:** an independent denylist can suppress an offer, product,
-    institution, or snapshot with actor, time, and reason.
+13. **Emergency withdrawal:** an independent denylist can suppress a source, offer,
+    product, institution, or snapshot with actor, time, and reason.
 14. **Constrained auto-publication:** previously reviewed offers may republish only
     when source and parser remain approved, structure is unchanged, conditions and
     evidence are complete, validations pass, point structure and product identity are
@@ -172,6 +172,189 @@ statewide summary claims.
     cache, and never bypass authentication, CAPTCHAs, or bot protection.
 16. **Source abandonment review:** an effective date older than 90 days plus no value
     change for 60 days triggers human review even when fetching still succeeds.
+
+### Collection and source-approval policy
+
+This policy is the minimum gate for every source. It is an engineering policy, not a
+legal opinion. A source remains blocked when the policy cannot establish that automated
+collection is appropriate.
+
+**Approval status:** approved by the product owner in T007; see decision D-12. Product
+approval does not substitute for source-by-source review or legal clearance.
+
+#### Default collection behavior
+
+- Identify the project with one stable user agent that links to the public methodology
+  and contact page. Do not impersonate a consumer browser, rotate identities, hide
+  automation, or use stealth plugins. Before collection begins, the user-agent URL must
+  resolve to a public project identity, methodology, and role-based contact route. During
+  development the public repository, `MASTER.md`, and issue tracker satisfy this gate;
+  production collection uses the website methodology and contact pages.
+- Limit collection to one concurrent request per origin and per registrable domain, and
+  two concurrent registrable domains globally. Wait at least five seconds between
+  requests governed by the same limit and reduce frequency when a source signals
+  pressure.
+- Cache successful responses and validators. Do not re-download unchanged content, and
+  do not fetch a public source more often than the approved schedule requires.
+- Retry only transient network errors, HTTP 408, 429, and 5xx responses. Make at most
+  two retries using exponential backoff with a 30-second base and 15-minute cap. Honor
+  `Retry-After`; when it exceeds 15 minutes, defer collection to the next scheduled run.
+  Never turn a persistent failure into a high-frequency retry loop.
+- Evaluate `robots.txt` before the first automated collection and cache the decision for
+  no more than 24 hours. A disallow rule blocks the affected automated path. A 401, 403,
+  429, 5xx, timeout, or unreachable response with no valid cached decision pauses
+  collection for that origin; other `4xx` responses mean no robots restrictions. Honor
+  `Crawl-delay` when it exceeds five seconds. Evaluate robots separately for every origin
+  contacted, including vendor and rendered-page XHR origins.
+- Review applicable public terms during source approval and after a detected material
+  change. An explicit automation prohibition, unresolved conflict, or unclear right to
+  retain the required evidence blocks the source pending product-owner or counsel review.
+  Store the reviewed terms URL, retrieval time, and normalized legal-text hash; re-check
+  at least quarterly. A hash change triggers triage and pauses the source when the change
+  may affect automation, evidence retention, or publication.
+- Never bypass authentication, paywalls, CAPTCHAs, bot protection, rate limits, access
+  controls, or geographic restrictions. Do not accept a vendor's hidden endpoint as
+  public merely because it is technically reachable.
+- Browser automation is permitted only when approved public content requires rendering.
+  Record the same project identity and limits as HTTP collection; do not simulate human
+  behavior to defeat controls. Block third-party advertising, analytics, and unrelated
+  subresources. Dismiss a cookie banner only when doing so grants no consent and submits
+  no data.
+- An anonymous public calculator may receive only the approved canonical scenario and a
+  ZIP code inside the verified footprint. Never submit a real or invented person, street
+  address, email, telephone number, Social Security number, income, employer, consent,
+  credit inquiry, application, appointment, or lead form.
+- Capture only the smallest screenshot or rendered region needed for private evidence.
+  Never publish captured pages, vendor responses, or full screenshots.
+- Enforce limits in code, not by convention. All source requests pass through the fetch
+  gateway or browser request interceptor; no other module may open source connections.
+  Spacing and retry limits govern top-level navigations, documents, PDFs, and rate-bearing
+  API/XHR requests. Required same-page static subresources use a separate per-render
+  request, byte, and time budget; unrelated resources are blocked. Persist next-allowed
+  times and backoff state in the operational database so limits survive restarts and
+  overlapping timers. Use one worker lock, a monotonic clock, verified system time, and
+  automated tests for spacing, concurrency, retry, robots, budgets, and denylist behavior.
+- On Raspberry Pi, run collection under a dedicated unprivileged user with systemd memory
+  and task limits, at most one browser instance, and owner-only artifact, cache, and
+  database paths on NVMe/SSD. Encrypt off-device backups; expire backed-up artifacts
+  within 30 days after their logged local deletion.
+
+#### Source approval checklist and classifications
+
+A source becomes `approved` only after a human reviewer records all of the following:
+
+1. The institution identity, official domain, product relationship, and lending
+   footprint are verified.
+2. The rate location is an institution or authorized-provider page for that product.
+3. Robots, applicable terms, authentication, form inputs, and access controls have been
+   reviewed with no unresolved block.
+4. The fetch profile, schedule, limits, artifact type, expected locator, and responsible
+   adapter are named. Browser profiles also set tested per-render request, byte, and time
+   budgets before approval.
+5. A fixture proves collection can occur without personal data, lead submission,
+   circumvention, or unrelated browsing. Committed fixtures are synthetic or original
+   and contain no third-party text; real captures remain only in the private store and
+   never enter the repository, CI, or exports.
+6. Retention, public excerpt, freshness, correction contact, and withdrawal behavior are
+   defined.
+7. A reviewer approves the first observation and records the decision, time, evidence,
+   and any conditions.
+
+Use these evidence-backed source classifications:
+
+- `approved`: automated collection may run under the recorded profile.
+- `quote_only`: the institution offers the product but no comparable public rate can be
+  collected without borrower data or human contact.
+- `login_required`: the rate is visible only after authentication.
+- `no_public_rate`: the product is verified but no public rate was found after the
+  approved search procedure.
+- `blocked`: robots, terms, access controls, anti-bot measures, legal uncertainty, or an
+  explicit owner decision prohibits collection.
+- `unsupported`: the public source exists but no approved adapter can yet collect it
+  reliably.
+- `unknown`: identity, product, source, or collection suitability has not been verified.
+
+`quote_only`, `login_required`, `no_public_rate`, `blocked`, `unsupported`, and `unknown`
+never publish a rate. They may appear as coverage results when their evidence is fresh.
+A blocked source appears only as a generic unavailable result when the product identity
+is independently verified and the product owner approves display; do not publish the
+block reason or identify a stop/takedown request.
+
+A stop, takedown, or cease request; a new robots or terms prohibition; a CAPTCHA or bot
+challenge; or three consecutive scheduled runs ending in 403/429 immediately moves a
+source to `blocked` and denylisting. Retries within one run count as one failed run. Only
+a recorded product-owner or counsel decision with actor, time, evidence, and rationale
+may restore it to `approved`. Five
+consecutive failed scheduled runs trigger human review and classification as
+`unsupported` or `blocked`. These rules supplement the source-abandonment review in
+principle 16.
+
+### Evidence, privacy, and retention policy
+
+- Raw HTML, JSON, PDFs, rendered DOM, images, screenshots, and vendor responses are
+  private evidence. They are encrypted or access-controlled at rest, excluded from the
+  public repository and exports, and never relicensed.
+- Public pages may show the source URL, observation time, scenario, assumptions, review
+  status, and the minimum excerpt needed to support a value. Excerpts are plain text,
+  limited to the relevant label/value and nearby qualification, and never reconstruct a
+  source page.
+- Limit published excerpts to 300 characters per field and exclude them from CC BY 4.0
+  exports. Exports contain normalized values, source URL, observation time, artifact
+  hash, locator, and review status only. Original source text, excerpts, and artifacts
+  are never exported; pages label excerpts as third-party text excluded from project
+  licensing.
+- A `304 Not Modified` response or unchanged content hash is a successful re-observation
+  for freshness. Record the observation without storing a duplicate artifact.
+- Preserve immutable artifact hashes, locators, collection metadata, parser version,
+  validation results, review decisions, corrections, and withdrawals for the life of
+  the project. Retain private third-party artifacts for 24 months after their last use in
+  a public snapshot, then delete them through a logged retention job unless a dispute,
+  correction, or legal hold requires longer retention.
+- Retain routine failed-fetch bodies for no more than 30 days and operational logs for
+  90 days. Logs must exclude query values or payloads that could contain personal data.
+- The project does not intentionally collect borrower personal data. If unsolicited
+  personal data arrives through contact or correction channels, restrict access, remove
+  it from working records, and delete it as soon as the request can be handled safely.
+
+### Corrections, disputes, and emergency withdrawal
+
+- Provide a public correction channel that accepts a source URL, affected field, reason,
+  and optional evidence. It must state that users must not submit applications, account
+  numbers, financial records, or other personal data.
+- Record each request as an append-only correction case with received time, reporter
+  category, affected entity, evidence, decision, actor, and resolution time. Do not edit
+  collection history to make an error disappear. Store reporter reply contact only in a
+  restricted mutable field, delete it 90 days after case resolution, and never copy it
+  into append-only history.
+- Triage a credible active-rate, identity, privacy, or security report within one
+  business day. Triage other reports within five business days. These are operational
+  targets, not promises of lender response or rate availability.
+- A reviewer may immediately place an offer, product, institution, source, or snapshot on
+  the independent denylist. Public reads enforce the denylist even when collection and
+  publication workers are unavailable.
+- Correction decisions may confirm, amend, quarantine, withdraw, or reject a claim. A
+  corrected value requires new evidence and normal publication validation; a reporter's
+  assertion is never itself a publishable source.
+- Do not forward a reporter's contact details or message to a credit union or vendor
+  without explicit permission. Do not use the correction channel for marketing or leads.
+
+### Licensing, trademarks, and legal-review boundary
+
+- MIT applies only to original V2 code whose authorship the project can establish.
+- CC BY 4.0 applies only to original V2 documentation and normalized exports. Exported
+  records retain source attribution and do not grant rights in third-party content.
+- Third-party pages, rate sheets, PDFs, screenshots, logos, vendor responses, and copied
+  fixtures are excluded from project licensing and remain private evidence.
+- Use institution and vendor names only as factual identifiers. Do not display logos,
+  slogans, trade dress, or imply sponsorship, endorsement, partnership, or official
+  status without documented permission or a confirmed license.
+- The following remain questions for qualified counsel before a broad public launch:
+  automated collection under source-specific terms; retention and excerpting of rate
+  sheets and rendered pages; database or compilation rights; logo and trademark use;
+  computer-access law and enforceability of website terms; accuracy, defamation, and
+  disclaimer exposure; privacy and analytics obligations; advertising or affiliate
+  relationships; correction/dispute procedures; and federal or Massachusetts
+  mortgage-advertising rules that may apply to comparisons.
 
 ## 6. Architecture
 
@@ -385,6 +568,7 @@ in the issue/PR; durable product or architecture decisions are incorporated here
 | D-09 | Use Caddy behind Cloudflare Tunnel/CDN with no inbound router port; document a fallback before production if rejected. |
 | D-10 | Use the outside-iCloud clone as authoritative; the iCloud repository is an integrator-updated checkpoint mirror only. |
 | D-11 | `MASTER.md` is the only durable project specification; GitHub Issues/Project replace repository task ledgers and standalone review reports. |
+| D-12 | Adopt §5 as the collection, evidence, corrections, and licensing policy. Publish only verified public rate facts and their context; keep full source captures private. |
 
 Reopening a resolved decision requires a recorded rationale and impact review in the
 relevant GitHub issue or pull request, followed by an update to this document.
