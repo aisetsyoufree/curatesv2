@@ -1,0 +1,148 @@
+{
+  "catalog_id": "t009-seed-fixtures",
+  "offline_testing_only": true,
+  "verifies_extraction": false,
+  "cases": [
+    {
+      "case_id": "athol-style",
+      "fixture": "athol_style_mortgage.html",
+      "source_url": "https://athol-style.example/mortgage-rates",
+      "media_type": "text/html; charset=utf-8",
+      "http_status": 200,
+      "fetch_run_id": "t009-athol-style",
+      "artifact_id": "f13c7f6f1dc71b5d9e39323daaeeac79d6d2d42ea4fa46725af9b0ccbc21022a",
+      "byte_length": 1655,
+      "page_kind": "static_mortgage_rate_table",
+      "rows": [
+        {
+          "row_id": "purchase-30-year",
+          "product_family": "mortgage",
+          "purpose": "purchase",
+          "term_months": 360,
+          "note_rate": "6.375",
+          "apr": "6.441",
+          "points": "0.000",
+          "canonical_scenario": "purchase_30y_fixed",
+          "ranking": "assumptions_match",
+          "ranking_reason": "Stated assumptions match the canonical 30-year fixed purchase scenario, including a 360-month term."
+        },
+        {
+          "row_id": "purchase-15-year",
+          "product_family": "mortgage",
+          "purpose": "purchase",
+          "term_months": 180,
+          "note_rate": "5.625",
+          "apr": "5.710",
+          "points": "0.000",
+          "canonical_scenario": "purchase_30y_fixed",
+          "ranking": "must_not_rank",
+          "ranking_reason": "The row states a note rate and an APR, but the term is 180 months. The canonical purchase scenario is 360 months, so this row must not rank."
+        }
+      ],
+      "evidence_phrases": [
+        "id=\"purchase-30-year\"",
+        "6.375%",
+        "6.441%",
+        "Term 30 years (360 months).",
+        "id=\"purchase-15-year\"",
+        "5.625%",
+        "5.710%",
+        "Term 15 years (180 months)."
+      ]
+    },
+    {
+      "case_id": "stoughton-style",
+      "fixture": "stoughton_style_consumer_loans.html",
+      "source_url": "https://stoughton-style.example/auto-and-personal-loans",
+      "media_type": "text/html; charset=utf-8",
+      "http_status": 200,
+      "fetch_run_id": "t009-stoughton-style",
+      "artifact_id": "51e373118d93f7aca5dd01d8c75166e562436b8ca7bc39217d040515b85dada4",
+      "byte_length": 1844,
+      "page_kind": "auto_and_personal_loans",
+      "mortgage_offers_from_this_page": 0,
+      "institution_offering": "not_inferred",
+      "institution_offering_reason": "This page does not establish what the institution offers on any other page.",
+      "rows": [
+        {
+          "row_id": "auto-new-36",
+          "product_family": "vehicle",
+          "note_rate": "4.990",
+          "apr": "5.140"
+        },
+        {
+          "row_id": "auto-used-60",
+          "product_family": "vehicle",
+          "note_rate": "5.740",
+          "apr": "5.910"
+        },
+        {
+          "row_id": "personal-unsecured-36",
+          "product_family": "unsecured_personal",
+          "note_rate": "9.250",
+          "apr": "9.490"
+        }
+      ],
+      "evidence_phrases": [
+        "This page lists vehicle loans and unsecured personal loans.",
+        "id=\"auto-new-36\"",
+        "4.990%",
+        "5.140%",
+        "id=\"auto-used-60\"",
+        "5.740%",
+        "5.910%",
+        "id=\"personal-unsecured-36\"",
+        "9.250%",
+        "9.490%"
+      ]
+    },
+    {
+      "case_id": "worcester-style",
+      "fixture": "worcester_style_home_lending.html",
+      "source_url": "https://worcester-style.example/home-lending",
+      "media_type": "text/html; charset=utf-8",
+      "http_status": 200,
+      "fetch_run_id": "t009-worcester-style",
+      "artifact_id": "9143387296dc6398c7f440aa9e7149efdd690923fa3bd9380d4c12c3d2b173f9",
+      "byte_length": 1683,
+      "page_kind": "quote_partner_and_second_mortgage",
+      "first_mortgage": {
+        "availability": "quote_only",
+        "published_rate": false,
+        "note_rate": null,
+        "apr": null
+      },
+      "partner_link": {
+        "url": "https://housing-partner.example/programs/example-housing",
+        "is_rate": false,
+        "is_institution_rate": false
+      },
+      "second_mortgage_table": {
+        "published_rate": true,
+        "rows": [
+          {
+            "row_id": "second-10-year",
+            "product_family": "home_equity_loan",
+            "lien": "second",
+            "term_months": 120,
+            "note_rate": "7.250",
+            "apr": "7.418",
+            "points": "0.000",
+            "canonical_scenario": "fixed_home_equity_10y",
+            "ranking": "assumptions_match",
+            "ranking_reason": "Stated assumptions match the canonical ten-year fixed home-equity scenario."
+          }
+        ]
+      },
+      "evidence_phrases": [
+        "Call for a quote. This page does not advertise a first-mortgage note rate or APR.",
+        "https://housing-partner.example/programs/example-housing",
+        "This link is not a note rate or an APR.",
+        "id=\"second-10-year\"",
+        "7.250%",
+        "7.418%",
+        "Ten-year fixed term (120 months)."
+      ]
+    }
+  ]
+}
