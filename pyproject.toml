@@ -5,6 +5,7 @@ description = "Educational, evidence-backed Massachusetts credit-union home-lend
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "httpx>=0.28,<1",
     "pydantic>=2.9,<3",
 ]
 
