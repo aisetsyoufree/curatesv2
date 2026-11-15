@@ -22,6 +22,7 @@ from cu_rates.contracts import (
 )
 from cu_rates.contracts.enums import FetchMethod
 from cu_rates.contracts.publication import QUARANTINE_REASONS
+from cu_rates.contracts.sources import is_strong_etag, profile_sha256
 
 from .factories import (
     ARTIFACT_ID,
@@ -59,18 +60,30 @@ def profile(**overrides: Any) -> FetchProfile:
     return FetchProfile(**kwargs)
 
 
+def original_run(**overrides: Any) -> FetchRun:
+    """The original successful 200: ETag validator, under the approved profile's digest."""
+    kwargs: dict[str, Any] = {
+        "conditional_validator": ETAG,
+        "profile_sha256": profile_sha256(profile()),
+    }
+    kwargs.update(overrides)
+    return fetch_run(**kwargs)
+
+
 def observation(**overrides: Any) -> NotModifiedObservation:
     kwargs: dict[str, Any] = {
         "schema_version": SV,
         "run_id": "reobs-001",
         "source_id": SOURCE_ID,
         "profile_id": "profile-1",
+        "profile_sha256": profile_sha256(profile()),
         "git_sha": GIT_SHA,
         "started_at": OBSERVED_AT - timedelta(seconds=2),
         "observed_at": OBSERVED_AT,
         "original_run_id": "fetch-001",
         "original_artifact_id": ARTIFACT_ID,
         "validator": ETAG,
+        "response_etag": ETAG.value,
     }
     kwargs.update(overrides)
     return NotModifiedObservation(**kwargs)
@@ -91,7 +104,7 @@ def decide(offer: NormalizedOffer | None = None, **overrides: Any) -> Publicatio
     kwargs: dict[str, Any] = {
         "subject": subject,
         "evaluated_at": NOW,
-        "fetch_runs": (fetch_run(conditional_validator=ETAG),),
+        "fetch_runs": (original_run(),),
         "reobservations": (observation(),),
         "approved_profile": profile(),
         "validations": validations_for(subject, evaluated_at=OBSERVED_AT),
@@ -133,7 +146,7 @@ def test_a_304_not_claimed_by_the_offer_does_not_refresh_it() -> None:
 
 
 def test_a_304_does_not_rewrite_the_original_artifact_or_run() -> None:
-    obs, run = observation(), fetch_run(conditional_validator=ETAG)
+    obs, run = observation(), original_run()
     assert obs.http_status == 304
     assert obs.run_id != run.run_id
     assert run.artifact_ids == (ARTIFACT_ID,)
@@ -173,13 +186,13 @@ def test_304_is_inert_when_the_offer_rests_on_a_normal_200() -> None:
                 observation(validator=ConditionalValidator(kind="last_modified", value='"v1"')),
             )
         },
-        {"fetch_runs": (fetch_run(),)},  # the original response recorded no validator
+        {"fetch_runs": (original_run(conditional_validator=None),)},  # recorded no validator
         {
             "fetch_runs": (
-                fetch_run(conditional_validator=ConditionalValidator(kind="etag", value='"v0"')),
+                original_run(conditional_validator=ConditionalValidator(kind="etag", value='"v0"')),
             )
         },
-        {"fetch_runs": (fetch_run(conditional_validator=ETAG, profile_id="profile-2"),)},
+        {"fetch_runs": (original_run(profile_id="profile-2"),)},
         {"reobservations": (observation(started_at=T0),)},  # began before the original run ended
         {"source_approval": source_approval(decided_at=OBSERVED_AT)},  # began before approval
     ],
@@ -350,3 +363,146 @@ def test_observation_cannot_reuse_a_fetch_run_id() -> None:
     reused = observation(run_id="fetch-001", original_run_id="fetch-000")
     with pytest.raises(ValidationError, match="duplicate fetch run"):
         context(fetch_runs=(fetch_run(),), reobservations=(reused,))
+
+
+# --- the validator must be one strong ETag, identical on the 200 and the 304 -----------------
+
+
+def _shared(value: str) -> dict[str, Any]:
+    validator = ConditionalValidator(kind="etag", value=value)
+    return {
+        "fetch_runs": (original_run(conditional_validator=validator),),
+        "reobservations": (observation(validator=validator, response_etag=value),),
+    }
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["*", 'W/"v1"', 'w/"v1"', '"a", "b"', "v1", '"v1', '""" ', '"a b"', '"a"b"', ""],
+)
+def test_only_a_single_strong_etag_refreshes_evidence(value: str) -> None:
+    if not value:
+        with pytest.raises(ValidationError):
+            ConditionalValidator(kind="etag", value=value)
+        return
+    decision = decide(**_shared(value))
+    blocked(
+        decision, PublicationOutcome.SUPPRESS, R.REOBSERVATION_UNVERIFIED, R.OBSERVATION_UNBOUND
+    )
+
+
+def test_the_same_strong_etag_refreshes_evidence() -> None:
+    assert decide(**_shared('"abc-123_~"')).publishable_now
+
+
+@pytest.mark.parametrize(
+    ("value", "strong"),
+    [
+        ('"v1"', True),
+        ('""', True),
+        ('"a/b=c+d"', True),
+        ("*", False),
+        ('W/"v1"', False),
+        ('"a","b"', False),
+        ('"a", "b"', False),
+        ('"a" ', False),
+        ("v1", False),
+        ('"a"b"', False),
+    ],
+)
+def test_strong_etag_syntax(value: str, strong: bool) -> None:
+    assert is_strong_etag(value) is strong
+
+
+def test_last_modified_only_never_refreshes_evidence() -> None:
+    stamp = ConditionalValidator(kind="last_modified", value="Tue, 01 Sep 2026 00:00:00 GMT")
+    decision = decide(
+        fetch_runs=(original_run(conditional_validator=stamp),),
+        reobservations=(observation(validator=stamp, response_etag=None),),
+    )
+    blocked(
+        decision, PublicationOutcome.SUPPRESS, R.REOBSERVATION_UNVERIFIED, R.OBSERVATION_UNBOUND
+    )
+
+
+@pytest.mark.parametrize(
+    "response_etag",
+    [None, '"v2"', 'W/"v1"', "*", '"v1", "v2"'],
+    ids=["missing", "other", "weak", "wildcard", "list"],
+)
+def test_the_304_must_return_the_original_etag_exactly(response_etag: str | None) -> None:
+    decision = decide(reobservations=(observation(response_etag=response_etag),))
+    blocked(
+        decision, PublicationOutcome.SUPPRESS, R.REOBSERVATION_UNVERIFIED, R.OBSERVATION_UNBOUND
+    )
+
+
+def test_the_request_validator_must_equal_the_original_etag() -> None:
+    sent = ConditionalValidator(kind="etag", value='"v2"')
+    decision = decide(reobservations=(observation(validator=sent, response_etag='"v1"'),))
+    blocked(decision, PublicationOutcome.SUPPRESS, R.REOBSERVATION_UNVERIFIED)
+
+
+def test_a_weak_or_wildcard_validator_leaves_a_normal_200_unchanged() -> None:
+    """Validator rules govern only 304 freshness; a fresh 200 publishes as before."""
+    fresh = purchase_offer()
+    weak = ConditionalValidator(kind="etag", value='W/"v1"')
+    plain = evaluate_publication(fresh, context(fresh))
+    with_weak = evaluate_publication(
+        fresh, context(fresh, fetch_runs=(fetch_run(conditional_validator=weak),))
+    )
+    assert plain.outcome is PublicationOutcome.AUTO_PUBLISH
+    assert with_weak == plain
+
+
+# --- both observations bind to the actual approved profile, not just its ID ---------------
+
+
+def test_a_changed_profile_with_the_same_id_fails() -> None:
+    changed = profile(timeout_seconds=31)
+    assert changed.profile_id == profile().profile_id
+    assert profile_sha256(changed) != profile_sha256(profile())
+    decision = decide(approved_profile=changed)
+    blocked(
+        decision, PublicationOutcome.SUPPRESS, R.REOBSERVATION_UNVERIFIED, R.OBSERVATION_UNBOUND
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"fetch_runs": (original_run(profile_sha256=None),)},
+        {"fetch_runs": (original_run(profile_sha256=profile_sha256(profile(timeout_seconds=31))),)},
+        {
+            "reobservations": (
+                observation(profile_sha256=profile_sha256(profile(min_interval_seconds=61))),
+            )
+        },
+        {"reobservations": (observation(profile_sha256="d" * 64),)},
+    ],
+    ids=[
+        "original-has-no-digest",
+        "original-other-digest",
+        "304-other-digest",
+        "304-unknown-digest",
+    ],
+)
+def test_both_observations_must_carry_the_approved_profile_digest(
+    overrides: dict[str, Any],
+) -> None:
+    decision = decide(**overrides)
+    blocked(
+        decision, PublicationOutcome.SUPPRESS, R.REOBSERVATION_UNVERIFIED, R.OBSERVATION_UNBOUND
+    )
+
+
+def test_profile_digest_is_stable_and_covers_every_field() -> None:
+    base = profile()
+    assert profile_sha256(base) == profile_sha256(profile())
+    for change in (
+        {"profile_id": "profile-2"},
+        {"source_id": "other"},
+        {"min_interval_seconds": 61},
+        {"timeout_seconds": 31},
+    ):
+        assert profile_sha256(profile(**change)) != profile_sha256(base)

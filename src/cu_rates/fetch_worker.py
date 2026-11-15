@@ -30,6 +30,7 @@ from cu_rates.contracts.sources import (
     NotModifiedObservation,
     RateSource,
     SourceApproval,
+    profile_sha256,
 )
 from cu_rates.fetch_robots import PRODUCT, RobotsPolicy, parse_robots
 
@@ -76,6 +77,8 @@ class Reobservation:
     observed_at: datetime
     original: RawArtifact
     validator: ConditionalValidator
+    profile_sha256: str
+    response_etag: str | None = None
     http_status: int = 304
 
     def record(self) -> NotModifiedObservation:
@@ -85,12 +88,14 @@ class Reobservation:
             run_id=self.run_id,
             source_id=self.source_id,
             profile_id=self.profile_id,
+            profile_sha256=self.profile_sha256,
             git_sha=self.git_sha,
             started_at=self.started_at,
             observed_at=self.observed_at,
             original_run_id=self.original.fetch_run_id,
             original_artifact_id=self.original.artifact_id,
             validator=self.validator,
+            response_etag=self.response_etag,
         )
 
 
@@ -474,12 +479,13 @@ class FetchWorker:
         artifact = None
         observed = None
         validator = None
+        echoed = None
         terminal = 0
         try:
             robots = self._robots(db, url, profile.timeout_seconds)
             if robots.permits(url.path):
                 try:
-                    artifact, observed, validator = self._retrieve(
+                    artifact, observed, validator, echoed = self._retrieve(
                         db,
                         source,
                         profile,
@@ -518,6 +524,8 @@ class FetchWorker:
                             "http_status": 304,
                             "source_id": key,
                             "profile_id": profile.profile_id,
+                            "profile_sha256": profile_sha256(profile),
+                            "response_etag": echoed,
                             "git_sha": self._git_sha,
                             "started_at": datetime.fromtimestamp(now, UTC).isoformat(),
                             "observed_at": end.isoformat(),
@@ -538,6 +546,8 @@ class FetchWorker:
                     end,
                     observed,
                     validator,
+                    profile_sha256(profile),
+                    echoed,
                 ),
             )
         run = FetchRun(
@@ -545,6 +555,7 @@ class FetchWorker:
             run_id=run_id,
             source_id=key,
             profile_id=profile.profile_id,
+            profile_sha256=profile_sha256(profile),
             status=status,
             started_at=datetime.fromtimestamp(now, UTC),
             finished_at=end,
@@ -564,7 +575,7 @@ class FetchWorker:
         url: httpx.URL,
         run_id: str,
         spacing: int,
-    ) -> tuple[RawArtifact | None, RawArtifact | None, ConditionalValidator | None]:
+    ) -> tuple[RawArtifact | None, RawArtifact | None, ConditionalValidator | None, str | None]:
         key = f"cache:{source.source_id}"
         cached = self._get(db, key)
         prior: RawArtifact | None = None
@@ -631,7 +642,7 @@ class FetchWorker:
                         raise _Stopped("cache-invalid")
                 except (ArtifactStoreError, OSError, ValidationError) as exc:
                     raise _Stopped("cache-invalid") from exc
-                return None, prior, validator
+                return None, prior, validator, echoed
             if code == 200:
                 media = response.headers.get("content-type", "").split(";")[0].strip().lower()
                 if media != _MEDIA[source.evidence_kind] or not response.body:
@@ -659,6 +670,7 @@ class FetchWorker:
                     record,
                     None,
                     _validator(response.headers.get("etag"), response.headers.get("last-modified")),
+                    None,
                 )
             if code in (408, 429) or 500 <= code < 600:
                 delay = self._defer(

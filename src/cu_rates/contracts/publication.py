@@ -76,6 +76,8 @@ from cu_rates.contracts.sources import (
     NotModifiedObservation,
     RateSource,
     SourceApproval,
+    is_strong_etag,
+    profile_sha256,
 )
 
 MAX_AUTO_MOVEMENT_BP = Decimal(50)
@@ -498,13 +500,17 @@ def _reobservation_proven(
 ) -> bool:
     """Whether a 304 proves the same immutable body was still served, under approval.
 
-    It must name this artifact and its successful original run, the approved source and
-    profile, and the validator the original 200 carried; it must be collected after that
-    run finished and the approval was decided, and cannot lie in the future. Freshness
-    only: nothing here approves publication.
+    It must name this artifact and its successful original run and the approved source.
+    Both observations must carry the digest of the actual approved profile (a changed
+    profile with the same ID fails), and one strong ETag must match exactly across the
+    original 200, the conditional request, and the returned 304: weak, wildcard,
+    list, Last-Modified-only, missing, or mismatched validators prove nothing. It must
+    be collected after the original run finished and the approval was decided, and
+    cannot lie in the future. Freshness only: nothing here approves publication.
     """
     run = next((r for r in ctx.fetch_runs if r.run_id == artifact.fetch_run_id), None)
     profile, approval = ctx.approved_profile, ctx.source_approval
+    validator = run.conditional_validator if run is not None else None
     return (
         run is not None
         and run.status is RunStatus.SUCCEEDED
@@ -517,8 +523,12 @@ def _reobservation_proven(
         and observation.source_id == offer.source_id == ctx.source.source_id == run.source_id
         and profile.source_id == observation.source_id
         and observation.profile_id == run.profile_id == profile.profile_id
-        and run.conditional_validator is not None
-        and observation.validator == run.conditional_validator
+        and run.profile_sha256 == observation.profile_sha256 == profile_sha256(profile)
+        and validator is not None
+        and validator.kind == "etag"
+        and is_strong_etag(validator.value)
+        and observation.validator == validator
+        and observation.response_etag == validator.value
         and run.finished_at <= observation.started_at
         and approval.decided_at <= observation.started_at
         and observation.observed_at <= ctx.evaluated_at

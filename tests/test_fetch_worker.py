@@ -14,7 +14,12 @@ from cu_rates import fetch_worker
 from cu_rates.artifact_store import ArtifactStore
 from cu_rates.contracts.base import CONTRACT_VERSION
 from cu_rates.contracts.enums import EvidenceKind, FetchMethod, ReviewVerdict, RunStatus
-from cu_rates.contracts.sources import ConditionalValidator, FetchProfile, RateSource
+from cu_rates.contracts.sources import (
+    ConditionalValidator,
+    FetchProfile,
+    RateSource,
+    profile_sha256,
+)
 from cu_rates.fetch_worker import (
     ROBOTS_TTL,
     USER_AGENT,
@@ -360,6 +365,27 @@ def test_304_records_the_validator_the_original_200_carried(pilot: Pilot) -> Non
     assert record.original_artifact_id == first.artifact.artifact_id
     assert record.profile_id == pilot.profile.profile_id and record.http_status == 304
     assert record.observed_at == item.observed_at
+    digest = profile_sha256(pilot.profile)
+    assert first.run.profile_sha256 == digest == record.profile_sha256
+    assert record.response_etag == '"v1"' == first.run.conditional_validator.value
+
+
+def test_304_without_an_echoed_etag_is_recorded_but_not_publication_proof(pilot: Pilot) -> None:
+    first = pilot.fetch(
+        lambda req: robots() if req.url.path == "/robots.txt" else page(ETag='"v1"')
+    )
+    assert first.run is not None
+    pilot.clock.sleep(60)
+    result = pilot.fetch(lambda _: httpx.Response(304))
+    item = result.reobserved
+    assert item is not None
+    assert item.response_etag is None and item.record().response_etag is None
+    assert item.validator == first.run.conditional_validator
+
+
+def test_every_run_records_the_profile_digest(pilot: Pilot) -> None:
+    run = pilot.fetch(ok).run
+    assert run is not None and run.profile_sha256 == profile_sha256(pilot.profile)
 
 
 def test_last_modified_is_the_validator_when_there_is_no_etag(pilot: Pilot) -> None:

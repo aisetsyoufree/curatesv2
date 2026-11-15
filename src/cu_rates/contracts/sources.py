@@ -5,6 +5,9 @@ Domain contracts only; no I/O, storage, or worker logic. Extraction output is a
 normalization, validation, and (where required) human review have run.
 """
 
+import hashlib
+import json
+import re
 from typing import Annotated, Literal, Self
 
 from pydantic import Field, model_validator
@@ -79,6 +82,21 @@ class ConditionalValidator(ContractModel):
     value: Text
 
 
+# RFC 9110 entity-tag: one quoted opaque value; no W/ prefix, wildcard, or list.
+_STRONG_ETAG = re.compile(r'"[\x21\x23-\x7e\x80-\xff]*"')
+
+
+def is_strong_etag(value: str) -> bool:
+    """Whether ``value`` is exactly one strong entity-tag (not weak, ``*``, or a list)."""
+    return _STRONG_ETAG.fullmatch(value) is not None
+
+
+def profile_sha256(profile: "FetchProfile") -> str:
+    """Digest of the exact request profile, so a changed profile never shares an identity."""
+    canonical = json.dumps(profile.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
 def _check_run(
     status: RunStatus, started: UtcDatetime, finished: UtcDatetime, error: str | None
 ) -> None:
@@ -94,6 +112,7 @@ class FetchRun(VersionedModel):
     run_id: Identifier
     source_id: Identifier
     profile_id: Identifier
+    profile_sha256: Sha256Hex | None = None
     status: RunStatus
     started_at: UtcDatetime
     finished_at: UtcDatetime
@@ -123,12 +142,14 @@ class NotModifiedObservation(VersionedModel):
     run_id: Identifier
     source_id: Identifier
     profile_id: Identifier
+    profile_sha256: Sha256Hex
     git_sha: GitSha
     started_at: UtcDatetime
     observed_at: UtcDatetime
     original_run_id: Identifier
     original_artifact_id: Sha256Hex
     validator: ConditionalValidator
+    response_etag: Text | None = None
     http_status: Literal[304] = 304
 
     @model_validator(mode="after")
