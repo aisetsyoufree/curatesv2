@@ -127,14 +127,17 @@ def test_seed_fixtures_round_trip_through_the_evidence_store(tmp_path: Path) -> 
         assert record.byte_length == len(body)
         assert store.read(record) == body
         assert store.read_body(record.artifact_id) == body
-        assert store.put(
-            body,
-            media_type=case["media_type"],
-            source_url=source_url,
-            fetched_at=OBSERVED_AT,
-            http_status=case["http_status"],
-            fetch_run_id=fetch_run_id,
-        ) == record
+        assert (
+            store.put(
+                body,
+                media_type=case["media_type"],
+                source_url=source_url,
+                fetched_at=OBSERVED_AT,
+                http_status=case["http_status"],
+                fetch_run_id=fetch_run_id,
+            )
+            == record
+        )
         repeat = store.put(
             body,
             media_type=case["media_type"],
