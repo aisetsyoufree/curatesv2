@@ -10,8 +10,10 @@ technology stack, model responsibilities, task ledger, and contributor workflow.
 
 The authoritative active clone is `~/Code/cu-rates.org-v2`, a full clone (not a
 `git worktree`) outside iCloud. All integration happens there. The copy in the iCloud
-folder is a frozen planning mirror. The `.venv`, caches, databases, WAL/SHM files,
-Playwright caches, and raw artifacts must never live in a cloud-synchronized folder.
+folder is a checkpoint mirror updated only by the integrator after accepted commits;
+it is not an implementation or runtime location. The `.venv`, caches, databases,
+WAL/SHM files, Playwright caches, and raw artifacts must never live in a
+cloud-synchronized folder.
 
 ## Bootstrap
 

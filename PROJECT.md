@@ -7,13 +7,15 @@
 | Field | Value |
 |---|---|
 | Project | CU-Rates.org V2 |
-| Status | Planning and foundation |
+| Status | Foundation established; no implementation task in progress |
 | Product owner | Sid |
 | Primary product manager / architect | OpenAI GPT-6.1 Sol through Codex |
 | Repository | `cu-rates.org-v2` |
-| Last updated | 2026-11-14 |
+| Authoritative clone | `/Users/sid/Code/cu-rates.org-v2` |
+| iCloud checkpoint mirror | This repository; updated only by the integrator after accepted commits |
+| Last updated | 2026-11-15 |
 | Current milestone | M0 — Governance and specification |
-| Current task | T004 — Initialize repository quality baseline |
+| Current task | None — T004 complete; T005 is ready but not started |
 
 ## 1. How to use this document
 
@@ -504,16 +506,16 @@ acceptance criteria and verification are recorded.
 | T001 | Create V2 repository and canonical control document | GPT-6.1 Sol | done | Repository folder, `PROJECT.md`, and `AGENTS.md` exist |
 | T002 | Independent review of this plan | Claude Opus 5.5 | done | Review covers objective, scope, architecture, stack, risks, model workflow, and missing decisions |
 | T003 | Reconcile Opus review findings | GPT-6.1 Sol + Sid | done | Accepted edits and D-01 through D-10 recorded; task dependencies corrected |
-| T004 | Initialize repository quality baseline | Claude Sonnet role; verify current model | ready | Authoritative active clone and runtime paths are outside iCloud; `uv`, packaging, lint, typing, tests, and one canonical verification command are reproducible |
-| T005 | Inventory reusable V1 assets | Sonnet | blocked | Await T004; V1 fixtures, sources, platform knowledge, content, and assets cataloged only as unverified leads; no V1 rate is trusted |
-| T006 | Run Raspberry Pi platform spike | Grok Build | blocked | Await T004; current supported Pi OS 64-bit release and RAM recorded; Python 3.12, Playwright Chromium arm64, SQLite WAL on NVMe, and memory use verified |
-| T007 | Write collection, evidence, and licensing policy | GPT-6.1 Sol + Sid | blocked | Await T004; robots/ToS decisions, User-Agent, rate limits, public-evidence rules, corrections, MIT code license, and CC BY 4.0 dataset/docs license recorded |
+| T004 | Initialize repository quality baseline | Claude Sonnet 5.5; Codex review | done | Full clone outside iCloud; Python 3.12, `uv`, package build, Ruff, strict mypy, pytest, clean-environment rebuild, and canonical check verified |
+| T005 | Inventory reusable V1 assets | Sonnet | ready | V1 fixtures, sources, platform knowledge, content, and assets cataloged only as unverified leads; no V1 rate is trusted |
+| T006 | Run Raspberry Pi platform spike | Grok Build | blocked | Needs a task packet and Pi access; current supported Pi OS 64-bit release and RAM recorded; Python 3.12, Playwright Chromium arm64, SQLite WAL on NVMe, and memory use verified |
+| T007 | Write collection, evidence, and licensing policy | GPT-6.1 Sol + Sid | ready | Robots/ToS decisions, User-Agent, rate limits, public-evidence rules, corrections, MIT code license, and CC BY 4.0 dataset/docs license recorded |
 
 ### M1 — Data contract, seed evidence, and vertical slice
 
 | ID | Task | Owner | Status | Acceptance criteria |
 |---|---|---|---|---|
-| T010 | Write canonical domain data contract | GPT-6.1 Sol | blocked | Await T004; institution, product, condition, scenario, source, artifact, evidence, candidate, offer, validation, correction, withdrawal, and publication contracts approved |
+| T010 | Write canonical domain data contract | GPT-6.1 Sol | ready | Institution, product, condition, scenario, source, artifact, evidence, candidate, offer, validation, correction, withdrawal, and publication contracts approved |
 | T008 | Select three seed CUs and one static vertical-slice CU | GPT-6.1 Sol + Sid | blocked | Await T005/T007/T010; seed set covers static positive, non-mortgage negative, and one difficult source |
 | T031 | Implement immutable artifact store | Sonnet | blocked | Await T004/T010; every artifact is content-addressed and stores HTTP metadata, timestamps, source, hash, code version, and retention class |
 | T032 | Implement minimal polite fetch worker | Grok Build | blocked | Await T007/T031; User-Agent, per-host limits, robots decision, caching, failure states, and no-circumvention rules are enforced |
@@ -646,6 +648,7 @@ metadata, and freshness verification.
 | 2026-11-14 | Grok 4.7 | Independent round-2 plan audit | Approve with changes; no T004 blocker after packet corrections | `reviews/2026-11-14-grok-4.7-round2.md` |
 | 2026-11-14 | Gemini 3.8 Flash High | Independent round-2 plan audit | Approve with changes; T004 may proceed | `reviews/2026-11-14-gemini-3.8-flash-round2.md` |
 | 2026-11-14 | GPT-6.1 Sol | Cross-model synthesis and adjudication | Accepted safety and dependency fixes; deferred evidence-dependent choices; rejected premature scope | `reviews/2026-11-14-round2-synthesis.md` |
+| 2026-11-15 | GPT-6.1 Sol / Codex | T004 implementation commit `d24cf0f` | Approved with no blocking findings after independent clean-environment, build, failure-path, secret, and scope checks | `reviews/2026-11-15-t004-code-review.md` |
 
 ## 18. Change log
 
@@ -655,6 +658,7 @@ metadata, and freshness verification.
 | 2026-11-14 | T002 | Recorded independent Opus 5.5 review; moved project to review reconciliation | GPT-6.1 Sol |
 | 2026-11-14 | T003 | Integrated Opus findings: scenarios, conditions, freshness, publication rules, evidence model, corrected dependencies, Pi constraints, and governance | GPT-6.1 Sol |
 | 2026-11-14 | Review R2 | Audited the reconciled plan independently with Opus 5.5, Grok 4.7, and Gemini 3.8 Flash; applied accepted corrections and recorded rejected/deferred advice | GPT-6.1 Sol |
+| 2026-11-15 | T004 | Established the outside-iCloud authoritative clone, uv-managed Python 3.12 baseline, minimal package, lockfile, Ruff, strict mypy, pytest, canonical check script, and verified package build | Claude Sonnet 5.5 + GPT-6.1 Sol review |
 
 ## 19. Resolved design decisions
 
@@ -672,5 +676,5 @@ dated decision-log entry and an impact review of contracts, fixtures, and public
 | D-07 | Pi platform | Use a currently supported Raspberry Pi OS 64-bit release, Python 3.12 managed by `uv`, and NVMe/SSD for all mutable data; T006 records the selected release, RAM, and Playwright arm64 result |
 | D-08 | Analytics and consent | Use GA4 `gtag.js`, not GTM; initialize Consent Mode v2 in basic mode with storage denied until consent; no advertising at launch |
 | D-09 | Network edge | Use Caddy locally behind Cloudflare Tunnel/CDN, with no inbound router port; document an alternate direct-hosting path before production if the tunnel is rejected |
-| D-10 | Repository and runtime location | Keep this planning repository in the requested iCloud folder as a frozen mirror, but create the authoritative full implementation clone, virtual environment, caches, databases, WAL/SHM files, and artifacts outside iCloud in T004 |
+| D-10 | Repository and runtime location | Keep this repository in the requested iCloud folder as an integrator-updated checkpoint mirror, but use the authoritative full implementation clone, virtual environment, caches, databases, WAL/SHM files, and artifacts outside iCloud |
 
