@@ -179,8 +179,8 @@ This policy is the minimum gate for every source. It is an engineering policy, n
 legal opinion. A source remains blocked when the policy cannot establish that automated
 collection is appropriate.
 
-**Approval status:** proposed for T007; it becomes binding after Sid approves it and
-decision D-12 is recorded.
+**Approval status:** approved by the product owner in T007; see decision D-12. Product
+approval does not substitute for source-by-source review or legal clearance.
 
 #### Default collection behavior
 
@@ -568,6 +568,7 @@ in the issue/PR; durable product or architecture decisions are incorporated here
 | D-09 | Use Caddy behind Cloudflare Tunnel/CDN with no inbound router port; document a fallback before production if rejected. |
 | D-10 | Use the outside-iCloud clone as authoritative; the iCloud repository is an integrator-updated checkpoint mirror only. |
 | D-11 | `MASTER.md` is the only durable project specification; GitHub Issues/Project replace repository task ledgers and standalone review reports. |
+| D-12 | Adopt §5 as the collection, evidence, corrections, and licensing policy. Publish only verified public rate facts and their context; keep full source captures private. |
 
 Reopening a resolved decision requires a recorded rationale and impact review in the
 relevant GitHub issue or pull request, followed by an update to this document.
