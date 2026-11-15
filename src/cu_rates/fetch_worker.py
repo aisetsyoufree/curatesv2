@@ -274,8 +274,13 @@ class FetchWorker:
                 headers={"User-Agent": USER_AGENT, "Accept-Encoding": "identity", **headers},
             ) as response,
         ):
+            # A server can signal a challenge even when its body uses an
+            # unsupported encoding. Preserve the stop signal without decoding.
+            headers_only = _Response(response.status_code, response.headers, b"")
+            if _is_challenge(headers_only):
+                return headers_only
             if response.status_code != 200 and response.status_code not in (401, 403, 429, 503):
-                return _Response(response.status_code, response.headers, b"")
+                return headers_only
             if response.headers.get("content-encoding", "identity").lower() != "identity":
                 raise _Stopped("unsupported-encoding")
             body = bytearray()

@@ -181,13 +181,14 @@ def test_disallow_and_allow_overlap_fails_closed(pilot: Pilot) -> None:
     assert len(pilot.calls) == 1
 
 
-@pytest.mark.parametrize("target", ["robots", "body-200", "body-503"])
+@pytest.mark.parametrize("target", ["robots", "robots-403", "body-200", "body-403", "body-503"])
 def test_challenge_prefix_immediately_pauses_target(pilot: Pilot, target: str) -> None:
     def handler(req: httpx.Request) -> httpx.Response:
-        if req.url.path == "/robots.txt" and target != "robots":
+        if req.url.path == "/robots.txt" and not target.startswith("robots"):
             return robots()
+        code = int(target.split("-")[-1]) if "-" in target else 503
         return httpx.Response(
-            200 if target == "body-200" else 503,
+            code,
             content=b"<html><div class='g-recaptcha'></div></html>",
             headers={"Content-Type": "text/html"},
         )
@@ -195,8 +196,21 @@ def test_challenge_prefix_immediately_pauses_target(pilot: Pilot, target: str) -
     result = pilot.fetch(handler)
     assert result.reason == "access-challenge"
     assert result.run is not None and result.run.status is RunStatus.BLOCKED
-    assert len(pilot.calls) == (1 if target == "robots" else 2)
+    assert len(pilot.calls) == (1 if target.startswith("robots") else 2)
     assert list(pilot.store.observations()) == []
+    pilot.clock.sleep(60)
+    assert pilot.fetch(ok).reason == "source-paused"
+
+
+def test_challenge_header_stops_without_decoding_body(pilot: Pilot) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/robots.txt":
+            return robots()
+        return httpx.Response(
+            403, headers={"Content-Encoding": "gzip", "CF-Mitigated": "challenge"}
+        )
+
+    assert pilot.fetch(handler).reason == "access-challenge"
     pilot.clock.sleep(60)
     assert pilot.fetch(ok).reason == "source-paused"
 
