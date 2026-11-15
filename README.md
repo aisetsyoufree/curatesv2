@@ -1,10 +1,13 @@
 # CU-Rates.org V2
 
-Clean-room V2 of the educational, evidence-backed Massachusetts credit-union
-home-lending directory and comparison project.
+Educational, evidence-backed Massachusetts credit-union home-lending directory and
+comparison project.
 
-Start with [`PROJECT.md`](PROJECT.md). It defines the objective, scope, architecture,
-technology stack, model responsibilities, task ledger, and contributor workflow.
+- Read [`MASTER.md`](MASTER.md) for the product, architecture, policies, stack, roles,
+  and delivery rules.
+- Use the [GitHub Project](https://github.com/users/aisetsyoufree/projects/1) and
+  [Issues](https://github.com/aisetsyoufree/curatesv2/issues) for all stories and
+  execution status.
 
 ## Authoritative clone and runtime location
 
