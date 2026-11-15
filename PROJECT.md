@@ -13,7 +13,7 @@
 | Repository | `cu-rates.org-v2` |
 | Last updated | 2026-11-14 |
 | Current milestone | M0 — Governance and specification |
-| Current task | T002 — Independent Opus 5.5 review |
+| Current task | T003 — Reconcile Opus 5.5 review findings |
 
 ## 1. How to use this document
 
@@ -355,7 +355,7 @@ acceptance criteria and verification are recorded.
 | ID | Task | Owner | Status | Acceptance criteria |
 |---|---|---|---|---|
 | T001 | Create V2 repository and canonical control document | GPT-6.1 Sol | done | Repository folder, `PROJECT.md`, and `AGENTS.md` exist |
-| T002 | Independent review of this plan | Claude Opus 5.5 | in_progress | Review covers objective, scope, architecture, stack, risks, model workflow, and missing decisions |
+| T002 | Independent review of this plan | Claude Opus 5.5 | done | Review covers objective, scope, architecture, stack, risks, model workflow, and missing decisions |
 | T003 | Reconcile review findings | GPT-6.1 Sol + Sid | ready | Accepted changes recorded; disagreements and owner decisions documented |
 | T004 | Initialize repository quality baseline | Sonnet | blocked | Await T003; packaging, lint, typing, tests, and CI commands are reproducible |
 
@@ -476,11 +476,12 @@ metadata, and freshness verification.
 
 | Date | Reviewer | Scope | Result | Report |
 |---|---|---|---|---|
-| 2026-11-14 | Claude Opus 5.5 | Initial project-control document | in progress | `reviews/2026-11-14-opus-5.5-initial-review.md` |
+| 2026-11-14 | Claude Opus 5.5 | Initial project-control document | Direction approved; four design blockers identified for T003 | `reviews/2026-11-14-opus-5.5-initial-review.md` |
 
 ## 18. Change log
 
 | Date | Task | Change | Author |
 |---|---|---|---|
 | 2026-11-14 | T001 | Created V2 project-control document, architecture, model roles, operating protocol, and initial task ledger | GPT-6.1 Sol |
+| 2026-11-14 | T002 | Recorded independent Opus 5.5 review; moved project to review reconciliation | GPT-6.1 Sol |
 
