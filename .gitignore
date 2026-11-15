@@ -13,6 +13,13 @@ __pycache__/
 *.db
 *.db-wal
 *.db-shm
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+.coverage
+.coverage.*
+htmlcov/
 artifacts/
 data/runtime/
 playwright/.cache/

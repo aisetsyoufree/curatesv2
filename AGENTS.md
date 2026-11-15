@@ -19,6 +19,11 @@ One writer owns each implementation task. Do not begin a blocked task, broaden i
 scope, or silently change an acceptance criterion. If code and `PROJECT.md` disagree,
 stop and report the conflict in the task packet.
 
+Implementation work uses one branch per task, named `task/<ID>-<short-name>`. The
+integrator reviews the diff and recorded verification, merges or cherry-picks the
+accepted commit into the authoritative active clone, and alone updates `PROJECT.md`.
+Workers do not merge their own branches or continue into the next task.
+
 Do not publish or invent financial data. Every publication path must remain
 fail-closed and source-grounded. Preserve unrelated and uncommitted work.
 

@@ -35,9 +35,10 @@ Before declaring an implementation task complete, every model must:
 Review-only models do not edit the repository. The integrator records their reports
 under `reviews/` and updates this document after evaluating the findings.
 
-If implementation and this document disagree, stop and resolve the disagreement
-in this document before continuing. The project plan must describe the system that
-actually exists, not an aspirational or obsolete version of it.
+If implementation and this document disagree, the worker stops and records the
+conflict in its task packet. The integrator resolves it here before work continues.
+The project plan must describe the system that actually exists, not an aspirational
+or obsolete version of it.
 
 ## 2. Objective
 
@@ -86,8 +87,8 @@ Initial scope:
   of Banks list.
 - Credit unions offering no home-lending products remain in scope with that status.
 - NCUA charter number is the durable institution identity key.
-- Institution lifecycle values are `active`, `merged_into:<charter>`, `liquidated`,
-  `converted`, and `under_review`.
+- Institution lifecycle values are `active`, `merged`, `liquidated`, `converted`,
+  and `under_review`; a merged institution carries a separate successor charter ID.
 - Only active institutions with a verified charter may publish offers.
 
 Later expansion may include credit unions headquartered elsewhere that both accept
@@ -110,19 +111,17 @@ Loan purpose is an offer attribute, not a product family:
 
 One offer may apply to multiple purposes when the source says so.
 
-Loan program is also an attribute:
+Programs use separate, composable dimensions rather than one mutually exclusive enum:
 
-- `conventional`
-- `jumbo`
-- `fha`
-- `va`
-- `usda`
-- `first_time_buyer`
-- `agency_partner`, including MassHousing-related programs
+- `conforming_status`: `conforming`, `high_balance_conforming`, `jumbo`, `unknown`
+- `government_guaranty`: `none`, `fha`, `va`, `usda`, `unknown`
+- `borrower_programs`: a set that may include `first_time_buyer`
+- `partner_programs`: a set that may include MassHousing-related programs
 
-The first release ranks conventional and jumbo offers. Government, first-time-buyer,
-and agency-partner programs are cataloged and may appear on institution detail pages,
-but remain browse-only until their assumptions and fees are modeled and approved.
+`conventional` means no government guaranty; it may be conforming or jumbo. The first
+release ranks only conventional conforming offers. Jumbo, government, first-time-buyer,
+and agency-partner offers are cataloged and may appear on institution detail pages,
+but remain browse-only until their scenarios and fees are modeled and approved.
 
 Classify and retain, but do not publish in the first release:
 
@@ -170,16 +169,23 @@ primary residence; conventional conforming loan; $500,000 property value; $400,0
 balance; 80% LTV; 780 credit score; 30-day lock; no cash out; no relationship or
 autopay discount; zero points.
 
-**Fixed home-equity loan:** owner-occupied single-family primary residence; second
-lien; $50,000 loan; maximum 80% CLTV; ten-year fixed term; no relationship discount.
+**Fixed home-equity loan:** owner-occupied single-family primary residence; $500,000
+property value; $350,000 first-lien balance; second lien; $50,000 loan; 80% CLTV;
+780 credit score; ten-year fixed term; no relationship discount.
 
-**HELOC:** owner-occupied single-family primary residence; second lien; $50,000 line;
-maximum 80% CLTV; no relationship discount. Rankings use the post-intro variable APR,
-never the introductory rate, and group identical draw/repayment structures.
+**HELOC:** owner-occupied single-family primary residence; $500,000 property value;
+$350,000 first-lien balance; second lien; $50,000 line; 80% CLTV; 780 credit score;
+no relationship discount. Rankings use the post-intro variable APR, never the
+introductory rate, and group identical draw/repayment structures.
 
-If a form requires geography, use an address inside the verified lending footprint
-and store it with the scenario. A generated form quote is labeled as such and is not
-eligible for a statewide lowest-rate headline.
+If an approved anonymous calculator requires geography, use only a ZIP code inside
+the verified lending footprint and store it with the scenario. A source requiring a
+name, contact information, real street address, consent, or lead submission remains
+quote-only. A generated form quote is labeled as such and is not eligible for
+statewide summary language. A value matches a ranking scenario only when the source
+states the exact value or a range containing it. `unstated` is distinct from `matches`
+and `conflicts` and is browse-only until pilot evidence supports a narrower approved
+rule.
 
 ## 5. Non-negotiable data principles
 
@@ -216,6 +222,10 @@ eligible for a statewide lowest-rate headline.
 15. **Source abandonment review:** a source-effective date older than 90 days combined
     with no value changes for 60 days triggers human review even when daily fetches
     succeed.
+16. **Expiry independent of collection:** every published offer has a `valid_until`.
+    The web process suppresses expired offers at read time even when the collector or
+    publisher is down, and an emergency denylist can suppress an offer, product, or
+    institution without rebuilding the worker database.
 
 ## 6. Target technology stack
 
@@ -250,15 +260,16 @@ future contributors to understand.
 - HTMX vendored locally rather than loaded from a CDN
 - Structured JSON logs
 - Separate web and worker processes
-- Raspberry Pi OS Bookworm 64-bit on Raspberry Pi 5
+- A currently supported Raspberry Pi OS 64-bit release on Raspberry Pi 5, selected
+  and recorded during T006
 - NVMe/SSD storage for databases, WAL files, and artifacts; no SD-card runtime data
 - Systemd timers/services on Raspberry Pi 5
-- Caddy or Nginx as reverse proxy
+- Caddy as reverse proxy
 - Atomic public snapshot generation
 - Off-device database and artifact backups using the SQLite online backup API or
   Litestream, with documented restore tests
-- Source may remain in the requested iCloud folder during planning, but active
-  implementation worktrees, `.venv`, databases, WAL/SHM files, Playwright caches,
+- Source may remain in the requested iCloud folder during planning, but the active
+  implementation clone, `.venv`, databases, WAL/SHM files, Playwright caches,
   and raw artifacts must live outside cloud-synchronized folders
 
 ### Deliberate exclusions
@@ -332,6 +343,8 @@ its inputs, outputs, failures, timestamps, and code version.
 - MembershipRule
 - LendingFootprint
 - ProductOffering
+- ServiceProvider
+- InstitutionSourceRelationship
 - OfferCondition
 - ComparisonScenario
 - RateSource
@@ -346,6 +359,7 @@ its inputs, outputs, failures, timestamps, and code version.
 - NormalizedOffer
 - ValidationResult
 - ReviewDecision
+- Correction
 - Withdrawal
 - PublishedSnapshot
 
@@ -356,7 +370,9 @@ retain their distinct terms.
 Evidence locators are artifact-specific:
 
 - HTML: XPath or stable CSS selector plus a hash of the normalized text span
+- Rendered DOM: selector, frame path, rendered text hash, and originating response IDs
 - PDF: page number plus bounding box and extracted-text hash
+- Image/OCR: image region plus source-image hash and recognized-text hash
 - JSON/XHR: RFC 6901 JSON Pointer plus response hash
 
 Every extraction records the Git SHA, parser ID and version, configuration hash, and
@@ -369,10 +385,12 @@ private operational evidence; the public site exposes only source URL, observati
 time, relevant text excerpt, and normalized assumptions.
 
 The web process never opens the worker database. The publisher creates a separate
-read-only `published.sqlite`, verifies it, and swaps it into place with an atomic
-rename. If publication fails, the last good snapshot remains only until its bounded
-freshness limit; after that, rate comparisons are withdrawn while institution and
-methodology pages remain available.
+versioned `published.sqlite` in rollback-journal mode, verifies it, and exposes it
+read-only/immutable through an atomic pointer swap; the web process reopens on version
+change. Published databases never use WAL sidecars. Each row carries `valid_until`,
+which the web layer enforces together with an independently writable emergency
+denylist. If publication fails, expired rate comparisons disappear while institution
+and methodology pages remain available.
 
 ## 9. Model inventory and roles
 
@@ -427,7 +445,7 @@ Operational rules:
 - Store durable context here instead of relying on long chat history.
 - Use fresh sessions with a compact handoff for new milestones. A new session reduces
   context overhead but does not reset provider usage limits.
-- Coding agents work in isolated branches or worktrees. Only one writer owns a task.
+- Coding agents work in isolated task branches. Only one writer owns a task.
 - Review agents produce reports unless explicitly assigned an implementation task.
 
 ## 11. Standard task prompt
@@ -486,16 +504,16 @@ acceptance criteria and verification are recorded.
 | T001 | Create V2 repository and canonical control document | GPT-6.1 Sol | done | Repository folder, `PROJECT.md`, and `AGENTS.md` exist |
 | T002 | Independent review of this plan | Claude Opus 5.5 | done | Review covers objective, scope, architecture, stack, risks, model workflow, and missing decisions |
 | T003 | Reconcile Opus review findings | GPT-6.1 Sol + Sid | done | Accepted edits and D-01 through D-10 recorded; task dependencies corrected |
-| T004 | Initialize repository quality baseline | Sonnet | ready | Active worktree and runtime paths are outside iCloud; `uv`, packaging, lint, typing, tests, and one canonical verification command are reproducible |
-| T005 | Inventory reusable V1 assets | Sonnet | ready | V1 fixtures, sources, platform knowledge, content, and assets cataloged only as unverified leads; no V1 rate is trusted |
-| T006 | Run Raspberry Pi platform spike | Grok Build | blocked | Await T004; Python 3.12, Playwright Chromium arm64, SQLite WAL on NVMe, and memory use verified on Pi OS Bookworm |
-| T007 | Write collection, evidence, and licensing policy | GPT-6.1 Sol + Sid | ready | Robots/ToS decisions, User-Agent, rate limits, public-evidence rules, corrections, MIT code license, and CC BY 4.0 dataset/docs license recorded |
+| T004 | Initialize repository quality baseline | Claude Sonnet role; verify current model | ready | Authoritative active clone and runtime paths are outside iCloud; `uv`, packaging, lint, typing, tests, and one canonical verification command are reproducible |
+| T005 | Inventory reusable V1 assets | Sonnet | blocked | Await T004; V1 fixtures, sources, platform knowledge, content, and assets cataloged only as unverified leads; no V1 rate is trusted |
+| T006 | Run Raspberry Pi platform spike | Grok Build | blocked | Await T004; current supported Pi OS 64-bit release and RAM recorded; Python 3.12, Playwright Chromium arm64, SQLite WAL on NVMe, and memory use verified |
+| T007 | Write collection, evidence, and licensing policy | GPT-6.1 Sol + Sid | blocked | Await T004; robots/ToS decisions, User-Agent, rate limits, public-evidence rules, corrections, MIT code license, and CC BY 4.0 dataset/docs license recorded |
 
 ### M1 — Data contract, seed evidence, and vertical slice
 
 | ID | Task | Owner | Status | Acceptance criteria |
 |---|---|---|---|---|
-| T010 | Write canonical domain data contract | GPT-6.1 Sol | ready | Institution, product, condition, scenario, source, artifact, evidence, candidate, offer, validation, withdrawal, and publication contracts approved |
+| T010 | Write canonical domain data contract | GPT-6.1 Sol | blocked | Await T004; institution, product, condition, scenario, source, artifact, evidence, candidate, offer, validation, correction, withdrawal, and publication contracts approved |
 | T008 | Select three seed CUs and one static vertical-slice CU | GPT-6.1 Sol + Sid | blocked | Await T005/T007/T010; seed set covers static positive, non-mortgage negative, and one difficult source |
 | T031 | Implement immutable artifact store | Sonnet | blocked | Await T004/T010; every artifact is content-addressed and stores HTTP metadata, timestamps, source, hash, code version, and retention class |
 | T032 | Implement minimal polite fetch worker | Grok Build | blocked | Await T007/T031; User-Agent, per-host limits, robots decision, caching, failure states, and no-circumvention rules are enforced |
@@ -503,17 +521,17 @@ acceptance criteria and verification are recorded.
 | T011 | Finalize mortgage, home-equity, and HELOC taxonomies | Sonnet + Opus review | blocked | Await T009/T010; semantics cover seed fixtures, conditions, scenarios, and unrelated-product rejection |
 | T012 | Implement database schema and migrations | Sonnet | blocked | Await T010/T011; fresh and migrated databases pass contract tests with Decimal-safe financial storage |
 | T013 | Specify and implement publication-boundary invariants | Sol specifies; Sonnet implements; Gemini expands | blocked | Await T010; no offer publishes without approved institution/source/parser, current artifact, locator, conditions, validation, freshness, and review eligibility |
-| T014 | Deliver one-CU static end-to-end vertical slice | Sonnet | blocked | Await T012/T013/T031/T032; one approved source flows artifact → extract → normalize → validate → `published.sqlite` → server-rendered page |
+| T014 | Deliver one-CU static end-to-end vertical slice | Sonnet | blocked | Await T008/T009/T012/T013/T031/T032; one approved source flows artifact → extract → normalize → validate → `published.sqlite` → server-rendered page |
 
 ### M2 — Institution, product, and source registry
 
 | ID | Task | Owner | Status | Acceptance criteria |
 |---|---|---|---|---|
-| T020 | Import current official MA NCUA roster | Sonnet | blocked | Await T004; reproducible NCUA import, MA Division of Banks cross-check metadata, lifecycle states, and reconciliation report |
-| T021 | Reconcile institution identities | Grok research + Sid review | blocked | Await T020; every row matched, explicitly excepted, lifecycle-classified, or held for review |
+| T020 | Import current official MA NCUA roster | Sonnet | blocked | Await T010/T012; reproducible NCUA import, MA Division of Banks cross-check metadata, lifecycle states, and reconciliation report |
+| T021 | Reconcile institution identities | Grok research + Sid review | blocked | Await T020/T031/T032; every row matched, explicitly excepted, lifecycle-classified, or held for review |
 | T022 | Catalog home-lending products | Grok research | blocked | Await T021/T031/T032; every product claim cites a RawArtifact ID and explicit status |
 | T023 | Verify source URLs and fetch profiles | Grok research + Sid approval | blocked | Await T021/T031/T032; each source is institution-bound, product-bound, artifact-backed, and approved |
-| T024 | Build registry validation tooling | Sonnet | blocked | Await T012/T023; duplicate identities, cross-CU URL collisions, invalid states, and missing artifact evidence fail validation |
+| T024 | Build registry validation tooling | Sonnet | blocked | Await T012/T023; duplicate identities, unapproved cross-CU URL sharing, invalid states, and missing artifact evidence fail validation; approved shared providers remain explicit |
 
 ### M3 — Representative pilot expansion
 
@@ -526,34 +544,34 @@ acceptance criteria and verification are recorded.
 
 | ID | Task | Owner | Status | Acceptance criteria |
 |---|---|---|---|---|
-| T040 | Static HTML adapter | Sonnet | blocked | Positive and negative fixtures pass with evidence locators |
-| T041 | Vendor adapter framework | Grok Build | blocked | Known platforms route deterministically and cannot bypass product classification |
-| T042 | PDF text adapter | Sonnet | blocked | Text PDFs extract source-grounded candidates; image-only files quarantine |
-| T043 | Browser/XHR adapter | Grok Build | blocked | Dynamic sources store network evidence and deterministic scenario inputs |
-| T044 | Normalize product-specific offers | Sonnet | blocked | Mortgage, home-equity, and HELOC records retain distinct semantics |
-| T045 | Deterministic validation and quarantine | Sonnet + Grok audit | blocked | Field checks, family-specific APR logic, scenario matching, 50-bp review threshold, fingerprints, freshness, and reason codes are tested |
+| T040 | Static HTML adapter | Sonnet | blocked | Await T011/T012/T033; positive and negative fixtures pass with evidence locators |
+| T041 | Vendor adapter framework | Grok Build | blocked | Await T011/T012/T033; known platforms route deterministically and cannot bypass product classification |
+| T042 | PDF text adapter | Sonnet | blocked | Await T011/T012/T033; text PDFs extract source-grounded candidates; image-only files quarantine |
+| T043 | Browser/XHR adapter | Grok Build | blocked | Await T006/T011/T012/T033; dynamic sources store network evidence and deterministic scenario inputs |
+| T044 | Normalize product-specific offers | Sonnet | blocked | Await T012 and at least one adapter; mortgage, home-equity, and HELOC records retain distinct semantics |
+| T045 | Deterministic validation and quarantine | Sonnet + Grok audit | blocked | Await T013/T044; field checks, family-specific APR logic, scenario matching, 50-bp review threshold, fingerprints, freshness, and reason codes are tested |
 
 ### M5 — Publication and educational website
 
 | ID | Task | Owner | Status | Acceptance criteria |
 |---|---|---|---|---|
-| T050 | Atomic public snapshot builder | Sonnet | blocked | Only current validated offers publish; atomic read-only `published.sqlite`, 72/96-hour freshness transitions, emergency withdrawal, and fail-safe replacement are tested |
-| T051 | Server-rendered website foundation | Sonnet | blocked | Accessible, responsive, crawlable pages with no client-only data dependency |
-| T052 | CU profiles and coverage pages | Sonnet | blocked | Every in-scope CU has an honest public status and evidence links where appropriate |
-| T053 | Product comparison experiences | Sonnet | blocked | Like-for-like mortgage, home-equity, and HELOC views expose assumptions and freshness |
-| T054 | Educational content system | Gemini Flash + human review | blocked | Original, accurate, source-linked content with editorial metadata |
-| T055 | Analytics, SEO, consent, and ad-readiness | Sonnet + Gemini verification | blocked | `gtag.js`, basic Consent Mode v2, CSP, sitemap, canonical, `noindex`, conditional `ads.txt`, structured metadata, and performance tests pass |
-| T056 | Launch gate and corrections workflow | GPT-6.1 Sol + Sid | blocked | Milestone exit criteria, security headers, legal/editorial pages, correction intake, emergency withdrawal rehearsal, and content review pass |
+| T050 | Atomic public snapshot builder | Sonnet | blocked | Await T045; only current validated offers publish; immutable versioned `published.sqlite`, 72/96-hour freshness, read-time expiry, emergency denylist, and fail-safe replacement are tested |
+| T051 | Server-rendered website foundation | Sonnet | blocked | Await T004; accessible, responsive, crawlable pages with no client-only data dependency |
+| T052 | CU profiles and coverage pages | Sonnet | blocked | Await T021/T023/T051; every in-scope CU has an honest public status and evidence links where appropriate |
+| T053 | Product comparison experiences | Sonnet | blocked | Await T050/T051; like-for-like views expose assumptions, freshness, coverage counts, and membership eligibility; unqualified statewide or "best" claims are prohibited |
+| T054 | Educational content system | Gemini Flash + human review | blocked | Await T007/T051; original, accurate, source-linked content with editorial metadata |
+| T055 | Analytics, SEO, consent, and ad-readiness | Sonnet + Gemini verification | blocked | Await T051/T054; `gtag.js`, basic Consent Mode v2, CSP, sitemap, canonical, `noindex`, conditional `ads.txt`, conservative JSON-LD, and performance tests pass |
+| T056 | Launch gate and corrections workflow | GPT-6.1 Sol + Sid | blocked | Await T050–T055/T064; milestone exit criteria, security headers, legal/editorial pages, correction intake, emergency withdrawal rehearsal, and content review pass |
 
 ### M6 — Raspberry Pi operations and expansion
 
 | ID | Task | Owner | Status | Acceptance criteria |
 |---|---|---|---|---|
-| T060 | Pi web/worker deployment | Grok Build | blocked | Separate services, least privilege, health checks, and reproducible deployment |
-| T061 | Scheduling, backups, and restore test | Sonnet | blocked | Scheduled collection, verified backups, and documented restore rehearsal |
-| T062 | Freshness and regression monitoring | Sonnet | blocked | Alerts cover stale sources, zero-row regressions, structural drift, and publish failure |
-| T063 | Expand by verified platform batch | Assigned per batch | blocked | Each expansion meets pilot-level evidence and test standards |
-| T064 | Security hardening and adversarial audit | Grok 4.7 + Sonnet remediation | blocked | Dependency, secret, auth, CSP, input, file, network, service, and Pi exposure findings resolved or explicitly accepted |
+| T060 | Pi web/worker deployment | Grok Build | blocked | Await T006/T050/T051; separate services, least privilege, health checks, and reproducible deployment |
+| T061 | Scheduling, backups, and restore test | Sonnet | blocked | Await T060; scheduled collection, verified backups, and documented restore rehearsal |
+| T062 | Freshness and regression monitoring | Sonnet | blocked | Await T050/T060; alerts cover stale sources, zero-row regressions, structural drift, and publish failure |
+| T063 | Expand by verified platform batch | Assigned per batch | blocked | Await T056/T062; each expansion meets pilot-level evidence and test standards |
+| T064 | Security hardening and adversarial audit | Grok 4.7 + Sonnet remediation | blocked | Await T051/T055/T060; dependency, secret, auth, CSP, input, file, network, service, and Pi exposure findings resolved or explicitly accepted |
 
 ## 13. Handoff template
 
@@ -579,7 +597,7 @@ A task is ready only when:
 
 - Its dependencies are done.
 - Scope and acceptance criteria are explicit.
-- Its input data or fixtures are available.
+- Its required inputs are available, including fixtures when the task consumes them.
 - One writer owns it.
 - It does not require an unresolved product-owner decision.
 - A task packet exists at `tasks/<TASK_ID>.md` with scope, allowed files,
@@ -614,7 +632,9 @@ metadata, and freshness verification.
 | 2026-11-14 | Rank only offers matching a declared canonical scenario | APR and rate comparisons are meaningful only under like-for-like assumptions |
 | 2026-11-14 | Withdraw offers after 96 hours without successful re-observation | A hard freshness bound is safer than silently presenting stale financial data |
 | 2026-11-14 | Keep raw evidence private and publish only bounded excerpts and source links | Preserve auditability while limiting redistribution and privacy risk |
-| 2026-11-14 | Keep active worktrees and mutable runtime state outside iCloud | Avoid SQLite, Playwright, and synchronization corruption on the Pi and Mac |
+| 2026-11-14 | Keep the authoritative active clone and mutable runtime state outside iCloud | Avoid Git metadata, SQLite, Playwright, and synchronization corruption on the Pi and Mac |
+| 2026-11-14 | Keep jumbo browse-only until a source-tested scenario and limit rule exist | The initial plan had no canonical jumbo scenario, so ranking would contradict its own comparison rules |
+| 2026-11-14 | Enforce offer expiry in the web layer as well as publication | Stale data must disappear even if collection or snapshot generation is down |
 
 ## 17. Review register
 
@@ -622,6 +642,10 @@ metadata, and freshness verification.
 |---|---|---|---|---|
 | 2026-11-14 | Claude Opus 5.5 | Initial project-control document | Direction approved; four design blockers identified for T003 | `reviews/2026-11-14-opus-5.5-initial-review.md` |
 | 2026-11-14 | GPT-6.1 Sol | Reconciliation of initial Opus review | Accepted design blockers and high-value recommendations; recorded D-01 through D-10 | `tasks/T003.md` |
+| 2026-11-14 | Claude Opus 5.5 | Independent round-2 plan audit | Approve with changes; external clone and T004 packet fixes required | `reviews/2026-11-14-opus-5.5-round2.md` |
+| 2026-11-14 | Grok 4.7 | Independent round-2 plan audit | Approve with changes; no T004 blocker after packet corrections | `reviews/2026-11-14-grok-4.7-round2.md` |
+| 2026-11-14 | Gemini 3.8 Flash High | Independent round-2 plan audit | Approve with changes; T004 may proceed | `reviews/2026-11-14-gemini-3.8-flash-round2.md` |
+| 2026-11-14 | GPT-6.1 Sol | Cross-model synthesis and adjudication | Accepted safety and dependency fixes; deferred evidence-dependent choices; rejected premature scope | `reviews/2026-11-14-round2-synthesis.md` |
 
 ## 18. Change log
 
@@ -630,6 +654,7 @@ metadata, and freshness verification.
 | 2026-11-14 | T001 | Created V2 project-control document, architecture, model roles, operating protocol, and initial task ledger | GPT-6.1 Sol |
 | 2026-11-14 | T002 | Recorded independent Opus 5.5 review; moved project to review reconciliation | GPT-6.1 Sol |
 | 2026-11-14 | T003 | Integrated Opus findings: scenarios, conditions, freshness, publication rules, evidence model, corrected dependencies, Pi constraints, and governance | GPT-6.1 Sol |
+| 2026-11-14 | Review R2 | Audited the reconciled plan independently with Opus 5.5, Grok 4.7, and Gemini 3.8 Flash; applied accepted corrections and recorded rejected/deferred advice | GPT-6.1 Sol |
 
 ## 19. Resolved design decisions
 
@@ -638,14 +663,14 @@ dated decision-log entry and an impact review of contracts, fixtures, and public
 
 | ID | Decision | Resolution |
 |---|---|---|
-| D-01 | Canonical scenarios | Use the four scenarios in Section 4.4; form-generated quotes are labeled and never power statewide lowest-rate headlines |
+| D-01 | Canonical scenarios | Use the four scenarios in Section 4.4; form-generated quotes are labeled and never power statewide summary language |
 | D-02 | Freshness | Collect daily, mark degraded after 72 hours, withdraw rate comparisons after 96 hours, and support immediate manual withdrawal |
 | D-03 | Auto-publication | Permit only previously reviewed, structurally unchanged offers that satisfy every condition in Principle 13; otherwise quarantine for review |
-| D-04 | First-release program scope | Rank conventional and jumbo; catalog government, agency, and first-time-buyer programs as browse-only until modeled |
+| D-04 | First-release program scope | Rank conventional conforming offers; catalog jumbo, government, agency, and first-time-buyer programs as browse-only until modeled |
 | D-05 | Rate without APR | Show only on an institution detail page with an explicit label; exclude from rankings and headlines |
 | D-06 | Licensing and public evidence | MIT for code, CC BY 4.0 for original documentation and exported normalized datasets; raw third-party artifacts remain private and are not relicensed or redistributed |
-| D-07 | Pi platform | Raspberry Pi OS Bookworm 64-bit, Python 3.12 managed by `uv`, and NVMe/SSD for all mutable data; verify Playwright arm64 early |
+| D-07 | Pi platform | Use a currently supported Raspberry Pi OS 64-bit release, Python 3.12 managed by `uv`, and NVMe/SSD for all mutable data; T006 records the selected release, RAM, and Playwright arm64 result |
 | D-08 | Analytics and consent | Use GA4 `gtag.js`, not GTM; initialize Consent Mode v2 in basic mode with storage denied until consent; no advertising at launch |
 | D-09 | Network edge | Use Caddy locally behind Cloudflare Tunnel/CDN, with no inbound router port; document an alternate direct-hosting path before production if the tunnel is rejected |
-| D-10 | Repository and runtime location | Keep this planning repository in the requested iCloud folder, but create the active implementation worktree, virtual environment, caches, databases, WAL/SHM files, and artifacts outside iCloud in T004 |
+| D-10 | Repository and runtime location | Keep this planning repository in the requested iCloud folder as a frozen mirror, but create the authoritative full implementation clone, virtual environment, caches, databases, WAL/SHM files, and artifacts outside iCloud in T004 |
 
