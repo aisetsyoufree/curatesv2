@@ -32,11 +32,19 @@ TERMS_TTL = 90 * ROBOTS_TTL
 MAX_RETRY_DELAY = 15 * 60
 MAX_BODY = 8 * 1024 * 1024
 MAX_ROBOTS = 512 * 1024
+_CHALLENGE_PREFIX_BYTES = 64_000
 _MEDIA = {
     EvidenceKind.HTML: "text/html",
     EvidenceKind.PDF: "application/pdf",
     EvidenceKind.JSON: "application/json",
 }
+
+
+class FetchApproval(SourceApproval):
+    """Human-approved source, media kind, and exact request profile."""
+
+    profile: FetchProfile
+    evidence_kind: EvidenceKind
 
 
 class TermsReview(SourceApproval):
@@ -54,6 +62,10 @@ class Reobservation:
     """
 
     run_id: str
+    source_id: str
+    profile_id: str
+    git_sha: str
+    started_at: datetime
     observed_at: datetime
     original: RawArtifact
     http_status: int = 304
@@ -119,12 +131,25 @@ def _retry_after(headers: httpx.Headers, now: float) -> float:
 
 
 def _is_challenge(response: _Response) -> bool:
-    head = response.body[:64_000].lower()
+    head = response.body[:_CHALLENGE_PREFIX_BYTES].lower()
     return (
         bool(response.headers.get("www-authenticate"))
         or "challenge" in response.headers.get("cf-mitigated", "").lower()
         or any(
-            marker in head for marker in (b"/cdn-cgi/challenge-platform", b"<title>just a moment")
+            marker in head
+            for marker in (
+                b"/cdn-cgi/challenge-platform",
+                b"<title>just a moment",
+                b"g-recaptcha",
+                b"gstatic.com/recaptcha/",
+                b"hcaptcha.com/1/api.js",
+                b'class="h-captcha',
+                b"captcha-delivery.com/",
+                b"_pxcaptcha",
+                b"incapsula incident id",
+                b"verify you are human",
+                b"verify that you are a human",
+            )
         )
     )
 
@@ -144,6 +169,7 @@ class FetchWorker:
         *,
         git_sha: str,
         clock: Callable[[], float] = time.time,
+        monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if not re.fullmatch(r"[0-9a-f]{40}", git_sha):
@@ -154,6 +180,7 @@ class FetchWorker:
             raise ValueError("fetch state directory must be a private real directory")
         self._root, self._store, self._transport = root, store, transport
         self._git_sha, self._clock, self._sleep = git_sha, clock, sleep
+        self._monotonic = monotonic
 
     @contextmanager
     def _state(self) -> Iterator[sqlite3.Connection]:
@@ -194,13 +221,13 @@ class FetchWorker:
     def _set(db: sqlite3.Connection, key: str, value: str) -> None:
         db.execute("INSERT OR REPLACE INTO state VALUES (?, ?)", (key, value))
 
-    def _wait(self, until: float) -> None:
-        remaining = until - self._clock()
+    def _wait(self, until: float, tick_until: float) -> None:
+        remaining = max(until - self._clock(), tick_until - self._monotonic())
         if remaining > MAX_RETRY_DELAY:
             raise _Stopped("deferred")
         if remaining > 0:
             self._sleep(remaining)
-        if self._clock() < until:
+        if self._clock() < until or self._monotonic() < tick_until:
             raise _Stopped("clock-not-ready")
 
     def _send(
@@ -219,11 +246,21 @@ class FetchWorker:
                 float(self._get(db, "next-global") or 0),
                 float(self._get(db, f"started:{origin}") or 0) + spacing,
                 float(self._get(db, f"defer:{origin}") or 0),
-            )
+                float(self._get(db, "global-pressure") or 0),
+            ),
+            max(
+                float(self._get(db, "next-tick") or 0),
+                float(self._get(db, f"tick:{origin}") or 0) + spacing,
+                float(self._get(db, f"defer-tick:{origin}") or 0),
+                float(self._get(db, "pressure-tick") or 0),
+            ),
         )
         started = self._clock()
+        tick = self._monotonic()
         self._set(db, "next-global", str(started + 5))
         self._set(db, f"started:{origin}", str(started))
+        self._set(db, "next-tick", str(tick + 5))
+        self._set(db, f"tick:{origin}", str(tick))
         with (
             httpx.Client(
                 transport=self._transport(),
@@ -237,7 +274,7 @@ class FetchWorker:
                 headers={"User-Agent": USER_AGENT, "Accept-Encoding": "identity", **headers},
             ) as response,
         ):
-            if response.status_code != 200:
+            if response.status_code != 200 and response.status_code not in (401, 403, 429, 503):
                 return _Response(response.status_code, response.headers, b"")
             if response.headers.get("content-encoding", "identity").lower() != "identity":
                 raise _Stopped("unsupported-encoding")
@@ -246,10 +283,15 @@ class FetchWorker:
                 iter((response.content,)) if response.is_stream_consumed else response.iter_raw()
             )
             for chunk in chunks:
+                if self._monotonic() - tick > timeout:
+                    raise _Stopped("response-time-limit")
+                if response.status_code != 200:
+                    body.extend(chunk[: _CHALLENGE_PREFIX_BYTES - len(body)])
+                    if len(body) >= _CHALLENGE_PREFIX_BYTES:
+                        break
+                    continue
                 if len(body) + len(chunk) > limit:
                     raise _Stopped("body-too-large")
-                if self._clock() - started > timeout:
-                    raise _Stopped("response-time-limit")
                 body.extend(chunk)
             return _Response(response.status_code, response.headers, bytes(body))
 
@@ -257,19 +299,29 @@ class FetchWorker:
         origin = f"https://{url.host}"
         key = f"robots:{origin}"
         cached = self._get(db, key)
+        spacing = 5
         if cached:
-            at, body = json.loads(cached)
-            if 0 <= self._clock() - at < ROBOTS_TTL:
-                return parse_robots(bytes.fromhex(body))
+            at, tick, body = json.loads(cached)
+            policy = parse_robots(bytes.fromhex(body))
+            spacing = max(spacing, policy.delay)
+            if 0 <= self._clock() - at < ROBOTS_TTL and 0 <= self._monotonic() - tick < ROBOTS_TTL:
+                return policy
         try:
             response = self._send(
-                db, httpx.URL(f"{origin}/robots.txt"), {}, timeout, limit=MAX_ROBOTS
+                db,
+                httpx.URL(f"{origin}/robots.txt"),
+                {},
+                timeout,
+                limit=MAX_ROBOTS,
+                spacing=spacing,
             )
         except httpx.HTTPError as exc:
             raise _Stopped("robots-unavailable") from exc
-        if _is_challenge(response) or response.status in (401, 403, 429):
+        if _is_challenge(response):
+            raise _Stopped("access-challenge")
+        if response.status in (401, 403, 429):
             if response.status == 429:
-                self._defer(db, origin, response.headers, minimum=30)
+                self._defer(db, origin, response.headers, minimum=30, pressure=True)
             raise _Stopped("robots-unavailable")
         if 400 <= response.status < 500:
             body = b""
@@ -284,7 +336,7 @@ class FetchWorker:
             policy = parse_robots(body)
         except ValueError as exc:
             raise _Stopped("robots-unsupported") from exc
-        self._set(db, key, json.dumps((self._clock(), body.hex())))
+        self._set(db, key, json.dumps((self._clock(), self._monotonic(), body.hex())))
         return policy
 
     def _defer(
@@ -294,17 +346,25 @@ class FetchWorker:
         headers: httpx.Headers,
         *,
         minimum: float,
+        pressure: bool = False,
     ) -> float:
         now = self._clock()
         delay = max(minimum, _retry_after(headers, now))
         self._set(db, f"defer:{origin}", str(now + delay))
+        tick = self._monotonic()
+        self._set(db, f"defer-tick:{origin}", str(tick + delay))
+        # Deliberately stricter than domain-wide pressure. An HTTP Retry-After
+        # can slow the entire serial collector, including sibling hostnames.
+        if pressure or "retry-after" in headers:
+            self._set(db, "global-pressure", str(now + delay))
+            self._set(db, "pressure-tick", str(tick + delay))
         return delay
 
     def fetch(
         self,
         source: RateSource,
         profile: FetchProfile,
-        approval: SourceApproval,
+        approval: FetchApproval,
         terms: TermsReview,
         *,
         withdrawn: bool = False,
@@ -320,11 +380,15 @@ class FetchWorker:
                 return FetchResult("source-not-approved")
         if (now - terms.decided_at).total_seconds() >= TERMS_TTL:
             return FetchResult("terms-review-expired")
+        if approval.approval_id == terms.approval_id:
+            return FetchResult("terms-review-not-independent-record")
         if (
             withdrawn
             or profile.source_id != source.source_id
             or profile.method is not FetchMethod.HTTP_GET
             or source.evidence_kind not in _MEDIA
+            or approval.profile != profile
+            or approval.evidence_kind is not source.evidence_kind
         ):
             return FetchResult("withdrawn-or-unsupported-profile")
         try:
@@ -352,15 +416,24 @@ class FetchWorker:
         if now < max(
             float(self._get(db, f"scheduled:{key}") or 0),
             float(self._get(db, f"defer:{origin}") or 0),
+            float(self._get(db, "global-pressure") or 0),
+        ) or self._monotonic() < max(
+            float(self._get(db, f"scheduled-tick:{key}") or 0),
+            float(self._get(db, f"defer-tick:{origin}") or 0),
+            float(self._get(db, "pressure-tick") or 0),
         ):
             return FetchResult("not-due")
         run_id = uuid4().hex
         self._set(db, f"scheduled:{key}", str(now + max(5, profile.min_interval_seconds)))
+        self._set(
+            db,
+            f"scheduled-tick:{key}",
+            str(self._monotonic() + max(5, profile.min_interval_seconds)),
+        )
         status, reason = RunStatus.BLOCKED, "robots-disallowed"
         artifact = None
         observed = None
         terminal = 0
-        paused = False
         try:
             robots = self._robots(db, url, profile.timeout_seconds)
             if robots.permits(url.path):
@@ -379,7 +452,8 @@ class FetchWorker:
                     status = RunStatus.FAILED
                     if reason in {"http-403", "http-429", "http-429-deferred"}:
                         terminal = 403 if reason == "http-403" else 429
-                    paused = reason == "access-challenge"
+                    if reason == "access-challenge":
+                        status = RunStatus.BLOCKED
                 except (httpx.HTTPError, ArtifactStoreError, OSError):
                     status, reason = RunStatus.FAILED, "transport-or-storage-failure"
         except _Stopped as exc:
@@ -390,7 +464,7 @@ class FetchWorker:
         barred = 1 + int(self._get(db, f"barred:{key}") or 0) if terminal in (403, 429) else 0
         self._set(db, f"failures:{key}", str(failures))
         self._set(db, f"barred:{key}", str(barred))
-        if paused or barred >= 3 or failures >= 5:
+        if reason in {"access-challenge", "robots-disallowed"} or barred >= 3 or failures >= 5:
             self._set(db, f"paused:{key}", reason)
         end = datetime.fromtimestamp(max(now, self._clock()), UTC)
         if observed is not None:
@@ -402,13 +476,27 @@ class FetchWorker:
                         {
                             "http_status": 304,
                             "source_id": key,
+                            "profile_id": profile.profile_id,
+                            "git_sha": self._git_sha,
+                            "started_at": datetime.fromtimestamp(now, UTC).isoformat(),
                             "observed_at": end.isoformat(),
                             "original": observed.model_dump(mode="json"),
                         }
                     ),
                 ),
             )
-            return FetchResult("reobserved", reobserved=Reobservation(run_id, end, observed))
+            return FetchResult(
+                "reobserved",
+                reobserved=Reobservation(
+                    run_id,
+                    key,
+                    profile.profile_id,
+                    self._git_sha,
+                    datetime.fromtimestamp(now, UTC),
+                    end,
+                    observed,
+                ),
+            )
         run = FetchRun(
             schema_version=CONTRACT_VERSION,
             run_id=run_id,
@@ -522,7 +610,9 @@ class FetchWorker:
                 )
                 return record, None
             if code in (408, 429) or 500 <= code < 600:
-                delay = self._defer(db, origin, response.headers, minimum=30 * 2**attempt)
+                delay = self._defer(
+                    db, origin, response.headers, minimum=30 * 2**attempt, pressure=code == 429
+                )
                 if delay > MAX_RETRY_DELAY:
                     raise _Stopped(f"http-{code}-deferred")
                 if attempt < 2:
