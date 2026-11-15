@@ -23,7 +23,14 @@ from cu_rates.artifact_store import ArtifactStore, ArtifactStoreError
 from cu_rates.contracts.base import CONTRACT_VERSION, HttpUrlText, Sha256Hex
 from cu_rates.contracts.enums import EvidenceKind, FetchMethod, RunStatus
 from cu_rates.contracts.evidence import RawArtifact
-from cu_rates.contracts.sources import FetchProfile, FetchRun, RateSource, SourceApproval
+from cu_rates.contracts.sources import (
+    ConditionalValidator,
+    FetchProfile,
+    FetchRun,
+    NotModifiedObservation,
+    RateSource,
+    SourceApproval,
+)
 from cu_rates.fetch_robots import PRODUCT, RobotsPolicy, parse_robots
 
 USER_AGENT = f"{PRODUCT}/2 (+https://github.com/aisetsyoufree/curatesv2)"
@@ -68,7 +75,23 @@ class Reobservation:
     started_at: datetime
     observed_at: datetime
     original: RawArtifact
+    validator: ConditionalValidator
     http_status: int = 304
+
+    def record(self) -> NotModifiedObservation:
+        """The contract form publication verifies against the original run and artifact."""
+        return NotModifiedObservation(
+            schema_version=CONTRACT_VERSION,
+            run_id=self.run_id,
+            source_id=self.source_id,
+            profile_id=self.profile_id,
+            git_sha=self.git_sha,
+            started_at=self.started_at,
+            observed_at=self.observed_at,
+            original_run_id=self.original.fetch_run_id,
+            original_artifact_id=self.original.artifact_id,
+            validator=self.validator,
+        )
 
 
 @dataclass(frozen=True)
@@ -113,6 +136,18 @@ def _public_url(text: str) -> httpx.URL:
     except ValueError:
         return url
     raise _Stopped("unsupported-url")
+
+
+def _validator(etag: str | None, last_modified: str | None) -> ConditionalValidator | None:
+    """The validator a later conditional request uses: the ETag, else Last-Modified."""
+    try:
+        if etag:
+            return ConditionalValidator(kind="etag", value=etag)
+        if last_modified:
+            return ConditionalValidator(kind="last_modified", value=last_modified)
+    except ValidationError:
+        pass
+    return None
 
 
 def _retry_after(headers: httpx.Headers, now: float) -> float:
@@ -438,12 +473,13 @@ class FetchWorker:
         status, reason = RunStatus.BLOCKED, "robots-disallowed"
         artifact = None
         observed = None
+        validator = None
         terminal = 0
         try:
             robots = self._robots(db, url, profile.timeout_seconds)
             if robots.permits(url.path):
                 try:
-                    artifact, observed = self._retrieve(
+                    artifact, observed, validator = self._retrieve(
                         db,
                         source,
                         profile,
@@ -472,7 +508,7 @@ class FetchWorker:
         if reason in {"access-challenge", "robots-disallowed"} or barred >= 3 or failures >= 5:
             self._set(db, f"paused:{key}", reason)
         end = datetime.fromtimestamp(max(now, self._clock()), UTC)
-        if observed is not None:
+        if observed is not None and validator is not None:
             db.execute(
                 "INSERT INTO events VALUES (?, ?)",
                 (
@@ -486,6 +522,7 @@ class FetchWorker:
                             "started_at": datetime.fromtimestamp(now, UTC).isoformat(),
                             "observed_at": end.isoformat(),
                             "original": observed.model_dump(mode="json"),
+                            "validator": validator.model_dump(mode="json") if validator else None,
                         }
                     ),
                 ),
@@ -500,6 +537,7 @@ class FetchWorker:
                     datetime.fromtimestamp(now, UTC),
                     end,
                     observed,
+                    validator,
                 ),
             )
         run = FetchRun(
@@ -513,6 +551,7 @@ class FetchWorker:
             git_sha=self._git_sha,
             artifact_ids=(artifact.artifact_id,) if artifact else (),
             error=None if succeeded else reason,
+            conditional_validator=validator if succeeded else None,
         )
         db.execute("INSERT INTO events VALUES (?, ?)", (run_id, run.model_dump_json()))
         return FetchResult(reason, run, artifact)
@@ -525,10 +564,11 @@ class FetchWorker:
         url: httpx.URL,
         run_id: str,
         spacing: int,
-    ) -> tuple[RawArtifact | None, RawArtifact | None]:
+    ) -> tuple[RawArtifact | None, RawArtifact | None, ConditionalValidator | None]:
         key = f"cache:{source.source_id}"
         cached = self._get(db, key)
         prior: RawArtifact | None = None
+        validator: ConditionalValidator | None = None
         headers: dict[str, str] = {}
         if cached:
             prior_json, etag, last_modified = json.loads(cached)
@@ -540,6 +580,7 @@ class FetchWorker:
                         headers["If-None-Match"] = etag
                     elif last_modified:
                         headers["If-Modified-Since"] = last_modified
+                    validator = _validator(etag, last_modified)
             except ValidationError as exc:
                 raise _Stopped("cache-invalid") from exc
         origin = f"https://{url.host}"
@@ -565,6 +606,7 @@ class FetchWorker:
                 echoed = response.headers.get("etag")
                 if (
                     prior is None
+                    or validator is None
                     or not headers
                     or (echoed and echoed != headers.get("If-None-Match"))
                 ):
@@ -589,7 +631,7 @@ class FetchWorker:
                         raise _Stopped("cache-invalid")
                 except (ArtifactStoreError, OSError, ValidationError) as exc:
                     raise _Stopped("cache-invalid") from exc
-                return None, prior
+                return None, prior, validator
             if code == 200:
                 media = response.headers.get("content-type", "").split(";")[0].strip().lower()
                 if media != _MEDIA[source.evidence_kind] or not response.body:
@@ -613,7 +655,11 @@ class FetchWorker:
                         )
                     ),
                 )
-                return record, None
+                return (
+                    record,
+                    None,
+                    _validator(response.headers.get("etag"), response.headers.get("last-modified")),
+                )
             if code in (408, 429) or 500 <= code < 600:
                 delay = self._defer(
                     db, origin, response.headers, minimum=30 * 2**attempt, pressure=code == 429

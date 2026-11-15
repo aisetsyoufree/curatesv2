@@ -8,7 +8,7 @@ records (``ReviewDecision``, ``WithdrawalEntry``), not booleans. No model output
 authority here.
 """
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated, Self
@@ -70,7 +70,13 @@ from cu_rates.contracts.scenarios import (
     ComparisonScenario,
     evaluate_scenario_match,
 )
-from cu_rates.contracts.sources import FetchRun, RateSource, SourceApproval
+from cu_rates.contracts.sources import (
+    FetchProfile,
+    FetchRun,
+    NotModifiedObservation,
+    RateSource,
+    SourceApproval,
+)
 
 MAX_AUTO_MOVEMENT_BP = Decimal(50)
 DEGRADE_AFTER = timedelta(hours=72)
@@ -117,6 +123,7 @@ class ReasonCode(StrEnum):
     ARTIFACT_SOURCE_MISMATCH = "artifact_source_mismatch"
     ARTIFACT_HTTP_STATUS = "artifact_http_status"
     FETCH_NOT_VERIFIED = "fetch_not_verified"
+    REOBSERVATION_UNVERIFIED = "reobservation_unverified"
     OBSERVATION_UNBOUND = "observation_unbound"
     FIELD_EVIDENCE_MISSING = "field_evidence_missing"
     VALIDITY_MISSING = "validity_missing"
@@ -196,6 +203,7 @@ QUARANTINE_REASONS = frozenset(
         R.ARTIFACT_SOURCE_MISMATCH,
         R.ARTIFACT_HTTP_STATUS,
         R.FETCH_NOT_VERIFIED,
+        R.REOBSERVATION_UNVERIFIED,
         R.OBSERVATION_UNBOUND,
         R.FIELD_EVIDENCE_MISSING,
         R.VALIDITY_MISSING,
@@ -353,6 +361,8 @@ class PublicationContext(ContractModel):
     approved_parsers: tuple[ParserVersion, ...] = ()
     known_artifacts: tuple[RawArtifact, ...] = ()
     fetch_runs: tuple[FetchRun, ...] = ()
+    reobservations: tuple[NotModifiedObservation, ...] = ()
+    approved_profile: FetchProfile | None = None
     validations: tuple[ValidationResult, ...] = ()
     prior: PriorPublication | None = None
     product_review: ReviewDecision | None = None
@@ -367,7 +377,10 @@ class PublicationContext(ContractModel):
         keyed: dict[str, list[object]] = {
             "approved parser": [(p.name, p.version) for p in self.approved_parsers],
             "known artifact": [a.artifact_id for a in self.known_artifacts],
-            "fetch run": [r.run_id for r in self.fetch_runs],
+            "fetch run": [
+                *(r.run_id for r in self.fetch_runs),
+                *(o.run_id for o in self.reobservations),
+            ],
             "validation rule result": [(v.offer_id, v.rule_id) for v in self.validations],
             "withdrawal": [w.withdrawal_id for w in self.withdrawals],
             "correction": [c.correction_id for c in self.corrections],
@@ -477,8 +490,70 @@ def _source_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[Reas
     return set()
 
 
+def _reobservation_proven(
+    observation: NotModifiedObservation,
+    artifact: RawArtifact,
+    offer: NormalizedOffer,
+    ctx: PublicationContext,
+) -> bool:
+    """Whether a 304 proves the same immutable body was still served, under approval.
+
+    It must name this artifact and its successful original run, the approved source and
+    profile, and the validator the original 200 carried; it must be collected after that
+    run finished and the approval was decided, and cannot lie in the future. Freshness
+    only: nothing here approves publication.
+    """
+    run = next((r for r in ctx.fetch_runs if r.run_id == artifact.fetch_run_id), None)
+    profile, approval = ctx.approved_profile, ctx.source_approval
+    return (
+        run is not None
+        and run.status is RunStatus.SUCCEEDED
+        and artifact.http_status == 200
+        and profile is not None
+        and approval is not None
+        and approval.approved
+        and observation.original_run_id == run.run_id
+        and observation.original_artifact_id == artifact.artifact_id
+        and observation.source_id == offer.source_id == ctx.source.source_id == run.source_id
+        and profile.source_id == observation.source_id
+        and observation.profile_id == run.profile_id == profile.profile_id
+        and run.conditional_validator is not None
+        and observation.validator == run.conditional_validator
+        and run.finished_at <= observation.started_at
+        and approval.decided_at <= observation.started_at
+        and observation.observed_at <= ctx.evaluated_at
+    )
+
+
+def _reobservation_basis(
+    artifact: RawArtifact, offer: NormalizedOffer, ctx: PublicationContext
+) -> tuple[datetime, bool]:
+    """The newest proven observation of ``artifact`` the offer claims, and any bad claim.
+
+    A 304 counts only when the offer's own observation time is exactly that 304's; an
+    unclaimed record is ignored, and a claimed one that is not fully proven fails closed.
+    """
+    claimed = [
+        o
+        for o in ctx.reobservations
+        if o.original_artifact_id == artifact.artifact_id
+        and o.observed_at == offer.observed_at
+        and o.observed_at != artifact.fetched_at
+    ]
+    if not claimed:
+        return artifact.fetched_at, False
+    if all(_reobservation_proven(o, artifact, offer, ctx) for o in claimed):
+        return offer.observed_at, False
+    return artifact.fetched_at, True
+
+
 def _artifact_reasons(
-    artifact: RawArtifact, offer: NormalizedOffer, ctx: PublicationContext, *, primary: bool
+    artifact: RawArtifact,
+    offer: NormalizedOffer,
+    ctx: PublicationContext,
+    *,
+    primary: bool,
+    observed: datetime | None = None,
 ) -> set[ReasonCode]:
     """Whether one stored response came from a successful, current fetch of this source."""
     reasons: set[ReasonCode] = set()
@@ -496,7 +571,7 @@ def _artifact_reasons(
         reasons.add(R.ARTIFACT_HTTP_STATUS)
     if artifact.fetched_at > ctx.evaluated_at:
         reasons.add(R.CLOCK_SKEW)
-    elif ctx.evaluated_at - artifact.fetched_at > WITHDRAW_AFTER:
+    elif ctx.evaluated_at - (observed or artifact.fetched_at) > WITHDRAW_AFTER:
         reasons.add(R.ARTIFACT_STALE)
     # The source contract models no redirects, so a cited page must be the exact URL.
     if primary and artifact.source_url != ctx.source.url:
@@ -508,7 +583,7 @@ def _evidence_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[Re
     reasons: set[ReasonCode] = set()
     stored = {artifact.artifact_id: artifact for artifact in ctx.known_artifacts}
     approved = set(ctx.approved_parsers)
-    used: dict[str, RawArtifact] = {}
+    used: dict[str, datetime] = {}
     for provenance in offer.iter_provenance():
         locator = provenance.locator
         referenced = [(provenance.artifact_id, True)]
@@ -519,10 +594,15 @@ def _evidence_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[Re
             if artifact is None:
                 reasons.add(R.ARTIFACT_NOT_STORED)
                 continue
-            reasons |= _artifact_reasons(artifact, offer, ctx, primary=primary)
+            observed, unproven = (
+                _reobservation_basis(artifact, offer, ctx) if primary else (None, False)
+            )
+            if unproven:
+                reasons.add(R.REOBSERVATION_UNVERIFIED)
+            reasons |= _artifact_reasons(artifact, offer, ctx, primary=primary, observed=observed)
             if not primary:
                 continue
-            used[artifact_id] = artifact
+            used[artifact_id] = observed or artifact.fetched_at
             if not locator_fits_media_type(locator, artifact.media_type) or (
                 locator.kind not in _SOURCE_LOCATORS[ctx.source.evidence_kind]
             ):
@@ -537,8 +617,8 @@ def _evidence_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[Re
             reasons.add(R.PARSER_NOT_APPROVED)
         if provenance.is_ocr:
             reasons.add(R.OCR_VALUE)
-    # Observation is the newest cited fetch, not a free-standing claim.
-    if used and offer.observed_at != max(a.fetched_at for a in used.values()):
+    # Observation is the newest cited fetch (or proven 304 of one), not a free-standing claim.
+    if used and offer.observed_at != max(used.values()):
         reasons.add(R.OBSERVATION_UNBOUND)
     return reasons
 

@@ -121,10 +121,12 @@ from cu_rates.contracts.scenarios import (
     match_numeric,
 )
 from cu_rates.contracts.sources import (
+    ConditionalValidator,
     ExtractedCandidate,
     ExtractionRun,
     FetchProfile,
     FetchRun,
+    NotModifiedObservation,
     RateSource,
     SourceApproval,
     SourceFingerprint,
@@ -145,6 +147,7 @@ __all__ = [
     "ChangeKind",
     "ComparisonScenario",
     "ConditionKind",
+    "ConditionalValidator",
     "ConformingStatus",
     "ContractModel",
     "Correction",
@@ -175,6 +178,7 @@ __all__ = [
     "MembershipKind",
     "MembershipRule",
     "NormalizedOffer",
+    "NotModifiedObservation",
     "Occupancy",
     "OfferCondition",
     "OfferFingerprints",

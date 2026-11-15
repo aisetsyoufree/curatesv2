@@ -489,6 +489,7 @@ def test_unsafe_cases_cover_every_blocking_reason() -> None:
         R.ARTIFACT_HTTP_STATUS,
         R.FETCH_NOT_VERIFIED,
         R.OBSERVATION_UNBOUND,
+        R.REOBSERVATION_UNVERIFIED,
         R.VALIDATION_UNBOUND,
         R.CORRECTION_PENDING,
     }  # covered by dedicated tests below and in test_publication_evidence.py

@@ -14,7 +14,7 @@ from cu_rates import fetch_worker
 from cu_rates.artifact_store import ArtifactStore
 from cu_rates.contracts.base import CONTRACT_VERSION
 from cu_rates.contracts.enums import EvidenceKind, FetchMethod, ReviewVerdict, RunStatus
-from cu_rates.contracts.sources import FetchProfile, RateSource
+from cu_rates.contracts.sources import ConditionalValidator, FetchProfile, RateSource
 from cu_rates.fetch_worker import (
     ROBOTS_TTL,
     USER_AGENT,
@@ -342,6 +342,40 @@ def test_reobserved_304_preserves_the_original_success(pilot: Pilot) -> None:
     assert item.started_at <= item.observed_at
     assert result.run is None and result.artifact is None
     assert list(pilot.store.observations()) == [first.artifact]
+
+
+def test_304_records_the_validator_the_original_200_carried(pilot: Pilot) -> None:
+    first = pilot.fetch(
+        lambda req: robots() if req.url.path == "/robots.txt" else page(ETag='"v1"')
+    )
+    assert first.run is not None and first.artifact is not None
+    assert first.run.conditional_validator == ConditionalValidator(kind="etag", value='"v1"')
+    pilot.clock.sleep(60)
+    result = pilot.fetch(lambda _: httpx.Response(304, headers={"ETag": '"v1"'}))
+    item = result.reobserved
+    assert item is not None
+    assert item.validator == first.run.conditional_validator
+    record = item.record()
+    assert record.original_run_id == first.run.run_id
+    assert record.original_artifact_id == first.artifact.artifact_id
+    assert record.profile_id == pilot.profile.profile_id and record.http_status == 304
+    assert record.observed_at == item.observed_at
+
+
+def test_last_modified_is_the_validator_when_there_is_no_etag(pilot: Pilot) -> None:
+    stamp = "Tue, 01 Sep 2026 00:00:00 GMT"
+    first = pilot.fetch(
+        lambda req: robots() if req.url.path == "/robots.txt" else page(**{"Last-Modified": stamp})
+    )
+    assert first.run is not None
+    assert first.run.conditional_validator == ConditionalValidator(
+        kind="last_modified", value=stamp
+    )
+
+
+def test_200_without_a_validator_records_none(pilot: Pilot) -> None:
+    first = pilot.fetch(ok)
+    assert first.run is not None and first.run.conditional_validator is None
 
 
 def test_bare_304_is_not_fresh_evidence(pilot: Pilot) -> None:

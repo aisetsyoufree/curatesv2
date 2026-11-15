@@ -10,6 +10,7 @@ from typing import Annotated, Literal, Self
 from pydantic import Field, model_validator
 
 from cu_rates.contracts.base import (
+    ContractModel,
     FieldPath,
     GitSha,
     HttpUrlText,
@@ -68,6 +69,16 @@ class FetchProfile(VersionedModel):
     respect_robots: Literal[True] = True
 
 
+class ConditionalValidator(ContractModel):
+    """The HTTP validator a 200 response carried and a later conditional request echoed.
+
+    ``etag`` maps to ``If-None-Match`` and ``last_modified`` to ``If-Modified-Since``.
+    """
+
+    kind: Literal["etag", "last_modified"]
+    value: Text
+
+
 def _check_run(
     status: RunStatus, started: UtcDatetime, finished: UtcDatetime, error: str | None
 ) -> None:
@@ -89,12 +100,43 @@ class FetchRun(VersionedModel):
     git_sha: GitSha
     artifact_ids: Annotated[tuple[Sha256Hex, ...], SortedUnique] = ()
     error: Text | None = None
+    conditional_validator: ConditionalValidator | None = None
 
     @model_validator(mode="after")
     def _consistent(self) -> Self:
         _check_run(self.status, self.started_at, self.finished_at, self.error)
         if self.status is RunStatus.SUCCEEDED and not self.artifact_ids:
             raise ValueError("a successful fetch must store at least one artifact")
+        if self.conditional_validator is not None and self.status is not RunStatus.SUCCEEDED:
+            raise ValueError("only a successful fetch records a conditional validator")
+        return self
+
+
+class NotModifiedObservation(VersionedModel):
+    """A real HTTP 304 re-observing the unchanged body of one earlier successful fetch.
+
+    It is neither a new fetch run nor a new artifact: it names the original run and
+    artifact, the profile it was collected under, and the validator the server confirmed.
+    Publication accepts it only as proof of freshness; it approves nothing.
+    """
+
+    run_id: Identifier
+    source_id: Identifier
+    profile_id: Identifier
+    git_sha: GitSha
+    started_at: UtcDatetime
+    observed_at: UtcDatetime
+    original_run_id: Identifier
+    original_artifact_id: Sha256Hex
+    validator: ConditionalValidator
+    http_status: Literal[304] = 304
+
+    @model_validator(mode="after")
+    def _ordered(self) -> Self:
+        if self.observed_at < self.started_at:
+            raise ValueError("observed_at cannot precede started_at")
+        if self.run_id == self.original_run_id:
+            raise ValueError("a 304 re-observation is its own run, not the original fetch")
         return self
 
 
