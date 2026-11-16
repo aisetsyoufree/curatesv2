@@ -119,46 +119,102 @@ class _Stopped(Exception):
 
 
 _IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
+IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
 Resolver = Callable[[str], Iterable[_IPAddress | str]]
+TransportFactory = Callable[[tuple[_IPAddress, ...]], httpx.BaseTransport]
+
+_DENIED_IPV4_NETWORKS: tuple[ipaddress.IPv4Network, ...] = (
+    ipaddress.IPv4Network("0.0.0.0/8"),  # This network (RFC 791)
+    ipaddress.IPv4Network("10.0.0.0/8"),  # Private-use (RFC 1918)
+    ipaddress.IPv4Network("100.64.0.0/10"),  # Shared address space / CGNAT (RFC 6598)
+    ipaddress.IPv4Network("127.0.0.0/8"),  # Loopback (RFC 1122)
+    ipaddress.IPv4Network("169.254.0.0/16"),  # Link-local (RFC 3927)
+    ipaddress.IPv4Network("172.16.0.0/12"),  # Private-use (RFC 1918)
+    ipaddress.IPv4Network("192.0.0.0/24"),  # IETF protocol assignments (RFC 6890)
+    ipaddress.IPv4Network("192.0.2.0/24"),  # Documentation TEST-NET-1 (RFC 5737)
+    ipaddress.IPv4Network("192.88.99.0/24"),  # 6to4 relay anycast (RFC 7526)
+    ipaddress.IPv4Network("192.168.0.0/16"),  # Private-use (RFC 1918)
+    ipaddress.IPv4Network("198.18.0.0/15"),  # Benchmarking (RFC 2544)
+    ipaddress.IPv4Network("198.51.100.0/24"),  # Documentation TEST-NET-2 (RFC 5737)
+    ipaddress.IPv4Network("203.0.113.0/24"),  # Documentation TEST-NET-3 (RFC 5737)
+    ipaddress.IPv4Network("224.0.0.0/4"),  # Multicast (RFC 5771)
+    ipaddress.IPv4Network("240.0.0.0/4"),  # Reserved / Class E (RFC 1112)
+    ipaddress.IPv4Network("255.255.255.255/32"),  # Limited broadcast (RFC 8190)
+)
+
+_DENIED_IPV6_NETWORKS: tuple[ipaddress.IPv6Network, ...] = (
+    ipaddress.IPv6Network("::/128"),  # Unspecified (RFC 4291)
+    ipaddress.IPv6Network("::1/128"),  # Loopback (RFC 4291)
+    ipaddress.IPv6Network("100::/64"),  # Discard-only prefix (RFC 6666)
+    ipaddress.IPv6Network("2001:2::/48"),  # Benchmarking (RFC 5180)
+    ipaddress.IPv6Network("2001:db8::/32"),  # Documentation (RFC 3849)
+    ipaddress.IPv6Network("fc00::/7"),  # Unique local / ULA (RFC 4193)
+    ipaddress.IPv6Network("fe80::/10"),  # Link-local unicast (RFC 4291)
+    ipaddress.IPv6Network("fec0::/10"),  # Site-local (RFC 3879, deprecated)
+    ipaddress.IPv6Network("ff00::/8"),  # Multicast (RFC 4291)
+)
+
+_NAT64_WELL_KNOWN_PREFIX = ipaddress.IPv6Network("64:ff9b::/96")
+_NAT64_LOCAL_PREFIX = ipaddress.IPv6Network("64:ff9b:1::/48")
+_6TO4_PREFIX = ipaddress.IPv6Network("2002::/16")
+_TEREDO_PREFIX = ipaddress.IPv6Network("2001::/32")
+
+
+def _is_denied_ipv4(address: ipaddress.IPv4Address) -> bool:
+    return any(address in net for net in _DENIED_IPV4_NETWORKS)
+
+
+def _is_denied_ipv6(address: ipaddress.IPv6Address) -> bool:
+    mapped = address.ipv4_mapped
+    if mapped is not None:
+        return _is_denied_ipv4(mapped)
+    if any(address in net for net in _DENIED_IPV6_NETWORKS):
+        return True
+    if address in _NAT64_LOCAL_PREFIX:
+        return True
+    if address in _NAT64_WELL_KNOWN_PREFIX:
+        embedded_v4 = ipaddress.IPv4Address(address.packed[12:16])
+        if _is_denied_ipv4(embedded_v4):
+            return True
+    if address in _6TO4_PREFIX:
+        embedded_v4 = ipaddress.IPv4Address(address.packed[2:6])
+        if _is_denied_ipv4(embedded_v4):
+            return True
+    if address in _TEREDO_PREFIX:
+        embedded_v4 = ipaddress.IPv4Address(bytes(b ^ 0xFF for b in address.packed[12:16]))
+        if _is_denied_ipv4(embedded_v4):
+            return True
+    return False
 
 
 def _globally_routable(address: _IPAddress) -> bool:
-    """True only for a public unicast address, after unwrapping IPv4-mapped IPv6."""
-    mapped = address.ipv4_mapped if isinstance(address, ipaddress.IPv6Address) else None
-    if mapped is not None:
-        return _globally_routable(mapped)
-    return not (
-        address.is_loopback
-        or address.is_private
-        or address.is_link_local
-        or address.is_multicast
-        or address.is_reserved
-        or address.is_unspecified
-        or not address.is_global
-    )
+    """True only for a public unicast address, rejecting all special-use ranges."""
+    if isinstance(address, ipaddress.IPv4Address):
+        return not _is_denied_ipv4(address)
+    return not _is_denied_ipv6(address)
 
 
-def _require_routable(host: str, resolve: Resolver) -> None:
+def _require_routable(host: str, resolve: Resolver) -> tuple[_IPAddress, ...]:
     """Refuse the connection unless every answer is globally routable.
 
-    A live transport must connect to these validated addresses, not a second
-    lookup of the same name. Resolving again at connect time leaves a
-    DNS-rebinding gap between this check and the socket.
+    Returns the validated addresses so the transport can dial one of them
+    without re-resolving the hostname.
     """
     try:
         literal = ipaddress.ip_address(host)
     except ValueError:
         literal = None
     if literal is not None:
-        answers: tuple[_IPAddress | str, ...] = (literal,)
+        raw_answers: tuple[_IPAddress | str, ...] = (literal,)
     else:
         try:
-            answers = tuple(resolve(host))
+            raw_answers = tuple(resolve(host))
         except OSError as exc:
             raise _Stopped("address-resolution-failed") from exc
-    if not answers:
+    if not raw_answers:
         raise _Stopped("address-resolution-failed")
-    for item in answers:
+    validated: list[_IPAddress] = []
+    for item in raw_answers:
         try:
             address = (
                 item
@@ -169,23 +225,12 @@ def _require_routable(host: str, resolve: Resolver) -> None:
             raise _Stopped("address-resolution-failed") from exc
         if not _globally_routable(address):
             raise _Stopped("non-routable-address")
+        validated.append(address)
+    return tuple(validated)
 
 
 def _resolution_disabled(host: str) -> tuple[_IPAddress, ...]:
     raise OSError(f"name resolution is not configured for {host}")
-
-
-def _redirect_host(status: int, headers: httpx.Headers) -> str | None:
-    if status not in {301, 302, 303, 307, 308}:
-        return None
-    location = headers.get("location", "").strip()
-    if not location:
-        return None
-    try:
-        target = httpx.URL(location)
-    except httpx.InvalidURL:
-        return None
-    return target.host or None
 
 
 def _public_url(text: str) -> httpx.URL:
@@ -275,7 +320,7 @@ class FetchWorker:
         self,
         root: Path,
         store: ArtifactStore,
-        transport: Callable[[], httpx.BaseTransport],
+        transport: Callable[[tuple[_IPAddress, ...]], httpx.BaseTransport],
         *,
         git_sha: str,
         clock: Callable[[], float] = time.time,
@@ -352,9 +397,7 @@ class FetchWorker:
         limit: int,
         spacing: int = 5,
     ) -> _Response:
-        # Check the destination before waiting or opening a socket. The comment
-        # on _require_routable is the pin a live transport has to keep.
-        _require_routable(url.host, self._resolve)
+        validated = _require_routable(url.host, self._resolve)
         origin = f"https://{url.host}"
         self._wait(
             max(
@@ -378,7 +421,7 @@ class FetchWorker:
         self._set(db, f"tick:{origin}", str(tick))
         with (
             httpx.Client(
-                transport=self._transport(),
+                transport=self._transport(validated),
                 trust_env=False,
                 follow_redirects=False,
                 timeout=timeout,
@@ -389,39 +432,51 @@ class FetchWorker:
                 headers={"User-Agent": USER_AGENT, "Accept-Encoding": "identity", **headers},
             ) as response,
         ):
-            # A server can signal a challenge even when its body uses an
-            # unsupported encoding. Preserve the stop signal without decoding.
+            # Process challenge headers first without resolving any redirect destination.
             headers_only = _Response(response.status_code, response.headers, b"")
-            redirect_host = _redirect_host(response.status_code, response.headers)
-            if redirect_host is not None:
-                _require_routable(redirect_host, self._resolve)
             if _is_challenge(headers_only):
                 return headers_only
-            # Denial and Retry-After live in the status line and headers. A
-            # compressed 403 or 429 must still count; do not require a decoded body.
+
+            # For non-200 responses, record status and Retry-After immediately.
+            # Perform optional body inspection for challenge markers, but never
+            # let encoding, streaming errors, or timeouts discard the known status.
+            if response.status_code != 200:
+                body = b""
+                encoding = response.headers.get("content-encoding", "identity").lower()
+                if encoding == "identity":
+                    try:
+                        raw_body = bytearray()
+                        chunks: Iterator[bytes] = (
+                            iter((response.content,))
+                            if response.is_stream_consumed
+                            else response.iter_raw()
+                        )
+                        for chunk in chunks:
+                            if self._monotonic() - tick > timeout:
+                                break
+                            raw_body.extend(chunk[: _CHALLENGE_PREFIX_BYTES - len(raw_body)])
+                            if len(raw_body) >= _CHALLENGE_PREFIX_BYTES:
+                                break
+                        body = bytes(raw_body)
+                    except Exception:
+                        body = b""
+                return _Response(response.status_code, response.headers, body)
+
+            # For 200 responses, validate identity encoding and read the full body.
             encoding = response.headers.get("content-encoding", "identity").lower()
-            if response.status_code in (403, 429) and encoding != "identity":
-                return headers_only
-            if response.status_code != 200 and response.status_code not in (401, 403, 429, 503):
-                return headers_only
             if encoding != "identity":
                 raise _Stopped("unsupported-encoding")
-            body = bytearray()
-            chunks: Iterator[bytes] = (
+            body_list = bytearray()
+            stream_chunks: Iterator[bytes] = (
                 iter((response.content,)) if response.is_stream_consumed else response.iter_raw()
             )
-            for chunk in chunks:
+            for chunk in stream_chunks:
                 if self._monotonic() - tick > timeout:
                     raise _Stopped("response-time-limit")
-                if response.status_code != 200:
-                    body.extend(chunk[: _CHALLENGE_PREFIX_BYTES - len(body)])
-                    if len(body) >= _CHALLENGE_PREFIX_BYTES:
-                        break
-                    continue
-                if len(body) + len(chunk) > limit:
+                if len(body_list) + len(chunk) > limit:
                     raise _Stopped("body-too-large")
-                body.extend(chunk)
-            return _Response(response.status_code, response.headers, bytes(body))
+                body_list.extend(chunk)
+            return _Response(response.status_code, response.headers, bytes(body_list))
 
     def _robots(self, db: sqlite3.Connection, url: httpx.URL, timeout: int) -> RobotsPolicy:
         origin = f"https://{url.host}"
@@ -449,7 +504,20 @@ class FetchWorker:
             raise _Stopped("access-challenge")
         if response.status in (401, 403, 429):
             if response.status == 429:
-                self._defer(db, origin, response.headers, minimum=30, pressure=True)
+                delay = self._defer(db, origin, response.headers, minimum=30, pressure=True)
+                if delay > MAX_RETRY_DELAY:
+                    raise _Stopped("http-429-deferred")
+                raise _Stopped("http-429")
+            if response.status == 403:
+                delay = 0.0
+                if (
+                    "retry-after" in response.headers
+                    or _retry_after(response.headers, self._clock()) > 0
+                ):
+                    delay = self._defer(db, origin, response.headers, minimum=0)
+                if delay > MAX_RETRY_DELAY:
+                    raise _Stopped("http-403-deferred")
+                raise _Stopped("http-403")
             raise _Stopped("robots-unavailable")
         if 400 <= response.status < 500:
             body = b""
@@ -580,14 +648,24 @@ class FetchWorker:
                 except _Stopped as exc:
                     reason = str(exc)
                     status = RunStatus.FAILED
-                    if reason in {"http-403", "http-429", "http-429-deferred"}:
-                        terminal = 403 if reason == "http-403" else 429
+                    if reason in {
+                        "http-403",
+                        "http-429",
+                        "http-429-deferred",
+                        "http-403-deferred",
+                    }:
+                        terminal = 403 if reason.startswith("http-403") else 429
                     if reason == "access-challenge":
                         status = RunStatus.BLOCKED
                 except (httpx.HTTPError, ArtifactStoreError, OSError):
                     status, reason = RunStatus.FAILED, "transport-or-storage-failure"
         except _Stopped as exc:
             reason = str(exc)
+            status = RunStatus.FAILED
+            if reason in {"http-403", "http-429", "http-429-deferred", "http-403-deferred"}:
+                terminal = 403 if reason.startswith("http-403") else 429
+            if reason in {"access-challenge", "robots-disallowed"}:
+                status = RunStatus.BLOCKED
 
         succeeded = status is RunStatus.SUCCEEDED
         failures = 0 if succeeded else 1 + int(self._get(db, f"failures:{key}") or 0)
@@ -755,6 +833,16 @@ class FetchWorker:
                     _validator(response.headers.get("etag"), response.headers.get("last-modified")),
                     None,
                 )
+            if code == 403:
+                delay = 0.0
+                if (
+                    "retry-after" in response.headers
+                    or _retry_after(response.headers, self._clock()) > 0
+                ):
+                    delay = self._defer(db, origin, response.headers, minimum=0)
+                if delay > MAX_RETRY_DELAY:
+                    raise _Stopped("http-403-deferred")
+                raise _Stopped("http-403")
             if code in (408, 429) or 500 <= code < 600:
                 delay = self._defer(
                     db, origin, response.headers, minimum=30 * 2**attempt, pressure=code == 429

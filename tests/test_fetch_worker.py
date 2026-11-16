@@ -1,7 +1,10 @@
 """Offline T032 tests. The only HTTP transport is synthetic."""
 
 import fcntl
-from collections.abc import Callable, Iterable
+import gzip
+import ipaddress
+import zlib
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
@@ -32,6 +35,30 @@ from cu_rates.fetch_worker import (
 URL = "https://credit-union.test/rates"
 BODY = b"<html>Synthetic fixture</html>"
 PUBLIC = ("8.8.8.8",)
+_IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
+
+
+class MockDialTransport(httpx.BaseTransport):
+    """Synthetic transport that checks the dial target against validated addresses."""
+
+    def __init__(
+        self,
+        validated: tuple[_IPAddress, ...],
+        *,
+        dial_address: _IPAddress | None,
+        handler: Callable[[httpx.Request], httpx.Response],
+    ) -> None:
+        self.validated = validated
+        self.dial_address = dial_address
+        self.handler = handler
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        if self.dial_address is None or self.dial_address not in self.validated:
+            raise httpx.ConnectError(
+                f"Transport dialed {self.dial_address} which is not in "
+                f"validated addresses {self.validated}"
+            )
+        return self.handler(request)
 
 
 def public_resolver(host: str) -> tuple[str, ...]:
@@ -55,6 +82,7 @@ class Pilot:
         self.path = root
         self.clock = Clock()
         self.calls: list[tuple[float, httpx.Request]] = []
+        self.dialed: list[tuple[_IPAddress, ...]] = []
         self.store = ArtifactStore(root / "evidence")
         stamp = datetime.fromtimestamp(self.clock.value, UTC)
         self.source = RateSource(
@@ -97,8 +125,16 @@ class Pilot:
     def worker(
         self,
         handler: Callable[[httpx.Request], httpx.Response],
-        resolve: Callable[[str], Iterable[str]] | None = None,
+        resolve: Callable[[str], Iterable[str | _IPAddress]] | None = None,
     ) -> FetchWorker:
+        def transport_factory(addresses: tuple[_IPAddress, ...]) -> httpx.BaseTransport:
+            self.dialed.append(addresses)
+            return MockDialTransport(
+                addresses,
+                dial_address=addresses[0] if addresses else None,
+                handler=send,
+            )
+
         def send(request: httpx.Request) -> httpx.Response:
             self.calls.append((self.clock.now(), request))
             return handler(request)
@@ -106,7 +142,7 @@ class Pilot:
         return FetchWorker(
             self.path / "state",
             self.store,
-            lambda: httpx.MockTransport(send),
+            transport_factory,
             git_sha="0" * 40,
             clock=self.clock.now,
             monotonic=self.clock.now,
@@ -175,9 +211,20 @@ def test_no_http_without_approval(pilot: Pilot, kind: str) -> None:
     assert not pilot.calls
 
 
-@pytest.mark.parametrize("code", [301, 401, 403, 429, 503])
-def test_inaccessible_robots_stops_before_source(pilot: Pilot, code: int) -> None:
-    assert pilot.fetch(lambda _: httpx.Response(code)).reason == "robots-unavailable"
+@pytest.mark.parametrize(
+    ("code", "expected_reason"),
+    [
+        (301, "robots-unavailable"),
+        (401, "robots-unavailable"),
+        (403, "http-403"),
+        (429, "http-429"),
+        (503, "robots-unavailable"),
+    ],
+)
+def test_inaccessible_robots_stops_before_source(
+    pilot: Pilot, code: int, expected_reason: str
+) -> None:
+    assert pilot.fetch(lambda _: httpx.Response(code)).reason == expected_reason
     assert [req.url.path for _, req in pilot.calls] == ["/robots.txt"]
 
 
@@ -266,7 +313,7 @@ def test_forward_wall_clock_jump_does_not_shorten_spacing(pilot: Pilot) -> None:
     worker = FetchWorker(
         pilot.path / "state",
         pilot.store,
-        lambda: httpx.MockTransport(handler),
+        lambda _: httpx.MockTransport(handler),
         git_sha="0" * 40,
         clock=pilot.clock.now,
         monotonic=tick.now,
@@ -516,10 +563,10 @@ def test_resolution_failure_is_refused(pilot: Pilot, failure: OSError | tuple[()
     assert pilot.calls == []
 
 
-def test_redirect_to_non_routable_host_is_not_connected(pilot: Pilot) -> None:
+def test_redirect_does_not_resolve_destination_and_is_rejected(pilot: Pilot) -> None:
     def resolve(host: str) -> tuple[str, ...]:
-        if host == "elsewhere.test":
-            return ("169.254.169.254",)
+        if host != "credit-union.test":
+            raise AssertionError(f"Redirect destination {host} must not be resolved")
         return PUBLIC
 
     def handler(req: httpx.Request) -> httpx.Response:
@@ -530,8 +577,252 @@ def test_redirect_to_non_routable_host_is_not_connected(pilot: Pilot) -> None:
     result = pilot.worker(handler, resolve=resolve).fetch(
         pilot.source, pilot.profile, pilot.approval, pilot.terms
     )
-    assert result.reason == "non-routable-address"
+    assert result.reason == "http-302"
     assert [req.url.host for _, req in pilot.calls] == ["credit-union.test", "credit-union.test"]
+
+
+def test_redirect_with_challenge_header_is_access_challenge(pilot: Pilot) -> None:
+    def resolve(host: str) -> tuple[str, ...]:
+        if host != "credit-union.test":
+            raise AssertionError(f"Redirect destination {host} must not be resolved")
+        return PUBLIC
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/robots.txt":
+            return robots()
+        return httpx.Response(
+            302,
+            headers={"Location": "https://elsewhere.test/login", "CF-Mitigated": "challenge"},
+        )
+
+    result = pilot.worker(handler, resolve=resolve).fetch(
+        pilot.source, pilot.profile, pilot.approval, pilot.terms
+    )
+    assert result.reason == "access-challenge"
+    assert result.run is not None and result.run.status is RunStatus.BLOCKED
+    pilot.clock.sleep(60)
+    assert pilot.fetch(ok).reason == "source-paused"
+
+
+def test_transport_receives_validated_addresses(pilot: Pilot) -> None:
+    result = pilot.fetch(ok)
+    assert result.reason == "fetched"
+    assert len(pilot.dialed) == 2
+    for addrs in pilot.dialed:
+        assert addrs == (ipaddress.IPv4Address("8.8.8.8"),)
+
+
+def test_transport_ignoring_validated_addresses_is_detected(pilot: Pilot) -> None:
+    double = MockDialTransport(
+        (ipaddress.IPv4Address("8.8.8.8"),),
+        dial_address=ipaddress.IPv4Address("1.1.1.1"),
+        handler=ok,
+    )
+    with pytest.raises(httpx.ConnectError, match="not in validated addresses"):
+        double.handle_request(httpx.Request("GET", "https://credit-union.test/rates"))
+
+    # When robots dial ignores validated addresses, robots fails closed
+    worker1 = FetchWorker(
+        pilot.path / "state1",
+        pilot.store,
+        lambda addrs: MockDialTransport(
+            addrs, dial_address=ipaddress.IPv4Address("1.1.1.1"), handler=ok
+        ),
+        git_sha="0" * 40,
+        clock=pilot.clock.now,
+        monotonic=pilot.clock.now,
+        sleep=pilot.clock.sleep,
+        resolve=public_resolver,
+    )
+    assert (
+        worker1.fetch(pilot.source, pilot.profile, pilot.approval, pilot.terms).reason
+        == "robots-unavailable"
+    )
+
+    # When robots succeeds but source dial ignores validated addresses, fetch fails safely
+    call_count = 0
+
+    def ignore_on_source(
+        addresses: tuple[_IPAddress, ...],
+    ) -> httpx.BaseTransport:
+        nonlocal call_count
+        call_count += 1
+        dial = addresses[0] if call_count == 1 else ipaddress.IPv4Address("1.1.1.1")
+        return MockDialTransport(addresses, dial_address=dial, handler=ok)
+
+    worker2 = FetchWorker(
+        pilot.path / "state2",
+        pilot.store,
+        ignore_on_source,
+        git_sha="0" * 40,
+        clock=pilot.clock.now,
+        monotonic=pilot.clock.now,
+        sleep=pilot.clock.sleep,
+        resolve=public_resolver,
+    )
+    result = worker2.fetch(pilot.source, pilot.profile, pilot.approval, pilot.terms)
+    assert result.reason == "transport-failure"
+
+
+@pytest.mark.parametrize(
+    "denied_ip",
+    [
+        "fec0::1",
+        "fec0::ffff",
+        "100.64.0.1",
+        "100.127.255.254",
+        "192.0.0.1",
+        "198.18.0.1",
+        "198.19.255.254",
+        "192.0.2.1",
+        "198.51.100.1",
+        "203.0.113.1",
+        "2001:db8::1",
+        "240.0.0.1",
+        "250.1.2.3",
+        "64:ff9b::127.0.0.1",
+        "64:ff9b::10.0.0.1",
+        "64:ff9b::192.168.1.1",
+        "64:ff9b::169.254.1.1",
+        "64:ff9b::100.64.0.1",
+        "64:ff9b:1::1",
+        "2002:7f00:0001::",
+        "2002:0a00:0001::",
+        "2002:c0a8:0101::",
+        "2002:a9fe:0101::",
+        "2002:6440:0001::",
+        "2001:0000:4136:e378:8000:63bf:f5ff:ffee",
+        "fc00::1",
+        "fd00::1",
+        "fd12:3456:789a::1",
+        "fe80::1",
+        "2001:2::1",
+        "100::1",
+    ],
+)
+def test_special_use_denylist_rejects_non_routable_addresses(pilot: Pilot, denied_ip: str) -> None:
+    result = pilot.worker(ok, resolve=lambda host: (denied_ip,)).fetch(
+        pilot.source, pilot.profile, pilot.approval, pilot.terms
+    )
+    assert result.reason == "non-routable-address"
+    assert pilot.calls == []
+
+
+@pytest.mark.parametrize(
+    "allowed_ip",
+    [
+        "8.8.8.8",
+        "2607:f8b0:4004:800::200e",
+        "64:ff9b::8.8.8.8",
+        "2002:0808:0808::",
+    ],
+)
+def test_globally_routable_public_addresses_are_permitted(pilot: Pilot, allowed_ip: str) -> None:
+    result = pilot.worker(ok, resolve=lambda host: (allowed_ip,)).fetch(
+        pilot.source, pilot.profile, pilot.approval, pilot.terms
+    )
+    assert result.reason == "fetched"
+    assert len(pilot.calls) == 2
+
+
+def test_robots_403_counts_toward_three_run_block_rule(pilot: Pilot) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(403)
+
+    for _ in range(3):
+        assert pilot.fetch(handler).reason == "http-403"
+        pilot.clock.sleep(60)
+    assert len(pilot.calls) == 3
+    assert pilot.fetch(ok).reason == "source-paused"
+
+
+def test_robots_429_counts_toward_three_run_block_rule(pilot: Pilot) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(429)
+
+    for _ in range(3):
+        assert pilot.fetch(handler).reason == "http-429"
+        pilot.clock.sleep(60)
+    assert len(pilot.calls) == 3
+    assert pilot.fetch(ok).reason == "source-paused"
+
+
+def test_robots_403_honors_retry_after(pilot: Pilot) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, headers={"Retry-After": "1200"})
+
+    result = pilot.fetch(handler)
+    assert result.reason == "http-403-deferred"
+    assert len(pilot.calls) == 1
+    pilot.clock.sleep(600)
+    assert pilot.fetch(ok).reason == "not-due"
+    assert len(pilot.calls) == 1
+    pilot.clock.sleep(601)
+    assert pilot.fetch(ok).reason == "fetched"
+    assert len(pilot.calls) == 3
+
+
+def test_source_403_honors_retry_after_without_retry(pilot: Pilot) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/robots.txt":
+            return robots()
+        return httpx.Response(403, headers={"Retry-After": "1200"})
+
+    result = pilot.fetch(handler)
+    assert result.reason == "http-403-deferred"
+    assert len(pilot.calls) == 2
+    assert [req.url.path for _, req in pilot.calls] == ["/robots.txt", "/rates"]
+    pilot.clock.sleep(600)
+    assert pilot.fetch(ok).reason == "not-due"
+    assert len(pilot.calls) == 2
+
+
+@pytest.mark.parametrize("encoding", ["gzip", "br", "deflate"])
+def test_compressed_503_records_status_and_retry_after(pilot: Pilot, encoding: str) -> None:
+    if encoding == "gzip":
+        content = gzip.compress(b"service unavailable")
+    elif encoding == "deflate":
+        content = zlib.compress(b"service unavailable")
+    else:
+        content = b"service unavailable"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/robots.txt":
+            return robots()
+        return httpx.Response(
+            503,
+            headers={"Content-Encoding": encoding, "Retry-After": "1200"},
+            content=content,
+        )
+
+    result = pilot.fetch(handler)
+    assert result.reason == "http-503-deferred"
+    assert len(pilot.calls) == 2
+    pilot.clock.sleep(600)
+    assert pilot.fetch(ok).reason == "not-due"
+    assert len(pilot.calls) == 2
+
+
+def test_failed_denial_body_read_preserves_status_and_retry_after(pilot: Pilot) -> None:
+    class FaultyStream(httpx.SyncByteStream):
+        def __iter__(self) -> Iterator[bytes]:
+            raise httpx.ReadError("stream read failure")
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/robots.txt":
+            return robots()
+        return httpx.Response(
+            429,
+            headers={"Retry-After": "1200"},
+            stream=FaultyStream(),
+        )
+
+    result = pilot.fetch(handler)
+    assert result.reason == "http-429-deferred"
+    assert len(pilot.calls) == 2
+    pilot.clock.sleep(600)
+    assert pilot.fetch(ok).reason == "not-due"
+    assert len(pilot.calls) == 2
 
 
 @pytest.mark.parametrize("encoding", [{}, {"Content-Encoding": "gzip"}])
