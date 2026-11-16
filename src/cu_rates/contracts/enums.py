@@ -201,6 +201,44 @@ class FetchMethod(StrEnum):
     RENDERED_BROWSER = "rendered_browser"
 
 
+class ProductScope(StrEnum):
+    """Whether a page's product falls in the first-release scope (see ``taxonomy``)."""
+
+    IN_SCOPE = "in_scope"
+    OUT_OF_SCOPE = "out_of_scope"
+    UNKNOWN = "unknown"
+
+
+class OutOfScopeProduct(StrEnum):
+    """Consumer products classified when encountered but never published (MASTER §3)."""
+
+    VEHICLE = "vehicle"
+    UNSECURED_PERSONAL = "unsecured_personal"
+    CONSTRUCTION = "construction"
+    RENOVATION = "renovation"
+    LAND = "land"
+    REVERSE_MORTGAGE = "reverse_mortgage"
+    COMMERCIAL = "commercial"
+    DEPOSIT = "deposit"
+    OTHER_CONSUMER = "other_consumer"
+
+
+class CollectionMethod(StrEnum):
+    """How a source is collected; independent of who hosts it (``SourceRelationshipKind``)."""
+
+    STATIC_HTML = "static_html"
+    PDF = "pdf"
+    JSON_API = "json_api"
+    BROWSER_XHR = "browser_xhr"
+    UNSUPPORTED = "unsupported"
+
+
+class FindingReviewState(StrEnum):
+    PROPOSED = "proposed"
+    VERIFIED = "verified"
+    REJECTED = "rejected"
+
+
 class RunStatus(StrEnum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
