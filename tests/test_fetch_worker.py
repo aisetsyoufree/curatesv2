@@ -38,29 +38,6 @@ PUBLIC = ("8.8.8.8",)
 _IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
 
 
-class MockDialTransport(httpx.BaseTransport):
-    """Synthetic transport that checks the dial target against validated addresses."""
-
-    def __init__(
-        self,
-        validated: tuple[_IPAddress, ...],
-        *,
-        dial_address: _IPAddress | None,
-        handler: Callable[[httpx.Request], httpx.Response],
-    ) -> None:
-        self.validated = validated
-        self.dial_address = dial_address
-        self.handler = handler
-
-    def handle_request(self, request: httpx.Request) -> httpx.Response:
-        if self.dial_address is None or self.dial_address not in self.validated:
-            raise httpx.ConnectError(
-                f"Transport dialed {self.dial_address} which is not in "
-                f"validated addresses {self.validated}"
-            )
-        return self.handler(request)
-
-
 def public_resolver(host: str) -> tuple[str, ...]:
     del host
     return PUBLIC
@@ -129,11 +106,7 @@ class Pilot:
     ) -> FetchWorker:
         def transport_factory(addresses: tuple[_IPAddress, ...]) -> httpx.BaseTransport:
             self.dialed.append(addresses)
-            return MockDialTransport(
-                addresses,
-                dial_address=addresses[0] if addresses else None,
-                handler=send,
-            )
+            return httpx.MockTransport(send)
 
         def send(request: httpx.Request) -> httpx.Response:
             self.calls.append((self.clock.now(), request))
@@ -612,56 +585,38 @@ def test_transport_receives_validated_addresses(pilot: Pilot) -> None:
         assert addrs == (ipaddress.IPv4Address("8.8.8.8"),)
 
 
-def test_transport_ignoring_validated_addresses_is_detected(pilot: Pilot) -> None:
-    double = MockDialTransport(
-        (ipaddress.IPv4Address("8.8.8.8"),),
-        dial_address=ipaddress.IPv4Address("1.1.1.1"),
-        handler=ok,
-    )
-    with pytest.raises(httpx.ConnectError, match="not in validated addresses"):
-        double.handle_request(httpx.Request("GET", "https://credit-union.test/rates"))
+@pytest.mark.parametrize("after_robots", [False, True])
+def test_network_transport_is_refused_before_dispatch(
+    pilot: Pilot, monkeypatch: pytest.MonkeyPatch, after_robots: bool
+) -> None:
+    def should_not_dispatch(
+        transport: httpx.HTTPTransport, request: httpx.Request
+    ) -> httpx.Response:
+        pytest.fail("a network-capable transport reached dispatch")
 
-    # When robots dial ignores validated addresses, robots fails closed
-    worker1 = FetchWorker(
-        pilot.path / "state1",
+    factories_called = 0
+
+    def factory(addresses: tuple[_IPAddress, ...]) -> httpx.BaseTransport:
+        nonlocal factories_called
+        factories_called += 1
+        if after_robots and factories_called == 1:
+            return httpx.MockTransport(ok)
+        return httpx.HTTPTransport()
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", should_not_dispatch)
+    worker = FetchWorker(
+        pilot.path / "state",
         pilot.store,
-        lambda addrs: MockDialTransport(
-            addrs, dial_address=ipaddress.IPv4Address("1.1.1.1"), handler=ok
-        ),
+        factory,
         git_sha="0" * 40,
         clock=pilot.clock.now,
         monotonic=pilot.clock.now,
         sleep=pilot.clock.sleep,
         resolve=public_resolver,
     )
-    assert (
-        worker1.fetch(pilot.source, pilot.profile, pilot.approval, pilot.terms).reason
-        == "robots-unavailable"
-    )
-
-    # When robots succeeds but source dial ignores validated addresses, fetch fails safely
-    call_count = 0
-
-    def ignore_on_source(
-        addresses: tuple[_IPAddress, ...],
-    ) -> httpx.BaseTransport:
-        nonlocal call_count
-        call_count += 1
-        dial = addresses[0] if call_count == 1 else ipaddress.IPv4Address("1.1.1.1")
-        return MockDialTransport(addresses, dial_address=dial, handler=ok)
-
-    worker2 = FetchWorker(
-        pilot.path / "state2",
-        pilot.store,
-        ignore_on_source,
-        git_sha="0" * 40,
-        clock=pilot.clock.now,
-        monotonic=pilot.clock.now,
-        sleep=pilot.clock.sleep,
-        resolve=public_resolver,
-    )
-    result = worker2.fetch(pilot.source, pilot.profile, pilot.approval, pilot.terms)
-    assert result.reason == "transport-failure"
+    result = worker.fetch(pilot.source, pilot.profile, pilot.approval, pilot.terms)
+    assert result.reason == "live-transport-disabled"
+    assert factories_called == (2 if after_robots else 1)
 
 
 @pytest.mark.parametrize(
@@ -698,6 +653,13 @@ def test_transport_ignoring_validated_addresses_is_detected(pilot: Pilot) -> Non
         "fe80::1",
         "2001:2::1",
         "100::1",
+        "4000::1",
+        "3fff::1",
+        "100:0:0:1::1",
+        "64:ff9b::8.8.8.8",
+        "2002:0808:0808::",
+        "2607:f8b0:4004:800::200e%test",
+        "2001:20::1",
     ],
 )
 def test_special_use_denylist_rejects_non_routable_addresses(pilot: Pilot, denied_ip: str) -> None:
@@ -713,8 +675,7 @@ def test_special_use_denylist_rejects_non_routable_addresses(pilot: Pilot, denie
     [
         "8.8.8.8",
         "2607:f8b0:4004:800::200e",
-        "64:ff9b::8.8.8.8",
-        "2002:0808:0808::",
+        "::ffff:8.8.8.8",
     ],
 )
 def test_globally_routable_public_addresses_are_permitted(pilot: Pilot, allowed_ip: str) -> None:
@@ -725,25 +686,27 @@ def test_globally_routable_public_addresses_are_permitted(pilot: Pilot, allowed_
     assert len(pilot.calls) == 2
 
 
-def test_robots_403_counts_toward_three_run_block_rule(pilot: Pilot) -> None:
+@pytest.mark.parametrize("code", [403, 429])
+@pytest.mark.parametrize("from_robots", [True, False])
+def test_denial_counts_once_per_scheduled_run(pilot: Pilot, code: int, from_robots: bool) -> None:
     def handler(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(403)
+        if req.url.path == "/robots.txt" and not from_robots:
+            return robots()
+        return httpx.Response(code, headers={"Content-Encoding": "gzip", "Retry-After": "10"})
 
-    for _ in range(3):
-        assert pilot.fetch(handler).reason == "http-403"
-        pilot.clock.sleep(60)
-    assert len(pilot.calls) == 3
-    assert pilot.fetch(ok).reason == "source-paused"
-
-
-def test_robots_429_counts_toward_three_run_block_rule(pilot: Pilot) -> None:
-    def handler(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(429)
-
-    for _ in range(3):
-        assert pilot.fetch(handler).reason == "http-429"
-        pilot.clock.sleep(60)
-    assert len(pilot.calls) == 3
+    for expected in (RunStatus.FAILED, RunStatus.FAILED, RunStatus.BLOCKED):
+        result = pilot.fetch(handler)
+        assert result.reason == f"http-{code}"
+        assert result.run is not None and result.run.status is expected
+        pilot.clock.sleep(180)
+    if from_robots:
+        assert [req.url.path for _, req in pilot.calls] == ["/robots.txt"] * 3
+    else:
+        attempts = 3 if code == 429 else 1
+        assert [req.url.path for _, req in pilot.calls] == [
+            "/robots.txt",
+            *["/rates"] * (3 * attempts),
+        ]
     assert pilot.fetch(ok).reason == "source-paused"
 
 
@@ -822,6 +785,56 @@ def test_failed_denial_body_read_preserves_status_and_retry_after(pilot: Pilot) 
     assert len(pilot.calls) == 2
     pilot.clock.sleep(600)
     assert pilot.fetch(ok).reason == "not-due"
+    assert len(pilot.calls) == 2
+
+
+@pytest.mark.parametrize("challenge", [False, True])
+def test_robots_error_records_backoff_before_classification(pilot: Pilot, challenge: bool) -> None:
+    expected_until = pilot.clock.now() + 1200
+    headers = {"Content-Encoding": "gzip", "Retry-After": "1200"}
+    if challenge:
+        headers["CF-Mitigated"] = "challenge"
+    result = pilot.fetch(lambda _: httpx.Response(429 if challenge else 503, headers=headers))
+    assert result.reason == ("access-challenge" if challenge else "robots-unavailable")
+    pilot.clock.sleep(61)
+    if not challenge:
+        assert pilot.fetch(ok).reason == "not-due"
+    else:
+        with pilot.worker(ok)._state() as state:
+            deadline = state.execute(
+                "SELECT value FROM state WHERE key = 'global-pressure'"
+            ).fetchone()
+            assert deadline is not None and float(deadline[0]) == expected_until
+    assert len(pilot.calls) == 1
+
+
+@pytest.mark.parametrize("code", [429, 502])
+def test_partial_denial_body_keeps_challenge_and_does_not_retry(pilot: Pilot, code: int) -> None:
+    class InterruptedStream(httpx.SyncByteStream):
+        def __iter__(self) -> Iterator[bytes]:
+            yield b"<title>just a moment</title>"
+            raise httpx.ReadError("synthetic stream interruption")
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/robots.txt":
+            return robots()
+        return httpx.Response(code, headers={"Retry-After": "30"}, stream=InterruptedStream())
+
+    result = pilot.fetch(handler)
+    assert result.reason == "access-challenge"
+    assert result.run is not None and result.run.status is RunStatus.BLOCKED
+    assert len(pilot.calls) == 2
+
+
+def test_invalid_redirect_location_does_not_hide_challenge(pilot: Pilot) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/robots.txt":
+            return robots()
+        return httpx.Response(302, headers={"Location": "https://[", "CF-Mitigated": "challenge"})
+
+    result = pilot.fetch(handler)
+    assert result.reason == "access-challenge"
+    assert result.run is not None and result.run.status is RunStatus.BLOCKED
     assert len(pilot.calls) == 2
 
 
