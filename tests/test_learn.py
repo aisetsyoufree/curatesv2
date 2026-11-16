@@ -238,22 +238,51 @@ def test_every_article_has_marked_citations(client: FlaskClient) -> None:
         assert len(citation_links) >= 1, f"No citation links found on {path}"
 
 
-def test_correction_process_explained_without_personal_contact_data(
+def test_correction_process_and_planned_channel_specifications(
     client: FlaskClient,
 ) -> None:
-    """Data collection article explains the correction procedure without inventing emails/phones."""
+    """Data collection page describes planned policies, correction channel, and warnings."""
     resp = client.get("/learn/collection-and-corrections")
     assert resp.status_code == 200
     text = resp.get_data(as_text=True)
+    text_lower = text.lower()
 
-    # Required process elements
-    assert "GitHub" in text
-    assert "issue tracker" in text.lower() or "discrepancy" in text.lower()
-    assert "freshness" in text.lower()
-    assert "seventy-two hours" in text.lower() or "72" in text
-    assert "ninety-six hours" in text.lower() or "96" in text
+    # Warning against submitting personal financial data
+    assert "must not submit" in text_lower
+    assert "account numbers" in text_lower
+    assert "financial records" in text_lower
+    assert "personal data" in text_lower
 
-    # No invented email addresses, phone numbers, or physical mailing addresses
+    # No GitHub issue-tracker instructions
+    assert "github" not in text_lower
+
+    # No present-tense claims regarding active collection
+    assert "parser halts" not in text_lower
+    assert "are inspected on a daily schedule" not in text_lower
+
+    # Future / conditional planned wording and availability status
+    assert "will" in text_lower
+    assert "is designed to" in text_lower or "once collection is live" in text_lower
+    assert "not yet available" in text_lower
+
+    # Bounded freshness policy from methodology
+    assert "freshness" in text_lower
+    assert "seventy-two hours" in text_lower or "72-hour" in text_lower
+    assert "degrade" in text_lower
+    assert "ninety-six hours" in text_lower or "96-hour" in text_lower
+    assert "withdrawal" in text_lower
+
+    # Planned correction channel specifications per MASTER section 5
+    assert "source url" in text_lower
+    assert "affected field" in text_lower
+    assert "reason" in text_lower
+    assert "evidence" in text_lower
+    assert "correction case" in text_lower or "recorded case" in text_lower
+    assert "one business day" in text_lower
+    assert "five business days" in text_lower
+    assert "operational target" in text_lower
+
+    # No invented contact info (emails, phone numbers, physical addresses, external forms)
     email_pattern = re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+")
     phone_pattern = re.compile(r"\b\d{3}[-.\s]\d{3}[-.\s]\d{4}\b")
     assert not email_pattern.search(text), "Found email address in correction text"
