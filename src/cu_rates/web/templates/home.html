@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+
+{% block title %}Massachusetts Credit Union Residential Lending Directory{% endblock %}
+
+{% block content %}
+<article>
+  <h1>Massachusetts Credit Union Residential Lending Directory</h1>
+
+  <section class="card" aria-labelledby="about-heading">
+    <h2 id="about-heading">About This Directory</h2>
+    <p>CU-Rates.org is an educational, evidence-backed public directory accounting for Massachusetts credit unions that offer residential home-lending products. The project helps consumers discover and evaluate publicly advertised offers through objective, standardized criteria.</p>
+    <p>The directory distinguishes residential loan products into clear families—first mortgages, fixed-term home equity loans, and home equity lines of credit—without conflating purchase loans with refinancing purposes or promotional introductory periods.</p>
+  </section>
+
+  <section class="card" aria-labelledby="principles-heading">
+    <h2 id="principles-heading">Core Operating Principles</h2>
+    <p>Every observation in this directory is governed by strict, non-negotiable data integrity rules:</p>
+    <ul>
+      <li><strong>Fail-Closed Publication:</strong> Data with uncertain provenance, ambiguity, or unresolved verification is quarantined and never published.</li>
+      <li><strong>Evidence-Backed Provenance:</strong> Every published entry traces to an immutable, timestamped raw artifact locator from an approved public source.</li>
+      <li><strong>Standardized Scenarios:</strong> Comparisons are evaluated strictly against identical canonical borrower scenarios to maintain fair, like-for-like transparency.</li>
+      <li><strong>Explicit Product States:</strong> Institutions that do not publish rates, require authentication, or provide quotes by inquiry only are cataloged with their verified status rather than ungrounded assumptions.</li>
+    </ul>
+    <p>Read our full <a href="{{ url_for('web.methodology') }}">Methodology and Comparison Principles</a> to learn more about our verification pipeline and standards.</p>
+  </section>
+
+  <section class="card" aria-labelledby="status-heading">
+    <h2 id="status-heading">Current System Status</h2>
+    <p>The collection and verification pipeline is currently completing vertical-slice testing and institution roster reconciliation. Verified comparison data will appear here once baseline data snapshots pass automated integrity and governance gates.</p>
+    <p>For questions regarding data practices and user privacy, review our <a href="{{ url_for('web.privacy') }}">Privacy Policy</a>.</p>
+  </section>
+</article>
+{% endblock %}

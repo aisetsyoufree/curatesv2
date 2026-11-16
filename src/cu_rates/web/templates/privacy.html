@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+
+{% block title %}Privacy Policy and Consent Notice{% endblock %}
+
+{% block content %}
+<article>
+  <h1>Privacy Policy and Consent Notice</h1>
+
+  <section class="card" aria-labelledby="commitment-heading">
+    <h2 id="commitment-heading">Our Privacy-First Commitment</h2>
+    <p>CU-Rates.org is designed from the ground up to respect consumer privacy. We operate as an independent educational resource and do not collect, monetize, or broker personal borrower data.</p>
+    <ul>
+      <li><strong>No Borrower Lead Generation:</strong> We do not ask for personal identification numbers, Social Security Numbers, phone numbers, email addresses, or physical street addresses. We do not sell user inquiries to lenders, brokers, or lead aggregators.</li>
+      <li><strong>No Personalized Pricing Forms:</strong> All data presented in the directory reflects publicly advertised terms collected from institutional sources, not individualized quotes based on user submissions.</li>
+    </ul>
+  </section>
+
+  <section class="card" aria-labelledby="analytics-heading">
+    <h2 id="analytics-heading">Analytics and Measurement</h2>
+    <p>We believe in transparent, consent-driven measurement:</p>
+    <ul>
+      <li><strong>Disabled by Default:</strong> Analytics scripts and measurement tags are completely disabled by default. No third-party network requests or tracking scripts are loaded when you visit this website.</li>
+      <li><strong>Consent Mode Integration:</strong> If analytics are configured in the future, the platform implements Google Consent Mode with all storage parameters set to denied unless explicit consent is provided by the user.</li>
+      <li><strong>No Third-Party Advertising:</strong> The website carries no third-party banner advertisements, advertising trackers, or promotional remarketing pixels.</li>
+    </ul>
+  </section>
+
+  <section class="card" aria-labelledby="logs-heading">
+    <h2 id="logs-heading">Server Logs and Technical Data</h2>
+    <p>Like standard web services, our web server may log basic technical network metadata (such as IP address, user agent, requested path, and response status) strictly for security monitoring, denial-of-service defense, and service reliability. These operational logs are retained temporarily and are never combined with personal borrower profiles.</p>
+    <p>If you have questions about our privacy practices or educational mission, please consult our <a href="{{ url_for('web.methodology') }}">Methodology</a> page.</p>
+  </section>
+</article>
+{% endblock %}

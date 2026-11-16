@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+
+{% block title %}Methodology and Comparison Principles{% endblock %}
+
+{% block content %}
+<article>
+  <h1>Methodology and Comparison Principles</h1>
+
+  <section class="card" aria-labelledby="provenance-heading">
+    <h2 id="provenance-heading">Provenance and Verification Architecture</h2>
+    <p>CU-Rates.org operates under a deterministic, evidence-backed data architecture. Automated routines and deterministic parsers extract published lending terms from approved sources without altering their meaning.</p>
+    <ul>
+      <li><strong>Immutable Storage:</strong> Raw responses (HTML, documents, and network responses) are archived in a content-addressed storage repository before any parsing occurs.</li>
+      <li><strong>Field-Level Traceability:</strong> Every published data point retains its exact locator path, text hash, collection timestamp, and parser version.</li>
+      <li><strong>Human-Approved Sources:</strong> Third-party sources and discovered URLs are treated as untrusted until verified by human reviewers.</li>
+    </ul>
+  </section>
+
+  <section class="card" aria-labelledby="taxonomy-heading">
+    <h2 id="taxonomy-heading">Loan Taxonomy and Financial Rigor</h2>
+    <p>Financial terminology in home lending requires precision to avoid misleading comparisons:</p>
+    <ul>
+      <li><strong>Product Family Separation:</strong> First mortgages, closed-end home equity loans, and open-end lines of credit are modeled as distinct financial structures.</li>
+      <li><strong>Purpose Distinction:</strong> Refinancing is modeled as a loan purpose, not an independent product family. Purchase loans and refinancing programs are never conflated.</li>
+      <li><strong>Interest Rates and APRs:</strong> The initial interest rate and the Annual Percentage Rate represent different financial measurements and are never substituted for one another.</li>
+      <li><strong>Variable and Introductory Terms:</strong> Introductory teaser rates on credit lines are tracked separately from ongoing index-and-margin variable structures.</li>
+    </ul>
+  </section>
+
+  <section class="card" aria-labelledby="freshness-heading">
+    <h2 id="freshness-heading">Bounded Freshness and Emergency Suppression</h2>
+    <p>Advertised loan offerings change frequently. To prevent outdated data from remaining visible:</p>
+    <ul>
+      <li><strong>Automated Freshness Expiry:</strong> Observations undergo scheduled re-observation. Unconfirmed observations degrade and comparison rankings are automatically withdrawn if timely updates are not received.</li>
+      <li><strong>Emergency Suppression:</strong> An independent denylist mechanism allows immediate suppression of any offer, product, or institution record upon review.</li>
+      <li><strong>No Runtime Artificial Intelligence:</strong> Routine collection, extraction, normalization, and publication run deterministically without runtime language models.</li>
+    </ul>
+  </section>
+</article>
+{% endblock %}
