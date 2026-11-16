@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}{% endblock %} — CU-Rates.org</title>
+  {% block meta %}{% endblock %}
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  {% if config.ENABLE_ANALYTICS and config.GA_MEASUREMENT_ID %}
+  <!-- Google Analytics / Consent Mode v2 integration point (OFF by default) -->
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('consent', 'default', {
+      'analytics_storage': 'denied',
+      'ad_storage': 'denied',
+      'ad_user_data': 'denied',
+      'ad_personalization': 'denied'
+    });
+  </script>
+  {% endif %}
+</head>
+<body>
+  <a href="#main-content" class="skip-link">Skip to main content</a>
+
+  <header class="site-header">
+    <div class="header-container">
+      <a href="{{ url_for('web.home') }}" class="brand-link">CU-Rates.org</a>
+      <nav class="main-nav" aria-label="Main navigation">
+        <ul>
+          <li><a href="{{ url_for('web.home') }}" {% if request.endpoint == 'web.home' %}aria-current="page"{% endif %}>Home</a></li>
+          <li><a href="{{ url_for('web.methodology') }}" {% if request.endpoint == 'web.methodology' %}aria-current="page"{% endif %}>Methodology</a></li>
+          <li><a href="{{ url_for('web.privacy') }}" {% if request.endpoint == 'web.privacy' %}aria-current="page"{% endif %}>Privacy</a></li>
+        </ul>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main-content" class="site-main">
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer class="site-footer">
+    <div class="footer-container">
+      <div class="disclaimer-card" role="note" aria-label="Educational disclaimer">
+        <p><strong>Educational Information Only:</strong> CU-Rates.org is an educational and informational directory, not a lender, broker, or quote service. All content is strictly educational information and not personalized financial advice. We do not provide loan quotes or loan approvals. All information is published strictly for educational discovery, research, and transparency.</p>
+      </div>
+
+      <nav aria-label="Footer navigation">
+        <ul class="footer-links">
+          <li><a href="{{ url_for('web.home') }}">Home</a></li>
+          <li><a href="{{ url_for('web.methodology') }}">Methodology</a></li>
+          <li><a href="{{ url_for('web.privacy') }}">Privacy Policy</a></li>
+        </ul>
+      </nav>
+
+      <p class="footer-copy">&copy; 2026 CU-Rates.org. Educational project for Massachusetts residential lending transparency. MIT License / CC BY 4.0.</p>
+    </div>
+  </footer>
+</body>
+</html>
