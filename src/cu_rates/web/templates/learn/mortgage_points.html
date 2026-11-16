@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+
+{% block title %}Mortgage Points and Upfront Financing Costs{% endblock %}
+
+{% block meta %}
+{% if is_draft %}
+<meta name="robots" content="noindex, follow">
+{% endif %}
+{% endblock %}
+
+{% block content %}
+<article>
+  {% if is_draft %}
+  <div class="draft-banner" role="alert" aria-label="Draft notice">
+    <p><strong>Draft - awaiting factual review:</strong> This article is an unreviewed educational draft awaiting human factual review. It provides general educational explanations and does not provide personalized financial advice, loan recommendations, or endorsements.</p>
+  </div>
+  {% endif %}
+
+  <h1>Mortgage Points and Upfront Financing Costs</h1>
+
+  <section class="card" aria-labelledby="points-definition-heading">
+    <h2 id="points-definition-heading">What Are Mortgage Points?</h2>
+    <p>In residential mortgage lending, "points" refer to upfront fees paid directly to the lender at settlement or closing. Each point represents an upfront cost equal to one percent of the total principal loan amount.</p>
+    <p>Points serve two distinct economic functions in loan origination: reducing the ongoing interest rate (discount points) or covering administrative origination expenses (origination points).</p>
+  </section>
+
+  <section class="card" aria-labelledby="point-types-heading">
+    <h2 id="point-types-heading">Discount Points vs. Origination Points</h2>
+    <p>Regulatory disclosures under federal truth-in-lending rules distinguish between the two classifications of points:</p>
+    <ul>
+      <li><strong>Discount Points:</strong> These represent prepaid interest. In exchange for paying an upfront fee at closing, the lender contractually lowers the note interest rate over the loan term. This process is commonly called "buying down" the rate.</li>
+      <li><strong>Origination Points:</strong> These represent lender processing fees, administrative charges, or underwriting compensation. Paying origination points compensates the lender for evaluating the loan application but does not reduce the note interest rate.</li>
+    </ul>
+  </section>
+
+  <section class="card" aria-labelledby="breakeven-heading">
+    <h2 id="breakeven-heading">The Break-Even Analysis Concept</h2>
+    <p>Financial analysts evaluate discount points through a break-even horizon. A borrower paying upfront discount points exchanges immediate liquidity for smaller ongoing monthly payments:</p>
+    <ul>
+      <li>The break-even point is reached when the cumulative monthly payment savings equal the initial upfront cash disbursed for the discount points.</li>
+      <li>If a loan is paid off, refinanced, or transferred prior to reaching the break-even horizon, the cumulative interest savings do not offset the upfront capital expended.</li>
+      <li>Conversely, retaining the mortgage well past the break-even timeline yields cumulative interest savings exceeding the original upfront cost.</li>
+    </ul>
+  </section>
+
+  <section class="card" aria-labelledby="comparison-caution-heading">
+    <h2 id="comparison-caution-heading">Why Points Matter in Public Comparisons</h2>
+    <p>A published headline interest rate that requires paying multiple upfront points cannot be directly equated with a zero-point loan offer. The lower interest rate on the first offer was purchased using upfront capital. Honest comparisons require reporting both the interest rate and the associated point structure side-by-side.</p>
+  </section>
+
+  <section class="sources-section" aria-labelledby="sources-heading">
+    <h2 id="sources-heading">Authoritative Sources and Regulatory References</h2>
+    <p class="unverified-citation-notice"><em>Citations below cite public regulatory guidance:</em></p>
+    <ul>
+      <li>
+        <a href="https://www.consumerfinance.gov/ask-cfpb/what-are-discount-points-and-how-do-they-work-en-136/" rel="noopener noreferrer">Consumer Financial Protection Bureau (CFPB): What are discount points and how do they work?</a>
+        <span class="citation-tag">(unverified - reviewer must confirm the link and the claim)</span>
+      </li>
+      <li>
+        <a href="https://www.fdic.gov/resources/consumers/consumer-assistance-topics/mortgages.html" rel="noopener noreferrer">Federal Deposit Insurance Corporation (FDIC): Mortgage Overview and Consumer Guidance</a>
+        <span class="citation-tag">(unverified - reviewer must confirm the link and the claim)</span>
+      </li>
+    </ul>
+  </section>
+</article>
+{% endblock %}

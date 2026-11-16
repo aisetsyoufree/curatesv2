@@ -29,6 +29,7 @@
       <nav class="main-nav" aria-label="Main navigation">
         <ul>
           <li><a href="{{ url_for('web.home') }}" {% if request.endpoint == 'web.home' %}aria-current="page"{% endif %}>Home</a></li>
+          <li><a href="{{ url_for('web.learn_index') }}" {% if request.endpoint and request.endpoint.startswith('web.learn') %}aria-current="page"{% endif %}>Learn</a></li>
           <li><a href="{{ url_for('web.methodology') }}" {% if request.endpoint == 'web.methodology' %}aria-current="page"{% endif %}>Methodology</a></li>
           <li><a href="{{ url_for('web.privacy') }}" {% if request.endpoint == 'web.privacy' %}aria-current="page"{% endif %}>Privacy</a></li>
         </ul>
@@ -49,6 +50,7 @@
       <nav aria-label="Footer navigation">
         <ul class="footer-links">
           <li><a href="{{ url_for('web.home') }}">Home</a></li>
+          <li><a href="{{ url_for('web.learn_index') }}">Learn</a></li>
           <li><a href="{{ url_for('web.methodology') }}">Methodology</a></li>
           <li><a href="{{ url_for('web.privacy') }}">Privacy Policy</a></li>
         </ul>

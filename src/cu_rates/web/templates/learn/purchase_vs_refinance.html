@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+
+{% block title %}Purchase vs. Refinance: Why Refinance Is a Purpose, Not a Product{% endblock %}
+
+{% block meta %}
+{% if is_draft %}
+<meta name="robots" content="noindex, follow">
+{% endif %}
+{% endblock %}
+
+{% block content %}
+<article>
+  {% if is_draft %}
+  <div class="draft-banner" role="alert" aria-label="Draft notice">
+    <p><strong>Draft - awaiting factual review:</strong> This article is an unreviewed educational draft awaiting human factual review. It provides general educational explanations and does not provide personalized financial advice, loan recommendations, or endorsements.</p>
+  </div>
+  {% endif %}
+
+  <h1>Purchase vs. Refinance: Why Refinance Is a Purpose, Not a Product</h1>
+
+  <section class="card" aria-labelledby="purpose-concept-heading">
+    <h2 id="purpose-concept-heading">Refinance Is a Loan Purpose, Not a Distinct Product</h2>
+    <p>In consumer financial analysis, a common misconception is to treat a "refinance" as an independent product family separate from a mortgage. In rigorous financial modeling and regulatory reporting, a mortgage loan is the product family, while purchasing and refinancing represent two distinct transactional purposes.</p>
+    <p>Whether a borrower is acquiring a property or replacing an existing obligation, the legal instrument remains a first-lien residential mortgage. However, lenders apply different underwriting criteria, risk adjustments, and pricing matrices depending on the stated transaction purpose.</p>
+  </section>
+
+  <section class="card" aria-labelledby="types-of-purpose-heading">
+    <h2 id="types-of-purpose-heading">Understanding Loan Purposes</h2>
+    <p>Residential mortgage transactions fall into three primary purpose categories:</p>
+    <ul>
+      <li><strong>Home Purchase:</strong> The financing is obtained specifically to acquire ownership of a residential property. The transaction involves transfer of title, earnest money deposits, and closing adjustments between buyer and seller.</li>
+      <li><strong>Rate-and-Term Refinance:</strong> The borrower replaces an existing mortgage on an already owned property with a new mortgage to alter the interest rate, adjust the remaining amortization duration, or convert an adjustable rate to a fixed rate. No significant equity proceeds are paid out in cash.</li>
+      <li><strong>Cash-Out Refinance:</strong> The borrower secures a new mortgage with a principal balance greater than the payoff balance of the existing lien plus closing costs. The excess proceeds are disbursed directly to the homeowner as liquid cash against accrued home equity.</li>
+    </ul>
+  </section>
+
+  <section class="card" aria-labelledby="comparison-pitfalls-heading">
+    <h2 id="comparison-pitfalls-heading">Why Purpose Affects Pricing and Comparisons</h2>
+    <p>Lending institutions frequently publish differing interest rates and discount point structures for purchase and refinance purposes:</p>
+    <ul>
+      <li>Cash-out refinances carry higher risk profiles for secondary mortgage market investors, frequently resulting in additional pricing adjustments compared to purchase loans.</li>
+      <li>Rate-and-term refinances often evaluate existing property equity and prior payment history differently than new purchase appraisals.</li>
+      <li>Directly comparing a purchase headline rate against a refinance headline rate produces misleading conclusions unless the comparison isolates and controls for the loan purpose.</li>
+    </ul>
+  </section>
+
+  <section class="sources-section" aria-labelledby="sources-heading">
+    <h2 id="sources-heading">Authoritative Sources and Regulatory References</h2>
+    <p class="unverified-citation-notice"><em>Citations below cite public regulatory guidance:</em></p>
+    <ul>
+      <li>
+        <a href="https://www.consumerfinance.gov/ask-cfpb/what-is-a-refinance-en-152/" rel="noopener noreferrer">Consumer Financial Protection Bureau (CFPB): What is a refinance?</a>
+        <span class="citation-tag">(unverified - reviewer must confirm the link and the claim)</span>
+      </li>
+      <li>
+        <a href="https://www.mass.gov/service-details/consumer-guide-to-mortgages" rel="noopener noreferrer">Massachusetts Division of Banks: Consumer Guide to Mortgages</a>
+        <span class="citation-tag">(unverified - reviewer must confirm the link and the claim)</span>
+      </li>
+    </ul>
+  </section>
+</article>
+{% endblock %}

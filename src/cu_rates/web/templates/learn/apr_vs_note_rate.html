@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+
+{% block title %}APR vs. Note Rate: Why They Are Never Interchangeable{% endblock %}
+
+{% block meta %}
+{% if is_draft %}
+<meta name="robots" content="noindex, follow">
+{% endif %}
+{% endblock %}
+
+{% block content %}
+<article>
+  {% if is_draft %}
+  <div class="draft-banner" role="alert" aria-label="Draft notice">
+    <p><strong>Draft - awaiting factual review:</strong> This article is an unreviewed educational draft awaiting human factual review. It provides general educational explanations and does not provide personalized financial advice, loan recommendations, or endorsements.</p>
+  </div>
+  {% endif %}
+
+  <h1>APR vs. Note Rate: Why They Are Never Interchangeable</h1>
+
+  <section class="card" aria-labelledby="core-distinction-heading">
+    <h2 id="core-distinction-heading">Two Distinct Financial Measurements</h2>
+    <p>When consumers review mortgage advertisements, lenders publish two interrelated yet distinct figures: the note interest rate and the Annual Percentage Rate (APR). Treating these two metrics as interchangeable is a significant error in financial evaluation.</p>
+    <p>Federal regulations, including the Truth in Lending Act and Regulation Z, mandate the disclosure of both figures specifically because they communicate fundamentally different information regarding the cost of borrowing.</p>
+  </section>
+
+  <section class="card" aria-labelledby="note-rate-heading">
+    <h2 id="note-rate-heading">The Note Interest Rate</h2>
+    <p>The note rate—also referred to as the nominal or contract interest rate—is the specific contractual percentage used by the loan servicer to compute the periodic interest charge:</p>
+    <ul>
+      <li>It directly determines the monthly principal and interest payment due from the borrower.</li>
+      <li>It reflects only the cost of borrowing the principal balance itself and excludes any third-party fees, administrative charges, or upfront points.</li>
+      <li>On an adjustable-rate mortgage, the note rate adjusts over time based on the index and margin specified in the loan agreement.</li>
+    </ul>
+  </section>
+
+  <section class="card" aria-labelledby="apr-heading">
+    <h2 id="apr-heading">The Annual Percentage Rate (APR)</h2>
+    <p>The Annual Percentage Rate provides a broader calculation representing the total annualized cost of the credit transaction:</p>
+    <ul>
+      <li>The APR incorporates the contract interest rate plus mandatory upfront finance charges, including discount points, origination charges, processing fees, and certain lender closing costs.</li>
+      <li>These prepaid finance charges are amortized over the full contractual life of the loan and expressed as an annualized percentage.</li>
+      <li>Because it reflects upfront financing charges alongside periodic interest, the APR is typically higher than the underlying note rate. If a loan carries zero closing fees and zero points, the note rate and APR converge.</li>
+    </ul>
+  </section>
+
+  <section class="card" aria-labelledby="comparison-rules-heading">
+    <h2 id="comparison-rules-heading">Comparison Rules and Limitations</h2>
+    <p>In public rate directories and loan comparisons, note rates must be compared exclusively with note rates, and APRs must be compared exclusively with APRs. A low note rate accompanied by high upfront fees will produce a significantly higher APR, whereas an offer with a slightly higher note rate but zero fees may yield a lower overall APR.</p>
+    <p>Furthermore, APR calculations assume the borrower retains the loan for its full contractual amortization period. If a loan is refinanced or paid off early, the effective annual cost will exceed the stated APR because the upfront closing fees are absorbed over fewer years.</p>
+  </section>
+
+  <section class="sources-section" aria-labelledby="sources-heading">
+    <h2 id="sources-heading">Authoritative Sources and Regulatory References</h2>
+    <p class="unverified-citation-notice"><em>Citations below cite public regulatory guidance:</em></p>
+    <ul>
+      <li>
+        <a href="https://www.consumerfinance.gov/ask-cfpb/what-is-the-difference-between-a-loans-interest-rate-and-its-apr-en-135/" rel="noopener noreferrer">Consumer Financial Protection Bureau (CFPB): What is the difference between a loan's interest rate and its APR?</a>
+        <span class="citation-tag">(unverified - reviewer must confirm the link and the claim)</span>
+      </li>
+      <li>
+        <a href="https://www.federalreserve.gov/pubs/arms/arms_english.htm" rel="noopener noreferrer">Federal Reserve Board: Consumer Handbook on Adjustable-Rate Mortgages</a>
+        <span class="citation-tag">(unverified - reviewer must confirm the link and the claim)</span>
+      </li>
+    </ul>
+  </section>
+</article>
+{% endblock %}

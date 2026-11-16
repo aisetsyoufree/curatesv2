@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+
+{% block title %}Data Collection, Freshness, and Requesting Corrections{% endblock %}
+
+{% block meta %}
+{% if is_draft %}
+<meta name="robots" content="noindex, follow">
+{% endif %}
+{% endblock %}
+
+{% block content %}
+<article>
+  {% if is_draft %}
+  <div class="draft-banner" role="alert" aria-label="Draft notice">
+    <p><strong>Draft - awaiting factual review:</strong> This article is an unreviewed educational draft awaiting human factual review. It provides general educational explanations and does not provide personalized financial advice, loan recommendations, or endorsements.</p>
+  </div>
+  {% endif %}
+
+  <h1>Data Collection, Freshness, and Requesting Corrections</h1>
+
+  <section class="card" aria-labelledby="collection-methods-heading">
+    <h2 id="collection-methods-heading">Automated Public Data Collection</h2>
+    <p>CU-Rates.org compiles residential mortgage and home equity data directly from publicly accessible rate tables, product schedules, and fee disclosures published by Massachusetts credit unions. The platform operates on a strict fail-closed provenance standard: financial information is gathered exclusively from original institution publications, preserving the direct audit trail for every observation.</p>
+    <p>Automated retrieval routines execute on scheduled intervals designed to minimize server load on participating institutions. Parsing logic extracts verified terms, product types, and notes without synthetic interpolation, predictive modeling, or unverified estimation. When a credit union website alters its layout or obscures terms, the parser halts collection for that record until updated extraction rules are verified by maintainers.</p>
+  </section>
+
+  <section class="card" aria-labelledby="freshness-policy-heading">
+    <h2 id="freshness-policy-heading">Bounded Data Freshness Policy</h2>
+    <p>Financial market conditions change continuously, making timely updates essential for informational accuracy. CU-Rates.org enforces rigid data freshness thresholds:</p>
+    <ul>
+      <li>
+        <strong>Scheduled Re-observation:</strong> Primary rate sources are inspected on a daily schedule to detect updates to published rate tables.
+      </li>
+      <li>
+        <strong>Decay Threshold:</strong> If a scheduled collection cannot re-verify an institution's rate table within seventy-two hours of the previous observation, the entry is marked as decayed and suppressed from primary summary rankings.
+      </li>
+      <li>
+        <strong>Mandatory Withdrawal:</strong> Records that remain unverified beyond ninety-six hours are fully withdrawn from active comparison tables until fresh source data is successfully collected and verified.
+      </li>
+    </ul>
+    <p>This bounded freshness policy prevents outdated figures from lingering in public displays when institution pages change or experience temporary downtime.</p>
+  </section>
+
+  <section class="card" aria-labelledby="correction-process-heading">
+    <h2 id="correction-process-heading">Public Correction and Inaccuracy Reporting Process</h2>
+    <p>Transparency and data integrity are central to the mission of CU-Rates.org. Because rate sheets change without prior notification, discrepancies can occur between daily collection passes.</p>
+    <p>Credit union representatives, compliance officers, and members of the public can request data corrections through a public and auditable review process. The project utilizes a publicly tracked revision workflow on its open code repository.</p>
+    <h3>Step-by-Step Correction Procedure</h3>
+    <ol>
+      <li>
+        <strong>Submit an Issue:</strong> Open a formal discrepancy report in the project's public issue tracker on GitHub.
+      </li>
+      <li>
+        <strong>Identify the Record:</strong> Specify the exact credit union name, the loan category, and the specific data point (such as rate, APR, points, or term duration) that requires review.
+      </li>
+      <li>
+        <strong>Provide Primary Source Evidence:</strong> Include the direct public URL to the official institution rate sheet or disclosure document demonstrating the current terms. Submissions must refer to official institution documentation; third-party summaries or unverified verbal quotes are not accepted.
+      </li>
+      <li>
+        <strong>Maintainer Verification:</strong> Maintainers review the submitted evidence against automated extraction logs, adjust parser rules if formatting changes occurred, and rerun verification pipelines to update the record.
+      </li>
+    </ol>
+    <p>In accordance with fail-closed governance, if an institution disputes an automated listing and source documentation is ambiguous, the listing is withdrawn from public comparison pending definitive verification.</p>
+  </section>
+
+  <section class="sources-section" aria-labelledby="sources-heading">
+    <h2 id="sources-heading">Authoritative Sources and Regulatory References</h2>
+    <p class="unverified-citation-notice"><em>Citations below cite public regulatory guidance:</em></p>
+    <ul>
+      <li>
+        <a href="/methodology">CU-Rates.org Methodology and Comparison Principles</a>
+        <span class="citation-tag">(unverified - reviewer must confirm the link and the claim)</span>
+      </li>
+      <li>
+        <a href="https://www.mass.gov/orgs/division-of-banks" rel="noopener noreferrer">Massachusetts Division of Banks: Bank and Credit Union Regulatory Oversight</a>
+        <span class="citation-tag">(unverified - reviewer must confirm the link and the claim)</span>
+      </li>
+    </ul>
+  </section>
+</article>
+{% endblock %}
