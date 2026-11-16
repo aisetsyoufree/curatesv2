@@ -5,20 +5,23 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from alembic.autogenerate import compare_metadata
+from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from sqlalchemy import insert, inspect, select, text, update
 from sqlalchemy.exc import IntegrityError, StatementError
 
 from cu_rates.db import (
     ENUM_CHECKS,
-    HEAD_REVISION,
     AppendOnlyError,
     current_revision,
     downgrade_database,
+    metadata,
     open_operational_database,
+    script_head,
     upgrade_database,
 )
-from cu_rates.db.migrate import VERSIONS_DIR, _config, script_head
+from cu_rates.db.migrate import VERSIONS_DIR, _config
 from cu_rates.db.schema import (
     fetch_profiles,
     fetch_runs,
@@ -249,9 +252,9 @@ def test_fresh_database_migrates_downgrades_and_verifies_revision(tmp_path: Path
         names = set(inspect(conn).get_table_names())
     assert "institutions" in names
     assert "alembic_version" in names
-    assert current_revision(path) == HEAD_REVISION
+    assert current_revision(path) == script_head()
     script = ScriptDirectory.from_config(_config(path))
-    assert script.get_current_head() == script_head() == HEAD_REVISION
+    assert script.get_current_head() == script_head()
 
     downgrade_database(path)
     with engine.connect() as conn:
@@ -260,7 +263,7 @@ def test_fresh_database_migrates_downgrades_and_verifies_revision(tmp_path: Path
     assert current_revision(path) is None
 
     _migrate(path)
-    assert current_revision(path) == HEAD_REVISION
+    assert current_revision(path) == script_head()
     with engine.connect() as conn:
         assert "products" in inspect(conn).get_table_names()
 
@@ -429,7 +432,7 @@ def test_failed_migration_leaves_no_partial_schema_or_revision(tmp_path: Path) -
         names = set(inspect(conn).get_table_names())
     assert "partial_should_not_exist" not in names
     assert "institutions" in names
-    assert current_revision(path) == HEAD_REVISION
+    assert current_revision(path) == script_head()
 
 
 def test_enum_checks_use_contract_values(tmp_path: Path) -> None:
@@ -535,3 +538,49 @@ def test_append_only_history_rejects_update_and_delete(tmp_path: Path) -> None:
             conn.execute(select(product_findings.c.label)).scalar_one()
             == "page did not identify a product"
         )
+
+
+def test_migrated_database_matches_live_metadata(tmp_path: Path) -> None:
+    path = _database(tmp_path)
+    _migrate(path)
+    engine = open_operational_database(path)
+    with engine.connect() as conn:
+        context = MigrationContext.configure(conn)
+        diff = compare_metadata(context, metadata)
+    assert diff == []
+
+
+def test_later_migration_upgrades_from_initial(tmp_path: Path) -> None:
+    path = _database(tmp_path)
+    upgrade_database(path, "t012_initial")
+    assert current_revision(path) == "t012_initial"
+    later = tmp_path / "t012_later.py"
+    later.write_text(
+        "\n".join(
+            [
+                '"""A later revision that adds one table."""',
+                'revision = "t012_later"',
+                'down_revision = "t012_initial"',
+                "branch_labels = None",
+                "depends_on = None",
+                "from alembic import op",
+                "import sqlalchemy as sa",
+                "def upgrade():",
+                "    op.create_table(",
+                '        "later_added",',
+                "        sa.Column('id', sa.Text(), primary_key=True),",
+                "    )",
+                "def downgrade():",
+                '    op.drop_table("later_added")',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    upgrade_database(path, "t012_later", version_locations=(VERSIONS_DIR, tmp_path))
+    engine = open_operational_database(path)
+    with engine.connect() as conn:
+        names = set(inspect(conn).get_table_names())
+    assert "later_added" in names
+    assert "institutions" in names
+    assert current_revision(path) == "t012_later"
