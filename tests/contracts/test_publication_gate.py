@@ -8,6 +8,7 @@ from cu_rates.contracts import (
     Correction,
     DimensionMatch,
     EvidenceKind,
+    FetchMethod,
     MatchState,
     ParserVersion,
     Placement,
@@ -90,20 +91,18 @@ def test_304_cannot_publish_a_rate_the_original_extraction_did_not_verify() -> N
     decision = reobserved(changed)
     assert decision.outcome is PublicationOutcome.REQUIRES_REVIEW
     assert R.REOBSERVATION_CLAIM_CHANGED in decision.reasons
-    other_parser = ParserVersion(name="synthetic-html", version="9.0.0")
-    unbound = prior(purchase_offer()).model_copy(update={"verified_parser": other_parser})
+    verified = prior(purchase_offer())
+    assert verified.review is not None
+    unbound = verified.model_copy(
+        update={"review": verified.review.model_copy(update={"reviewed_evidence_sha256": "0" * 64})}
+    )
     extracted = reobserved(prior=unbound)
     assert R.REOBSERVATION_CLAIM_CHANGED in extracted.reasons
     assert not extracted.publishable_now
-    missing = prior(purchase_offer()).model_copy(
-        update={
-            "verified_artifact_id": None,
-            "verified_configuration_sha256": None,
-            "verified_parser": None,
-        }
+    missing = verified.model_copy(
+        update={"review": verified.review.model_copy(update={"reviewed_evidence_sha256": None})}
     )
     assert R.REOBSERVATION_CLAIM_CHANGED in reobserved(prior=missing).reasons
-    verified = prior(purchase_offer())
     assert verified.verified_configuration_sha256 == CONFIG_HASH
     assert reobserved().publishable_now
 
@@ -156,7 +155,13 @@ def test_scenario_match_needs_a_located_statement_and_is_computed() -> None:
     scenario = CANONICAL_SCENARIOS[scenario_id]
     full = list(matches_all(scenario_id))
     ltv = next(item for item in full if item.dimension.value == "ltv")
-    conflict = ltv.model_copy(update={"stated": StatedBound(exact=Decimal(50))})
+    conflict = ltv.model_copy(
+        update={
+            "stated": StatedBound(exact=Decimal(50)),
+            "source_text": "50%",
+            "provenance": provenance("50%"),
+        }
+    )
     assert conflict.stated is not None
     assert (
         computed_match_state(scenario, conflict.stated, conflict.dimension) is MatchState.CONFLICTS
@@ -166,7 +171,13 @@ def test_scenario_match_needs_a_located_statement_and_is_computed() -> None:
     assert conflicting.placement is Placement.BROWSE_ONLY
     assert R.SCENARIO_CONFLICT in conflicting.reasons
 
-    contained = ltv.model_copy(update={"stated": StatedBound(lower=Decimal(70), upper=Decimal(90))})
+    contained = ltv.model_copy(
+        update={
+            "stated": StatedBound(lower=Decimal(70), upper=Decimal(90)),
+            "source_text": "70% to 90%",
+            "provenance": provenance("70% to 90%"),
+        }
+    )
     full[full.index(conflict)] = contained
     assert decide(purchase_offer(scenario_matches=tuple(full))).ranking_eligible
 
@@ -183,7 +194,8 @@ def test_linked_response_must_share_the_render_run_and_an_approved_origin() -> N
     )
     offer = purchase_offer(supporting_evidence=(evidence,))
     page = raw_artifact()
-    digest = profile_sha256(fetch_profile())
+    profile = fetch_profile(method=FetchMethod.RENDERED_BROWSER)
+    digest = profile_sha256(profile)
     rendered = rate_source(evidence_kind=EvidenceKind.RENDERED_DOM)
 
     other_run = raw_artifact(
@@ -194,9 +206,11 @@ def test_linked_response_must_share_the_render_run_and_an_approved_origin() -> N
         context(
             offer,
             source=rendered,
+            approved_profile=profile,
+            source_approval=source_approval(approved_profile_sha256=digest),
             known_artifacts=(page, other_run),
             fetch_runs=(
-                fetch_run(ARTIFACT_ID),
+                fetch_run(ARTIFACT_ID, profile_sha256=digest),
                 fetch_run(OTHER, run_id="fetch-xhr", profile_sha256=digest),
             ),
         ),
@@ -213,8 +227,10 @@ def test_linked_response_must_share_the_render_run_and_an_approved_origin() -> N
         context(
             offer,
             source=rendered,
+            approved_profile=profile,
+            source_approval=source_approval(approved_profile_sha256=digest),
             known_artifacts=(page, vendor),
-            fetch_runs=(fetch_run(ARTIFACT_ID, OTHER),),
+            fetch_runs=(fetch_run(ARTIFACT_ID, OTHER, profile_sha256=digest),),
         ),
     )
     assert R.ARTIFACT_SOURCE_MISMATCH in unapproved.reasons
@@ -225,9 +241,12 @@ def test_linked_response_must_share_the_render_run_and_an_approved_origin() -> N
         context(
             offer,
             source=rendered,
-            source_approval=source_approval(approved_origins=(vendor_url,)),
+            approved_profile=profile,
+            source_approval=source_approval(
+                approved_origins=(vendor_url,), approved_profile_sha256=digest
+            ),
             known_artifacts=(page, vendor),
-            fetch_runs=(fetch_run(ARTIFACT_ID, OTHER),),
+            fetch_runs=(fetch_run(ARTIFACT_ID, OTHER, profile_sha256=digest),),
         ),
     )
     assert approved.publishable_now

@@ -176,8 +176,9 @@ class SourceFingerprint(VersionedModel):
     """Content and layout digests of one fetched artifact, for drift detection.
 
     ``adapter`` names the parser that produced ``structure_sha256``. T040/T045 must fill
-    both. Publication compares them to the human ``SourceApproval`` and does not derive
-    a layout digest itself. Absent adapter or digest fails closed.
+    both. The observation time is the capture time, not processing time. Publication
+    compares them to the human ``SourceApproval`` and does not derive a layout digest
+    itself. Absent adapter or digest fails closed.
     """
 
     source_id: Identifier

@@ -8,9 +8,11 @@ records (``ReviewDecision``, ``WithdrawalEntry``), not booleans. No model output
 authority here.
 """
 
+import re
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
+from ipaddress import IPv6Address
 from typing import Annotated, Self
 from urllib.parse import urlsplit
 
@@ -29,9 +31,11 @@ from cu_rates.contracts.base import (
     canonical_decimal,
 )
 from cu_rates.contracts.enums import (
+    CanonicalScenarioId,
     ChangeKind,
     ConformingStatus,
     EvidenceKind,
+    FetchMethod,
     InstitutionStatus,
     MatchState,
     OfferStatus,
@@ -42,12 +46,14 @@ from cu_rates.contracts.enums import (
     RateType,
     ReviewSubject,
     RunStatus,
+    ScenarioDimension,
     TierDimension,
     WithdrawalScope,
 )
 from cu_rates.contracts.evidence import (
     ImageOcrLocator,
     ParserVersion,
+    Provenance,
     RawArtifact,
     RenderedDomLocator,
     locator_fits_media_type,
@@ -55,6 +61,7 @@ from cu_rates.contracts.evidence import (
 from cu_rates.contracts.fingerprints import (
     OfferFingerprints,
     OfferSnapshot,
+    offer_evidence_sha256,
     offer_fingerprints,
     product_content_sha256,
     prove_rate_change,
@@ -63,6 +70,7 @@ from cu_rates.contracts.offers import (
     FixedEquityDetails,
     HelocDetails,
     NormalizedOffer,
+    OfferCondition,
     OfferDetails,
     PurchaseMortgageDetails,
     RefinanceMortgageDetails,
@@ -72,8 +80,10 @@ from cu_rates.contracts.scenarios import (
     CANONICAL_SCENARIOS,
     ComparisonScenario,
     DimensionMatch,
+    StatedBound,
     computed_match_state,
     evaluate_scenario_match,
+    statement_matches_excerpt,
 )
 from cu_rates.contracts.sources import (
     FetchProfile,
@@ -331,8 +341,7 @@ class PriorPublication(ContractModel):
     published: PublishedSnapshot
     review: ReviewDecision | None = None
     last_value_change_at: UtcDatetime
-    # Set together. T014 copies them from the extraction that was verified against the
-    # original artifact. A 304 cannot extend claims when any of them is missing.
+    # Legacy single-artifact metadata. 304 authority now comes from the human review digest.
     verified_artifact_id: Sha256Hex | None = None
     verified_configuration_sha256: Sha256Hex | None = None
     verified_parser: ParserVersion | None = None
@@ -383,6 +392,28 @@ class PriorPublication(ContractModel):
         return self.review is not None and self.review.approved
 
 
+class VerifiedScenarioStatement(ContractModel):
+    """T014 supplies this from a trusted verifier that resolved the stored artifact locator.
+
+    A claim copied from the proposed offer is not independent evidence.
+    """
+
+    offer_id: Identifier
+    dimension: ScenarioDimension
+    fetch_run_id: Identifier
+    stated: StatedBound
+    provenance: Provenance
+
+
+class VerifiedScenarioCondition(ContractModel):
+    """An independently verified condition match for this offer, scenario, and capture."""
+
+    offer_id: Identifier
+    scenario_id: CanonicalScenarioId
+    fetch_run_id: Identifier
+    condition: OfferCondition
+
+
 class PublicationContext(ContractModel):
     institution: Institution
     product: ProductIdentity
@@ -396,6 +427,8 @@ class PublicationContext(ContractModel):
     reobservations: tuple[NotModifiedObservation, ...] = ()
     approved_profile: FetchProfile | None = None
     source_fingerprints: tuple[SourceFingerprint, ...] = ()
+    verified_scenario_statements: tuple[VerifiedScenarioStatement, ...] = ()
+    verified_scenario_conditions: tuple[VerifiedScenarioCondition, ...] = ()
     validations: tuple[ValidationResult, ...] = ()
     prior: PriorPublication | None = None
     product_review: ReviewDecision | None = None
@@ -416,7 +449,15 @@ class PublicationContext(ContractModel):
             ],
             "validation rule result": [(v.offer_id, v.rule_id) for v in self.validations],
             "source fingerprint": [
-                (item.source_id, item.artifact_id) for item in self.source_fingerprints
+                (item.source_id, item.fetch_run_id, item.artifact_id)
+                for item in self.source_fingerprints
+            ],
+            "verified scenario statement": [
+                (item.offer_id, item.dimension) for item in self.verified_scenario_statements
+            ],
+            "verified scenario condition": [
+                (item.offer_id, item.scenario_id, item.condition.condition_id)
+                for item in self.verified_scenario_conditions
             ],
             "withdrawal": [w.withdrawal_id for w in self.withdrawals],
             "correction": [c.correction_id for c in self.corrections],
@@ -452,10 +493,42 @@ class PublicationDecision(ContractModel):
         return ReasonCode.STALE_DEGRADED in self.reasons
 
 
-def _origin(url: str) -> str:
-    parts = urlsplit(url)
-    port = f":{parts.port}" if parts.port else ""
-    return f"{parts.scheme}://{parts.hostname or ''}{port}"
+def _origin(url: str) -> tuple[str, str, int] | None:
+    """Canonical HTTP origin; malformed authorities never count as approvals."""
+    if any(ord(ch) < 33 or ch == "\\" for ch in url):
+        return None
+    try:
+        parts = urlsplit(url)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return None
+    default = {"http": 80, "https": 443}.get(parts.scheme)
+    if (
+        default is None
+        or not host
+        or parts.username is not None
+        or parts.password is not None
+        or parts.netloc.endswith(":")
+        or "%" in host
+        or port == 0
+    ):
+        return None
+    if ":" in host:
+        if not re.fullmatch(r"\[[0-9a-fA-F:.]+\](?::[0-9]+)?", parts.netloc):
+            return None
+        try:
+            host = IPv6Address(host).compressed
+        except ValueError:
+            return None
+    else:
+        try:
+            host = host.encode("idna").decode("ascii")
+        except UnicodeError:
+            return None
+        label = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+        if len(host) > 253 or not re.fullmatch(rf"{label}(?:\.{label})*\.?", host):
+            return None
+    return parts.scheme, host, default if port is None else port
 
 
 def _origin_approved(url: str, ctx: PublicationContext) -> bool:
@@ -465,7 +538,8 @@ def _origin_approved(url: str, ctx: PublicationContext) -> bool:
         return False
     allowed = {_origin(ctx.source.url)}
     allowed.update(_origin(item) for item in approval.approved_origins)
-    return _origin(url) in allowed
+    origin = _origin(url)
+    return origin is not None and origin in allowed
 
 
 def _profile_is_approved(run: FetchRun, ctx: PublicationContext) -> bool:
@@ -491,6 +565,10 @@ def _profile_is_approved(run: FetchRun, ctx: PublicationContext) -> bool:
         and run.profile_id == profile.profile_id
         and profile.source_id == run.source_id
         and approval.decided_at <= run.started_at
+        and (
+            ctx.source.evidence_kind is not EvidenceKind.RENDERED_DOM
+            or profile.method is FetchMethod.RENDERED_BROWSER
+        )
     )
 
 
@@ -666,7 +744,7 @@ def _artifact_reasons(
     elif ctx.evaluated_at - (observed or artifact.fetched_at) > WITHDRAW_AFTER:
         reasons.add(R.ARTIFACT_STALE)
     # The source contract models no redirects, so a cited page must be the exact URL.
-    if primary and artifact.source_url != ctx.source.url:
+    if _origin(artifact.source_url) is None or (primary and artifact.source_url != ctx.source.url):
         reasons.add(R.ARTIFACT_SOURCE_MISMATCH)
     return reasons
 
@@ -681,6 +759,10 @@ def _evidence_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[Re
         primary_artifact = stored.get(provenance.artifact_id)
         referenced = [(provenance.artifact_id, True)]
         if isinstance(locator, RenderedDomLocator):
+            if ctx.approved_profile is None or (
+                ctx.approved_profile.method is not FetchMethod.RENDERED_BROWSER
+            ):
+                reasons.add(R.PROFILE_UNAPPROVED)
             referenced += [(response_id, False) for response_id in locator.response_ids]
         for artifact_id, primary in referenced:
             artifact = stored.get(artifact_id)
@@ -718,9 +800,16 @@ def _evidence_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[Re
             reasons.add(R.PARSER_NOT_APPROVED)
         if provenance.is_ocr:
             reasons.add(R.OCR_VALUE)
-    # Observation is the newest cited fetch (or proven 304 of one), not a free-standing claim.
-    if used and offer.observed_at != max(used.values()):
+    # A new supporting document cannot advance the observation time of an older rate.
+    rate_ids = {rate.provenance.artifact_id for _, rate in offer.rate_items()}
+    rate_times = [used[artifact_id] for artifact_id in rate_ids & used.keys()]
+    if used and (
+        offer.observed_at != max(used.values())
+        or offer.observed_at != max(rate_times, default=None)
+    ):
         reasons.add(R.OBSERVATION_UNBOUND)
+    if any(DEGRADE_AFTER < ctx.evaluated_at - time <= WITHDRAW_AFTER for time in rate_times):
+        reasons.add(R.STALE_DEGRADED)
     return reasons
 
 
@@ -751,12 +840,9 @@ def _validation_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[
             passed.add(result.rule_id)  # the APR rule only counts if it examined both rates
     if not required or required - passed:
         reasons.add(R.VALIDATIONS_MISSING)
-    # A recorded pass does not outrank the rates on the offer.
-    if (
-        offer.apr is not None
-        and offer.note_rate is not None
-        and offer.apr.value < offer.note_rate.value
-    ):
+    # A recorded pass does not outrank any advertised pair, including browse-only tiers.
+    pairs = [(offer.note_rate, offer.apr), *((tier.note_rate, tier.apr) for tier in offer.tiers)]
+    if any(note is not None and apr is not None and apr.value < note.value for note, apr in pairs):
         reasons.add(R.VALIDATION_FAILED)
     return reasons
 
@@ -807,22 +893,13 @@ def _field_text(offer: NormalizedOffer, path: str) -> str | None:
     rates = offer.rate_values()
     if path in rates:
         return canonical_decimal(rates[path])
-    if path.startswith("details."):
-        name = path.removeprefix("details.")
-        if name == "intro.duration_months":
-            intro = getattr(offer.details, "intro", None)
-            duration = None if intro is None else intro.duration_months
-            return None if duration is None else str(duration)
-        if not hasattr(offer.details, name):
-            return None
-        value = getattr(offer.details, name)
-        if value is None or isinstance(value, tuple):
-            return None
+    if path.startswith("details.") and path in offer.material_paths():
+        value: object = offer.details
+        for name in path.removeprefix("details.").split("."):
+            value = getattr(value, name, None)
         if isinstance(value, Decimal):
             return canonical_decimal(value)
-        if isinstance(value, StrEnum):
-            return value.value
-        if isinstance(value, int):
+        if isinstance(value, str | int):
             return str(value)
         return None
     return None
@@ -839,14 +916,58 @@ def _same_stated_value(actual: str, claimed: str) -> bool:
 
 def _correction_value_matches(offer: NormalizedOffer, path: str, corrected_value: str) -> bool:
     actual = _field_text(offer, path)
-    return actual is not None and _same_stated_value(actual, corrected_value)
+    return actual is not None and _field_excerpt_matches(offer, path, actual, corrected_value)
 
 
-def _correction_evidence_stored(correction: Correction, ctx: PublicationContext) -> bool:
+def _field_excerpt_matches(offer: NormalizedOffer, path: str, actual: str, excerpt: str) -> bool:
+    if _same_stated_value(actual, excerpt):
+        return True
+    text = excerpt.lower()
+    if path == "points":
+        number = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)(?:\s*%|\s+points?)", text)
+        return number is not None and _same_stated_value(actual, number[1])
+    if path in offer.rate_values() or path.endswith(("_cap", ".max_cltv")):
+        number = re.fullmatch(r"([+-]?[0-9]+(?:\.[0-9]+)?)\s*%(?:\s+(?:apr|note rate|rate))?", text)
+        return number is not None and _same_stated_value(actual, number[1])
+    unit = (
+        ScenarioDimension.TERM_MONTHS
+        if path.endswith("_months")
+        else ScenarioDimension.LOCK_DAYS
+        if path.endswith(".lock_days")
+        else ScenarioDimension.LOAN_AMOUNT
+        if path.endswith((".min_amount", ".max_amount"))
+        else None
+    )
+    return unit is not None and statement_matches_excerpt(
+        unit, StatedBound(exact=Decimal(actual)), text
+    )
+
+
+def _correction_evidence_is_current(
+    correction: Correction, offer: NormalizedOffer, ctx: PublicationContext
+) -> bool:
     if not correction.evidence:
         return False
-    stored = {artifact.artifact_id for artifact in ctx.known_artifacts}
-    return all(item.artifact_id in stored for item in correction.evidence)
+    path = correction.field_path
+    actual = _field_text(offer, path)
+    if actual is None:
+        return False
+    bound = {
+        item for label, item in offer.iter_labeled_provenance() if label in (path, f"fields.{path}")
+    }
+    stored = {artifact.artifact_id: artifact for artifact in ctx.known_artifacts}
+    for item in correction.evidence:
+        capture = stored.get(item.artifact_id)
+        if (
+            item not in bound
+            or not _field_excerpt_matches(offer, path, actual, item.source_text)
+            or capture is None
+            or capture.fetched_at != offer.observed_at
+            or capture.fetched_at < correction.corrected_at
+            or _artifact_reasons(capture, offer, ctx, primary=True)
+        ):
+            return False
+    return True
 
 
 def _proven_refresh(offer: NormalizedOffer, ctx: PublicationContext) -> bool:
@@ -875,24 +996,14 @@ def _proven_refresh(offer: NormalizedOffer, ctx: PublicationContext) -> bool:
 
 
 def _claims_extend(offer: NormalizedOffer, prior: PriorPublication) -> bool:
-    """A 304 may extend only values already verified against the original artifact."""
-    artifact_id = prior.verified_artifact_id
-    parser = prior.verified_parser
-    configuration = prior.verified_configuration_sha256
-    if artifact_id is None or parser is None or configuration is None:
-        return False
-    current = OfferSnapshot.from_offer(offer)
-    if current.rates != prior.snapshot.rates or current.points != prior.snapshot.points:
-        return False
-    for item in offer.iter_provenance():
-        extraction = item.extraction
-        if (
-            item.artifact_id != artifact_id
-            or extraction.parser != parser
-            or extraction.configuration_sha256 != configuration
-        ):
-            return False
-    return True
+    """A 304 extends only the same claims with the exact evidence the human reviewed."""
+    review = prior.review
+    return (
+        review is not None
+        and review.approved
+        and review.reviewed_evidence_sha256 == offer_evidence_sha256(offer)
+        and offer_fingerprints(offer) == prior.snapshot.fingerprints
+    )
 
 
 def _layout_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[ReasonCode]:
@@ -920,6 +1031,8 @@ def _layout_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[Reas
     }
     if not cited:
         return {R.LAYOUT_UNREVIEWED}
+    if any(item.extraction.parser != approval.adapter for item in offer.iter_provenance()):
+        return {R.LAYOUT_UNREVIEWED}
     for artifact_id in cited:
         artifact = stored[artifact_id]
         match = next(
@@ -932,7 +1045,7 @@ def _layout_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[Reas
                 and fingerprint.content_sha256 == artifact.artifact_id
                 and fingerprint.structure_sha256 == approval.approved_layout_sha256
                 and fingerprint.adapter == approval.adapter
-                and fingerprint.observed_at <= ctx.evaluated_at
+                and fingerprint.observed_at == artifact.fetched_at <= ctx.evaluated_at
             ),
             None,
         )
@@ -949,6 +1062,8 @@ def _corrections_cleared(offer: NormalizedOffer, ctx: PublicationContext) -> boo
         review is not None
         and review.approved
         and review.reviewed_fingerprints == current
+        and review.reviewed_evidence_sha256 == offer_evidence_sha256(offer)
+        and review.subject_id == offer.offer_id
         and review.decided_at <= ctx.evaluated_at
     )
     for correction in ctx.corrections:
@@ -956,17 +1071,13 @@ def _corrections_cleared(offer: NormalizedOffer, ctx: PublicationContext) -> boo
             continue
         if correction.corrected_at > ctx.evaluated_at:
             return False
-        # A matching fingerprint clears a correction only when the offer now carries the
-        # stated replacement and new source evidence for it. A contradictory value, or
-        # evidence that was never stored, stays pending. A later human review of this
-        # exact state can still clear it.
-        bound = (
-            correction.corrected_fingerprints == current
-            and _correction_value_matches(offer, correction.field_path, correction.corrected_value)
-            and _correction_evidence_stored(correction, ctx)
-        )
-        if not bound and not (
-            reviewed_current and review is not None and review.decided_at >= correction.corrected_at
+        # Neither a fingerprint nor a review substitutes for new evidence of the replacement.
+        if not _correction_value_matches(offer, correction.field_path, correction.corrected_value):
+            return False
+        if not _correction_evidence_is_current(correction, offer, ctx):
+            return False
+        if correction.corrected_fingerprints != current and not (
+            reviewed_current and review is not None and review.decided_at >= offer.observed_at
         ):
             return False
     return True
@@ -1105,13 +1216,19 @@ def _terms_match_scenario(details: OfferDetails, scenario: ComparisonScenario) -
 def _verified_scenario_matches(
     offer: NormalizedOffer, ctx: PublicationContext
 ) -> tuple[tuple[DimensionMatch, ...], set[ReasonCode]]:
-    """Recompute claimed matches from typed, located statements.
-
-    A conflict is already fail-closed. A claimed match with no locator, no typed
-    value, or an unstored artifact does not count as a match.
-    """
+    """Rank only independently verified statements tied to the current rate capture."""
     assert offer.scenario_id is not None
-    stored = {artifact.artifact_id for artifact in ctx.known_artifacts}
+    stored = {artifact.artifact_id: artifact for artifact in ctx.known_artifacts}
+    verified = {
+        proof.dimension: proof
+        for proof in ctx.verified_scenario_statements
+        if proof.offer_id == offer.offer_id
+    }
+    rate_runs = {
+        capture.fetch_run_id
+        for _, rate in offer.rate_items()
+        if (capture := stored.get(rate.provenance.artifact_id)) is not None
+    }
     scenario = CANONICAL_SCENARIOS[offer.scenario_id]
     reasons: set[ReasonCode] = set()
     adjusted: list[DimensionMatch] = []
@@ -1120,7 +1237,21 @@ def _verified_scenario_matches(
             adjusted.append(match)
             continue
         provenance = match.provenance
-        if match.stated is None or provenance is None or provenance.artifact_id not in stored:
+        capture = stored.get(provenance.artifact_id) if provenance is not None else None
+        proof = verified.get(match.dimension)
+        if (
+            match.stated is None
+            or provenance is None
+            or capture is None
+            or proof is None
+            or proof.provenance != provenance
+            or proof.stated != match.stated
+            or proof.fetch_run_id != capture.fetch_run_id
+            or capture.fetch_run_id not in rate_runs
+            or match.source_text != provenance.source_text
+            or not statement_matches_excerpt(match.dimension, match.stated, provenance.source_text)
+            or _reobservation_basis(capture, offer, ctx) != (offer.observed_at, False)
+        ):
             if provenance is not None and provenance.artifact_id not in stored:
                 reasons.add(R.ARTIFACT_NOT_STORED)
             adjusted.append(
@@ -1131,6 +1262,34 @@ def _verified_scenario_matches(
         source_text = None if computed is MatchState.UNSTATED else match.source_text
         adjusted.append(match.model_copy(update={"state": computed, "source_text": source_text}))
     return tuple(adjusted), reasons
+
+
+def _verified_conditions(offer: NormalizedOffer, ctx: PublicationContext) -> bool:
+    captures = {artifact.artifact_id: artifact for artifact in ctx.known_artifacts}
+    rate_runs = {
+        capture.fetch_run_id
+        for _, rate in offer.rate_items()
+        if (capture := captures.get(rate.provenance.artifact_id)) is not None
+    }
+    proofs = {
+        item.condition.condition_id: item
+        for item in ctx.verified_scenario_conditions
+        if item.offer_id == offer.offer_id and item.scenario_id == offer.scenario_id
+    }
+    for condition in offer.conditions:
+        proven = proofs.get(condition.condition_id)
+        capture = captures.get(condition.provenance.artifact_id)
+        if (
+            condition.scenario_state is not MatchState.MATCHES
+            or proven is None
+            or proven.condition != condition
+            or capture is None
+            or proven.fetch_run_id != capture.fetch_run_id
+            or proven.fetch_run_id not in rate_runs
+            or _reobservation_basis(capture, offer, ctx) != (offer.observed_at, False)
+        ):
+            return False
+    return True
 
 
 def _placement_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[ReasonCode]:
@@ -1154,7 +1313,7 @@ def _placement_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[R
         ConformingStatus.CONFORMING
     ):
         reasons.add(R.NOT_CONFORMING)
-    if any(c.scenario_state is not MatchState.MATCHES for c in offer.conditions):
+    if not _verified_conditions(offer, ctx):
         reasons.add(R.CONDITION_NOT_SATISFIED)
     if offer.scenario_id is None:
         reasons.add(R.SCENARIO_NOT_DECLARED)

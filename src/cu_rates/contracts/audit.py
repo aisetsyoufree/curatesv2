@@ -37,6 +37,8 @@ class ReviewDecision(VersionedModel):
     evidence: tuple[Provenance, ...] = ()
     reviewed_fingerprints: OfferFingerprints | None = None
     reviewed_product_sha256: Sha256Hex | None = None
+    # T014 persists this binding at review time; legacy reviews still deserialize.
+    reviewed_evidence_sha256: Sha256Hex | None = None
 
     @model_validator(mode="after")
     def _reviews_are_content_bound(self) -> Self:
@@ -45,6 +47,8 @@ class ReviewDecision(VersionedModel):
             raise ValueError("an offer review must record the fingerprints it reviewed")
         if not is_offer and self.reviewed_fingerprints is not None:
             raise ValueError("only offer reviews carry fingerprints")
+        if not is_offer and self.reviewed_evidence_sha256 is not None:
+            raise ValueError("only offer reviews carry an offer evidence digest")
         if not is_offer and self.reviewed_product_sha256 is None:
             raise ValueError("a product review must record the product content digest")
         if is_offer and self.reviewed_product_sha256 is not None:
@@ -57,9 +61,9 @@ class ReviewDecision(VersionedModel):
 
 
 class WithdrawalEntry(VersionedModel):
-    """Emergency denylist entry suppressing an offer, product, institution, or snapshot.
+    """Emergency denylist entry suppressing an offer, product, institution, source, or snapshot.
 
-    ``target_id`` is the offer/product/snapshot identifier, or the charter number as text
+    ``target_id`` is the offer/product/source/snapshot identifier, or the charter number as text
     for institution scope. An entry is in force from ``withdrawn_at`` until ``lifted_at``.
     """
 

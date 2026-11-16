@@ -51,7 +51,7 @@ def test_fingerprints_are_deterministic_and_hex() -> None:
     assert first == second
     assert len(first.structural) == len(first.value) == 64
     assert first.structural != first.value
-    assert first.algorithm == "fp1"
+    assert first.algorithm == "fp2"
 
 
 def test_pure_rate_change_moves_value_fingerprint_only() -> None:

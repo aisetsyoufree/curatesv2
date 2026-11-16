@@ -1,5 +1,6 @@
 """Borrower comparison scenarios and tri-state scenario matching."""
 
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from decimal import Decimal
 from types import MappingProxyType
@@ -225,6 +226,96 @@ class DimensionMatch(ContractModel):
         if not stated and self.source_text is not None:
             raise ValueError("an unstated dimension cannot carry source text")
         return self
+
+
+_NUM = r"[0-9]+(?:\.[0-9]+)?"
+_MONEY = r"(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\.[0-9]+)?"
+_TERM = re.compile(
+    r"([0-9]{1,3}|ten|fifteen|twenty|thirty)[ -](years?|months?)"
+    r"(?: fixed term)?(?: \(([0-9]{1,3}) months?\))?"
+)
+_EXPLICIT_TOKENS: Mapping[ScenarioDimension, Mapping[str, str]] = {
+    _D.OCCUPANCY: {
+        "owner-occupied primary residence": "owner_occupied",
+        "owner-occupied single-family primary residence": "owner_occupied",
+    },
+    _D.PROPERTY_TYPE: {"single-family": "single_family", "single family": "single_family"},
+    _D.RATE_TYPE: {
+        "fixed": "fixed",
+        "fixed rate": "fixed",
+        "fixed-rate": "fixed",
+        "conventional conforming fixed purchase": "fixed",
+    },
+    _D.CASH_OUT: {"no cash out": "no", "no cash-out": "no", "cash out": "yes"},
+    _D.RELATIONSHIP_DISCOUNT: {
+        "no relationship discount": "no",
+        "relationship discount required": "yes",
+    },
+}
+
+
+def _dimension_number(text: str, dimension: ScenarioDimension) -> Decimal | None:
+    """Parse an exact excerpt's dimension-specific unit and physically valid bounds."""
+    if dimension is _D.TERM_MONTHS:
+        term = _TERM.fullmatch(text)
+        if term is None:
+            return None
+        quantity, unit, equivalent = term.groups()
+        count = (
+            int(quantity)
+            if quantity.isdigit()
+            else {"ten": 10, "fifteen": 15, "twenty": 20, "thirty": 30}[quantity]
+        )
+        months = count * 12 if unit.startswith("year") else count
+        if not 1 <= months <= 720 or (equivalent is not None and int(equivalent) != months):
+            return None
+        return Decimal(months)
+    patterns = {
+        _D.LTV: (rf"({_NUM})\s*%", 0, 100),
+        _D.CLTV: (rf"({_NUM})\s*%", 0, 100),
+        _D.LOAN_AMOUNT: (rf"(?:\$\s*|usd\s+)({_MONEY})", 0, 999_999_999_999),
+        _D.CREDIT_SCORE: (r"([0-9]{3})", 300, 850),
+        _D.LOCK_DAYS: (r"([0-9]{1,3})[ -]days?(?: lock)?", 1, 366),
+        _D.POINTS: (rf"({_NUM})(?:\s*%|\s+points?)?", 0, 10),
+    }
+    spec = patterns.get(dimension)
+    if spec is None:
+        return None
+    pattern, lower, upper = spec
+    match = re.fullmatch(pattern, text)
+    if match is None:
+        return None
+    value = Decimal(match[1].replace(",", ""))
+    fractional = match[1].partition(".")[2].rstrip("0")
+    if dimension is _D.LOAN_AMOUNT and (value == 0 or len(fractional) > 2):
+        return None
+    return value if lower <= value <= upper else None
+
+
+def statement_matches_excerpt(
+    dimension: ScenarioDimension, stated: StatedBound, excerpt: str
+) -> bool:
+    """Check units, domain, and literal agreement before treating a statement as evidence."""
+    text = " ".join(excerpt.lower().split())
+    if stated.token is not None:
+        return _EXPLICIT_TOKENS.get(dimension, {}).get(text) == stated.token
+    if stated.exact is not None:
+        return _dimension_number(text, dimension) == stated.exact
+    if stated.lower is not None and stated.upper is not None:
+        match = re.fullmatch(r"(.+?)(?:\s+to\s+|\s*[\u2013\u2014]\s*)(.+)", text)
+        return match is not None and (
+            _dimension_number(match[1], dimension),
+            _dimension_number(match[2], dimension),
+        ) == (stated.lower, stated.upper)
+    if stated.lower is not None:
+        match = re.fullmatch(r"(?:>=|at least\s+)\s*(.+)", text)
+        return match is not None and _dimension_number(match[1], dimension) == stated.lower
+    match = re.fullmatch(r"(?:<=|up to\s+)\s*(.+)", text)
+    return (
+        stated.upper is not None
+        and match is not None
+        and _dimension_number(match[1], dimension) == stated.upper
+    )
 
 
 def match_numeric(

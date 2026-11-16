@@ -16,6 +16,7 @@ from sqlalchemy import insert, inspect, select, text, update
 from sqlalchemy.exc import IntegrityError, StatementError
 
 from cu_rates.contracts import (
+    CanonicalScenarioId,
     FetchMethod,
     FetchProfile,
     FieldEvidence,
@@ -892,6 +893,10 @@ def _provider_chain(prefix: str, charter: int, body: bytes) -> dict[str, object]
     def prov(quote: str) -> Provenance:
         return make.provenance(quote, artifact_id=artifact_id)
 
+    scenario_matches = tuple(
+        match.model_copy(update={"provenance": prov(match.source_text or "")})
+        for match in make.matches_all(CanonicalScenarioId.PURCHASE_30Y_FIXED)
+    )
     draft = make.purchase_offer(
         offer_id=f"offer-{prefix}",
         institution_charter=charter,
@@ -901,6 +906,7 @@ def _provider_chain(prefix: str, charter: int, body: bytes) -> dict[str, object]
         apr=SourcedRate(value=Decimal("6.250"), provenance=prov(f"{prefix} apr")),
         points=SourcedPoints(value=Decimal("0"), provenance=prov(f"{prefix} points")),
         supporting_evidence=(prov(f"{prefix} supporting"),),
+        scenario_matches=scenario_matches,
         field_provenance=(),
     )
     offer = make.purchase_offer(
@@ -912,6 +918,7 @@ def _provider_chain(prefix: str, charter: int, body: bytes) -> dict[str, object]
         apr=draft.apr,
         points=draft.points,
         supporting_evidence=draft.supporting_evidence,
+        scenario_matches=draft.scenario_matches,
         field_provenance=tuple(
             FieldEvidence(path=field_path, provenance=prov(field_path))
             for field_path in sorted(draft.material_paths())

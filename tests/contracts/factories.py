@@ -52,6 +52,7 @@ from cu_rates.contracts import (
     ReviewDecision,
     ReviewSubject,
     ReviewVerdict,
+    ScenarioDimension,
     SnapshotEntry,
     SourceApproval,
     SourcedMargin,
@@ -69,6 +70,8 @@ from cu_rates.contracts import (
     product_content_sha256,
     snapshot_manifest_sha256,
 )
+from cu_rates.contracts.fingerprints import offer_evidence_sha256
+from cu_rates.contracts.publication import VerifiedScenarioCondition, VerifiedScenarioStatement
 from cu_rates.contracts.scenarios import matching_statement
 from cu_rates.contracts.sources import profile_sha256
 
@@ -222,13 +225,27 @@ def points(value: str) -> SourcedPoints:
 
 def matches_all(scenario_id: CanonicalScenarioId) -> tuple[DimensionMatch, ...]:
     scenario = CANONICAL_SCENARIOS[scenario_id]
+    texts = {
+        ScenarioDimension.OCCUPANCY: "Owner-occupied primary residence",
+        ScenarioDimension.PROPERTY_TYPE: "Single-family",
+        ScenarioDimension.CREDIT_SCORE: str(scenario.credit_score),
+        ScenarioDimension.RATE_TYPE: "Fixed",
+        ScenarioDimension.TERM_MONTHS: f"{scenario.term_months} months",
+        ScenarioDimension.LTV: f"{scenario.ltv}%",
+        ScenarioDimension.CLTV: f"{scenario.cltv}%",
+        ScenarioDimension.LOCK_DAYS: f"{scenario.lock_days} days",
+        ScenarioDimension.LOAN_AMOUNT: "$" + str(scenario.loan_amount),
+        ScenarioDimension.POINTS: f"{scenario.points} points",
+        ScenarioDimension.CASH_OUT: "No cash out",
+        ScenarioDimension.RELATIONSHIP_DISCOUNT: "No relationship discount",
+    }
     return tuple(
         DimensionMatch(
             dimension=dimension,
             state=MatchState.MATCHES,
-            source_text=f"{dimension.value} stated",
+            source_text=texts[dimension],
             stated=matching_statement(scenario, dimension),
-            provenance=provenance(f"{dimension.value} stated"),
+            provenance=provenance(texts[dimension]),
         )
         for dimension in sorted(REQUIRED_DIMENSIONS[scenario_id])
     )
@@ -421,6 +438,7 @@ def review(
         decided_at=T0 - timedelta(days=1),
         rationale="Matches the stored source page.",
         reviewed_fingerprints=offer_fingerprints(offer),
+        reviewed_evidence_sha256=offer_evidence_sha256(offer),
     )
 
 
@@ -571,6 +589,43 @@ def context(
         "evaluated_at": EVALUATED_AT,
     }
     kwargs.update(overrides)
+    if "source_fingerprints" not in overrides:
+        kwargs["source_fingerprints"] = tuple(
+            source_fingerprint(
+                artifact_id=artifact.artifact_id,
+                content_sha256=artifact.artifact_id,
+                fetch_run_id=artifact.fetch_run_id,
+                observed_at=artifact.fetched_at,
+            )
+            for artifact in kwargs["known_artifacts"]
+            if artifact.source_url == kwargs["source"].url
+        )
+    runs = {art.artifact_id: art.fetch_run_id for art in kwargs["known_artifacts"]}
+    if "verified_scenario_statements" not in overrides:
+        kwargs["verified_scenario_statements"] = tuple(
+            VerifiedScenarioStatement(
+                offer_id=current.offer_id,
+                dimension=match.dimension,
+                fetch_run_id=runs[match.provenance.artifact_id],
+                provenance=match.provenance,
+                stated=match.stated,
+            )
+            for match in current.scenario_matches
+            if match.stated is not None
+            and match.provenance is not None
+            and match.provenance.artifact_id in runs
+        )
+    if "verified_scenario_conditions" not in overrides and current.scenario_id is not None:
+        kwargs["verified_scenario_conditions"] = tuple(
+            VerifiedScenarioCondition(
+                offer_id=current.offer_id,
+                scenario_id=current.scenario_id,
+                fetch_run_id=runs[item.provenance.artifact_id],
+                condition=item,
+            )
+            for item in current.conditions
+            if item.provenance.artifact_id in runs
+        )
     if "product_review" not in kwargs:
         kwargs["product_review"] = product_review(reviewed=kwargs["product"])
     return PublicationContext(**kwargs)

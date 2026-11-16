@@ -39,7 +39,9 @@ from cu_rates.contracts.evidence import Provenance, SourcedMargin, SourcedPoints
 from cu_rates.contracts.offers import NormalizedOffer
 from cu_rates.contracts.registry import ProductIdentity
 
-FINGERPRINT_ALGORITHM = "fp1"
+FINGERPRINT_ALGORITHM: Literal["fp1"] = "fp1"
+TYPED_SCENARIO_FINGERPRINT: Literal["fp2"] = "fp2"
+type FingerprintAlgorithm = Literal["fp1", "fp2"]
 
 _EXCLUDED: dict[str, frozenset[str]] = {
     "NormalizedOffer": frozenset(
@@ -55,7 +57,7 @@ _EXCLUDED: dict[str, frozenset[str]] = {
             "field_provenance",
         }
     ),
-    "DimensionMatch": frozenset({"source_text"}),
+    "DimensionMatch": frozenset({"source_text", "provenance"}),
     "ProductIdentity": frozenset({"schema_version"}),
 }
 _ID_SORTED = {
@@ -67,7 +69,7 @@ _ID_SORTED = {
 SignedBasisPoints = Annotated[Decimal, Field(allow_inf_nan=False)]
 
 
-def _structure(obj: object) -> object:
+def _structure(obj: object, algorithm: FingerprintAlgorithm = "fp1") -> object:
     """Canonical structural view of ``obj``; sourced values contribute only their presence."""
     if isinstance(obj, SourcedRate | SourcedMargin | SourcedPoints):
         return True
@@ -78,12 +80,14 @@ def _structure(obj: object) -> object:
             raw = getattr(obj, name)
             if name in excluded or isinstance(raw, Provenance):
                 continue
+            if algorithm == "fp1" and type(obj).__name__ == "DimensionMatch" and name == "stated":
+                continue
             if name in _ID_SORTED:
                 raw = tuple(sorted(raw, key=attrgetter(_ID_SORTED[name])))
-            structure[name] = _structure(raw)
+            structure[name] = _structure(raw, algorithm)
         return structure
     if isinstance(obj, tuple):
-        return [_structure(item) for item in obj]
+        return [_structure(item, algorithm) for item in obj]
     if isinstance(obj, Decimal):
         return canonical_decimal(obj)
     if isinstance(obj, Enum):
@@ -91,13 +95,13 @@ def _structure(obj: object) -> object:
     return obj
 
 
-def _digest(payload: object) -> str:
+def _digest(payload: object, domain: str = FINGERPRINT_ALGORITHM) -> str:
     text = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-    return hashlib.sha256(f"{FINGERPRINT_ALGORITHM}:{text}".encode()).hexdigest()
+    return hashlib.sha256(f"{domain}:{text}".encode()).hexdigest()
 
 
 class OfferFingerprints(ContractModel):
-    algorithm: Literal["fp1"] = "fp1"
+    algorithm: FingerprintAlgorithm = "fp1"
     structural: Sha256Hex
     value: Sha256Hex
 
@@ -113,10 +117,43 @@ def value_fingerprint(rates: Mapping[str, Decimal], points: Decimal | None) -> s
 
 
 def offer_fingerprints(offer: NormalizedOffer) -> OfferFingerprints:
+    """Legacy fp1 is unchanged; fp2 versions the structural hash of typed assumptions.
+
+    The independent numeric rate-map digest has the same format in both versions.
+    """
     points = offer.points.value if offer.points else None
+    algorithm: FingerprintAlgorithm = (
+        TYPED_SCENARIO_FINGERPRINT
+        if any(m.stated is not None or m.provenance is not None for m in offer.scenario_matches)
+        else FINGERPRINT_ALGORITHM
+    )
     return OfferFingerprints(
-        structural=_digest(_structure(offer)),
+        algorithm=algorithm,
+        structural=_digest(_structure(offer, algorithm), algorithm),
         value=value_fingerprint(offer.rate_values(), points),
+    )
+
+
+def offer_evidence_sha256(offer: NormalizedOffer) -> str:
+    """Independent, versioned review binding for each claim's exact evidence.
+
+    Observation and validity timestamps can move during a refresh. Artifact IDs,
+    claim paths, locators, excerpts, and all extraction identity fields cannot.
+    T014 must load the reviewed digest from history, never compute it from the
+    offer it is currently attempting to refresh.
+    """
+    claims = sorted(
+        (path, json.dumps(evidence.model_dump(mode="json"), sort_keys=True))
+        for path, evidence in offer.iter_labeled_provenance()
+    )
+    excerpts = sorted((m.dimension.value, m.source_text) for m in offer.scenario_matches)
+    return _digest(
+        {
+            "claims": claims,
+            "scenario_excerpts": excerpts,
+            "effective_at": offer.effective_at.isoformat() if offer.effective_at else None,
+        },
+        "offer-evidence-v1",
     )
 
 
@@ -126,7 +163,7 @@ def product_content_sha256(product: ProductIdentity) -> str:
 
 
 def classify_change(prior: OfferFingerprints, current: OfferFingerprints) -> ChangeKind:
-    if prior.structural != current.structural:
+    if prior.algorithm != current.algorithm or prior.structural != current.structural:
         return ChangeKind.STRUCTURAL
     if prior.value != current.value:
         return ChangeKind.VALUE_ONLY
