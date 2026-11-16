@@ -1,0 +1,13 @@
+Charter,Credit Union Name,State,Status,City,Date Inactive,Successor Charter,As of Date
+99001,Beacon Synthetic Federal Credit Union,MA,Active,Boston,,,2026-09-01
+99002,Minuteman Fictional Credit Union,MA,Active,Worcester,,,2026-09-01
+99003,Old Colony Synthetic Credit Union,MA,Merged,Plymouth,2025-06-30,99001,2026-09-01
+99004,Pioneer Valley Fictional Credit Union,MA,Liquidated,Springfield,2024-12-31,,2026-09-01
+99001,Beacon Synthetic Federal Credit Union,MA,Active,Boston,,,2026-09-01
+99005,Berkshire Fictional Credit Union,MA,Active,Pittsfield,,,2026-09-01
+99005,Conflicting Berkshire Credit Union,MA,Liquidated,Pittsfield,2025-01-01,,2026-09-01
+99006,Granite Fictional Credit Union,NH,Active,Manchester,,,2026-09-01
+99007,Ocean State Synthetic Credit Union,RI,Active,Providence,,,2026-09-01
+NOT_A_CHARTER,Malformed Charter Credit Union,MA,Active,Cambridge,,,2026-09-01
+99008,Broken Merger Synthetic CU,MA,Merged,Lowell,2025-01-01,,2026-09-01
+99009,Unknown Status Fictional CU,MA,AlienStatus,Salem,,,2026-09-01

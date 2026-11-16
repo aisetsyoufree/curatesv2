@@ -16,6 +16,7 @@ the comment on ``normalized_offers``.
 """
 
 from collections import Counter
+from collections.abc import Iterable
 from enum import StrEnum
 
 from sqlalchemy import (
@@ -87,6 +88,8 @@ APPEND_ONLY_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "published_snapshots": ("snapshot_id",),
     "snapshot_entries": ("snapshot_id", "offer_id"),
     "snapshot_reviews": ("snapshot_id", "review_id"),
+    "roster_imports": ("import_id",),
+    "roster_import_entries": ("import_id", "charter_number"),
 }
 APPEND_ONLY_TABLES = frozenset(APPEND_ONLY_PRIMARY_KEYS)
 # Offers may change lifecycle columns. They still cannot be replaced, because
@@ -818,6 +821,52 @@ snapshot_reviews = Table(
     Column("review_id", SqlText, ForeignKey("review_decisions.review_id"), primary_key=True),
 )
 
+roster_imports = Table(
+    "roster_imports",
+    metadata,
+    _id("import_id", primary_key=True),
+    _schema_version(),
+    Column("source_version", SqlText, nullable=False),
+    Column("source_as_of_date", SqlText, nullable=False),
+    Column("retrieved_at", UtcDateTime, nullable=False),
+    Column("artifact_id", SqlText, nullable=False),
+    Column("row_count", Integer, nullable=False),
+    Column("imported_count", Integer, nullable=False),
+    CheckConstraint(
+        "length(artifact_id) = 64 AND artifact_id = lower(artifact_id)",
+        name="ck_roster_imports_artifact_id",
+    ),
+    CheckConstraint("row_count >= 0", name="ck_roster_imports_row_count"),
+    CheckConstraint("imported_count >= 0", name="ck_roster_imports_imported_count"),
+    UniqueConstraint("artifact_id", name="uq_roster_imports_artifact_id"),
+)
+
+roster_import_entries = Table(
+    "roster_import_entries",
+    metadata,
+    Column("import_id", SqlText, ForeignKey("roster_imports.import_id"), primary_key=True),
+    _charter("charter_number", primary_key=True),
+    _schema_version(),
+    Column("legal_name", SqlText, nullable=False),
+    Column("status", SqlText, nullable=False),
+    Column("successor_charter_number", Integer),
+    Column("city", SqlText),
+    Column("closure_or_merger_date", SqlText),
+    Column("source_as_of_date", SqlText, nullable=False),
+    CheckConstraint(
+        "charter_number > 0 AND charter_number < 100000000",
+        name="ck_roster_import_entries_charter_number",
+    ),
+    CheckConstraint(
+        "(status = 'merged' AND successor_charter_number IS NOT NULL"
+        " AND successor_charter_number != charter_number"
+        " AND successor_charter_number > 0 AND successor_charter_number < 100000000)"
+        " OR (status != 'merged' AND successor_charter_number IS NULL)",
+        name="ck_roster_import_entries_successor",
+    ),
+    _enum_check("roster_import_entries", "status", InstitutionStatus),
+)
+
 
 def offer_frozen_columns() -> tuple[str, ...]:
     """Columns on ``normalized_offers`` that a lifecycle update must not touch."""
@@ -830,15 +879,28 @@ def _append_only_message(table: str) -> str:
     return f"{table} is append-only"
 
 
-def schema_triggers() -> tuple[tuple[str, str], ...]:
+def schema_triggers(tables: Iterable[str] | None = None) -> tuple[tuple[str, str], ...]:
     """``(name, CREATE TRIGGER statement)`` for the operational database.
 
     Update and delete triggers reject ordinary mutation. The insert trigger
     rejects ``REPLACE`` even when ``recursive_triggers`` is off, because the
     old primary key is still visible to ``BEFORE INSERT``.
     """
+    target_tables: frozenset[str] | None = frozenset(tables) if tables is not None else None
+    if target_tables is None:
+        try:
+            from alembic import op
+            from sqlalchemy import inspect
+
+            bind = op.get_bind()
+            target_tables = frozenset(inspect(bind).get_table_names())
+        except Exception:
+            target_tables = None
+
     statements: list[tuple[str, str]] = []
     for table_name, keys in APPEND_ONLY_PRIMARY_KEYS.items():
+        if target_tables is not None and table_name not in target_tables:
+            continue
         message = _append_only_message(table_name)
         for action in ("update", "delete"):
             name = f"{table_name}_no_{action}"
@@ -859,32 +921,37 @@ def schema_triggers() -> tuple[tuple[str, str], ...]:
                 f"BEGIN SELECT RAISE(ABORT, '{message}'); END",
             )
         )
-    frozen = " OR ".join(f"OLD.{column} IS NOT NEW.{column}" for column in offer_frozen_columns())
-    published = "OLD.published_at IS NOT NULL AND OLD.published_at IS NOT NEW.published_at"
-    lifecycle = "normalized_offers_lifecycle_only"
-    statements.append(
-        (
-            lifecycle,
-            "CREATE TRIGGER normalized_offers_lifecycle_only BEFORE UPDATE ON normalized_offers "
-            f"WHEN {frozen} OR ({published}) "
-            "BEGIN SELECT RAISE(ABORT, 'normalized_offers allows only a lifecycle status change'); "
-            "END",
+    if target_tables is None or "normalized_offers" in target_tables:
+        frozen = " OR ".join(
+            f"OLD.{column} IS NOT NEW.{column}" for column in offer_frozen_columns()
         )
-    )
-    for action, timing in (("delete", "DELETE"), ("replace", "INSERT")):
-        name = f"normalized_offers_no_{action}"
-        if action == "delete":
-            body = (
-                f"CREATE TRIGGER {name} BEFORE {timing} ON normalized_offers "
-                "BEGIN SELECT RAISE(ABORT, 'normalized_offers is append-only'); END"
+        published = "OLD.published_at IS NOT NULL AND OLD.published_at IS NOT NEW.published_at"
+        lifecycle = "normalized_offers_lifecycle_only"
+        statements.append(
+            (
+                lifecycle,
+                "CREATE TRIGGER normalized_offers_lifecycle_only "
+                "BEFORE UPDATE ON normalized_offers "
+                f"WHEN {frozen} OR ({published}) "
+                "BEGIN SELECT RAISE(ABORT, "
+                "'normalized_offers allows only a lifecycle status change'); "
+                "END",
             )
-        else:
-            body = (
-                f"CREATE TRIGGER {name} BEFORE {timing} ON normalized_offers "
-                "WHEN EXISTS (SELECT 1 FROM normalized_offers WHERE offer_id = NEW.offer_id) "
-                "BEGIN SELECT RAISE(ABORT, 'normalized_offers is append-only'); END"
-            )
-        statements.append((name, body))
+        )
+        for action, timing in (("delete", "DELETE"), ("replace", "INSERT")):
+            name = f"normalized_offers_no_{action}"
+            if action == "delete":
+                body = (
+                    f"CREATE TRIGGER {name} BEFORE {timing} ON normalized_offers "
+                    "BEGIN SELECT RAISE(ABORT, 'normalized_offers is append-only'); END"
+                )
+            else:
+                body = (
+                    f"CREATE TRIGGER {name} BEFORE {timing} ON normalized_offers "
+                    "WHEN EXISTS (SELECT 1 FROM normalized_offers WHERE offer_id = NEW.offer_id) "
+                    "BEGIN SELECT RAISE(ABORT, 'normalized_offers is append-only'); END"
+                )
+            statements.append((name, body))
     return tuple(statements)
 
 
