@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+
+{% block title %}Data Collection, Freshness, and Requesting Corrections{% endblock %}
+
+{% block meta %}
+{% if is_draft %}
+<meta name="robots" content="noindex, follow">
+{% endif %}
+{% endblock %}
+
+{% block content %}
+<article>
+  {% if is_draft %}
+  <div class="draft-banner" role="alert" aria-label="Draft notice">
+    <p><strong>Draft - awaiting factual review:</strong> This article is an unreviewed educational draft awaiting human factual review. It provides general educational explanations and does not provide personalized financial advice, loan recommendations, or endorsements.</p>
+  </div>
+  {% endif %}
+
+  <h1>Data Collection, Freshness, and Requesting Corrections</h1>
+
+  <section class="card" aria-labelledby="collection-methods-heading">
+    <h2 id="collection-methods-heading">Planned Automated Public Data Collection</h2>
+    <p>Once data collection is live, CU-Rates.org will compile residential mortgage and home equity data directly from publicly accessible rate tables, product schedules, and fee disclosures published by Massachusetts credit unions. The platform is designed around a strict fail-closed provenance architecture: financial information will be gathered exclusively from original institution publications, preserving an immutable audit trail for every public observation.</p>
+    <p>The system is designed so that automated retrieval routines will execute on scheduled, rate-limited intervals to minimize server load on participating institutions. Parsing logic will extract verified terms, product families, and offer conditions deterministically without synthetic interpolation, predictive modeling, or unverified estimation. If an institution website alters its layout or obscures terms, the pipeline is designed to quarantine the affected record until updated extraction rules can be verified by maintainers.</p>
+  </section>
+
+  <section class="card" aria-labelledby="freshness-policy-heading">
+    <h2 id="freshness-policy-heading">Planned Data Freshness Policy</h2>
+    <p>Financial market conditions change continuously, making timely verification essential for informational accuracy. As defined in the project methodology, the planned data architecture enforces strict bounded freshness policies once collection is operational:</p>
+    <ul>
+      <li>
+        <strong>Scheduled Re-observation:</strong> Primary rate sources will be collected on a daily schedule to observe updates to published rate tables and product disclosures.
+      </li>
+      <li>
+        <strong>72-Hour Degrade Rule:</strong> If scheduled collection cannot re-verify an institution's rate table within seventy-two hours of the previous successful observation, the record will degrade and be suppressed from primary comparison rankings.
+      </li>
+      <li>
+        <strong>96-Hour Withdrawal Rule:</strong> Records that remain unverified beyond ninety-six hours will be fully withdrawn from rate comparisons until fresh source data is successfully collected and verified.
+      </li>
+    </ul>
+    <p>This planned freshness policy ensures that outdated or stale figures will never linger in public displays when institution pages change or experience temporary unavailability.</p>
+  </section>
+
+  <section class="card" aria-labelledby="correction-process-heading">
+    <h2 id="correction-process-heading">Planned Public Correction Channel</h2>
+    <p>Transparency, precision, and data integrity are core principles of CU-Rates.org. Per section 5 of the project methodology, a structured public correction and dispute channel will be provided once public data publication begins.</p>
+    <p><strong>Notice: The public correction channel is not yet available during this initial site foundation phase.</strong> Public submissions are not currently being accepted.</p>
+
+    <h3>Warning: Do Not Submit Personal Financial Data</h3>
+    <p><strong>Users must not submit loan applications, account numbers, financial records, or other personal data.</strong> CU-Rates.org is strictly an educational directory and research project; it is not a lender, broker, or financial institution. Unsolicited personal financial documentation or borrower applications will not be processed and will be deleted immediately.</p>
+
+    <h3>Planned Submission Specifications</h3>
+    <p>Once operational, the public correction channel will accept structured requests containing:</p>
+    <ul>
+      <li>The public source URL where the published rate or disclosure appears,</li>
+      <li>The specific affected field (such as product name, APR, note rate, term, points, or condition),</li>
+      <li>The reason for the correction or dispute,</li>
+      <li>Optional supporting primary evidence or documentation from the institution.</li>
+    </ul>
+    <p>Each submitted request will become an append-only recorded correction case tracking the received time, affected entity, submitted evidence, review decision, and resolution time. Decisions may confirm, amend, quarantine, withdraw, or reject a claim based on verifiable primary evidence.</p>
+
+    <h3>Operational Triage Targets</h3>
+    <p>The project establishes clear operational targets for triaging submitted reports once live:</p>
+    <ul>
+      <li><strong>One Business Day:</strong> Credible reports involving active rates, institution identity, privacy, or security are targeted for triage within one business day.</li>
+      <li><strong>Five Business Days:</strong> Other general data reports or structural feedback are targeted for triage within five business days.</li>
+    </ul>
+    <p>These timeframes represent internal operational targets for project reviewers, not promises of lender response or product availability.</p>
+  </section>
+
+  <section class="sources-section" aria-labelledby="sources-heading">
+    <h2 id="sources-heading">Authoritative Sources and Regulatory References</h2>
+    <p class="unverified-citation-notice"><em>Citations below cite public regulatory guidance:</em></p>
+    <ul>
+      <li>
+        <a href="/methodology">CU-Rates.org Methodology and Comparison Principles</a>
+        <span class="citation-tag">(unverified - reviewer must confirm the link and the claim)</span>
+      </li>
+      <li>
+        <a href="https://www.mass.gov/orgs/division-of-banks" rel="noopener noreferrer">Massachusetts Division of Banks: Bank and Credit Union Regulatory Oversight</a>
+        <span class="citation-tag">(unverified - reviewer must confirm the link and the claim)</span>
+      </li>
+    </ul>
+  </section>
+</article>
+{% endblock %}

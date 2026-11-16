@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+
+{% block title %}Mortgage Basics and Core Principles{% endblock %}
+
+{% block meta %}
+{% if is_draft %}
+<meta name="robots" content="noindex, follow">
+{% endif %}
+{% endblock %}
+
+{% block content %}
+<article>
+  {% if is_draft %}
+  <div class="draft-banner" role="alert" aria-label="Draft notice">
+    <p><strong>Draft - awaiting factual review:</strong> This article is an unreviewed educational draft awaiting human factual review. It provides general educational explanations and does not provide personalized financial advice, loan recommendations, or endorsements.</p>
+  </div>
+  {% endif %}
+
+  <h1>Mortgage Basics and Core Principles</h1>
+
+  <section class="card" aria-labelledby="definition-heading">
+    <h2 id="definition-heading">What Is a Mortgage?</h2>
+    <p>A residential mortgage is a legal agreement in which a borrower receives financing from a lender to purchase or refinance real property, pledging the real estate itself as collateral for the debt obligation.</p>
+    <p>If the borrower fulfills the payment terms stipulated in the promissory note, the lender releases the lien upon full repayment. If the borrower defaults on the contractual obligations, the underlying security instrument grants the lender legal recourse to initiate foreclosure proceedings to recover the outstanding balance.</p>
+  </section>
+
+  <section class="card" aria-labelledby="components-heading">
+    <h2 id="components-heading">Core Components of a Mortgage</h2>
+    <p>Every residential mortgage contains several fundamental financial components:</p>
+    <ul>
+      <li><strong>Principal:</strong> The original sum of money borrowed from the financial institution, which decreases over time as principal payments are applied.</li>
+      <li><strong>Interest:</strong> The fee assessed by the lender for the use of the borrowed funds, calculated as a contractual percentage of the remaining principal balance.</li>
+      <li><strong>Term:</strong> The contractual life of the loan, specifying the number of years or months over which regular payments are amortized. Common residential terms span multiple decades.</li>
+      <li><strong>Amortization:</strong> The structured schedule of periodic payments designed to pay down both interest and principal over the loan term, shifting from interest-heavy payments in early periods toward principal reduction in later periods.</li>
+      <li><strong>Escrow:</strong> An account maintained by the loan servicer to accumulate monthly homeowner reserves for property taxes, homeowners insurance premiums, and flood insurance where required.</li>
+    </ul>
+  </section>
+
+  <section class="card" aria-labelledby="rate-structures-heading">
+    <h2 id="rate-structures-heading">Fixed-Rate vs. Adjustable-Rate Structures</h2>
+    <p>Lenders offer two primary interest rate structures for first-lien home loans:</p>
+    <ul>
+      <li><strong>Fixed-Rate Mortgages:</strong> The interest rate remains constant throughout the entire amortization period. Monthly payments of principal and interest do not fluctuate, providing predictable payment schedules.</li>
+      <li><strong>Adjustable-Rate Mortgages (ARMs):</strong> The interest rate remains fixed for an introductory period, after which it adjusts periodically based on a published financial benchmark index plus an agreed lender margin, subject to contractual rate adjustment caps.</li>
+    </ul>
+  </section>
+
+  <section class="sources-section" aria-labelledby="sources-heading">
+    <h2 id="sources-heading">Authoritative Sources and Regulatory References</h2>
+    <p class="unverified-citation-notice"><em>Citations below cite public regulatory guidance:</em></p>
+    <ul>
+      <li>
+        <a href="https://www.consumerfinance.gov/ask-cfpb/what-is-a-mortgage-en-99/" rel="noopener noreferrer">Consumer Financial Protection Bureau (CFPB): What is a mortgage?</a>
+        <span class="citation-tag">(unverified - reviewer must confirm the link and the claim)</span>
+      </li>
+      <li>
+        <a href="https://www.federalreserve.gov/pubs/mortgage/mortb_1.htm" rel="noopener noreferrer">Federal Reserve Board: Looking for the Best Mortgage - Shop, Compare, Negotiate</a>
+        <span class="citation-tag">(unverified - reviewer must confirm the link and the claim)</span>
+      </li>
+    </ul>
+  </section>
+</article>
+{% endblock %}

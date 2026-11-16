@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+
+{% block title %}Home Equity Loans vs. HELOCs: Closed-End Loans vs. Open-End Lines{% endblock %}
+
+{% block meta %}
+{% if is_draft %}
+<meta name="robots" content="noindex, follow">
+{% endif %}
+{% endblock %}
+
+{% block content %}
+<article>
+  {% if is_draft %}
+  <div class="draft-banner" role="alert" aria-label="Draft notice">
+    <p><strong>Draft - awaiting factual review:</strong> This article is an unreviewed educational draft awaiting human factual review. It provides general educational explanations and does not provide personalized financial advice, loan recommendations, or endorsements.</p>
+  </div>
+  {% endif %}
+
+  <h1>Home Equity Loans vs. HELOCs: Closed-End Loans vs. Open-End Lines</h1>
+
+  <section class="card" aria-labelledby="equity-concept-heading">
+    <h2 id="equity-concept-heading">Understanding Home Equity Financing</h2>
+    <p>Home equity represents the unencumbered economic value of a residential property—calculated as the estimated fair market value minus all recorded mortgage liens and encumbrances. When property owners seek to borrow against accumulated equity, lenders offer two primary product structures: closed-end home equity loans and open-end lines of credit.</p>
+    <p>Both products typically occupy a junior or second-lien position behind the primary first mortgage, which impacts lender risk, underwriting standards, and interest rate margins.</p>
+  </section>
+
+  <section class="card" aria-labelledby="fixed-equity-heading">
+    <h2 id="fixed-equity-heading">Fixed Home Equity Loans (Closed-End Credit)</h2>
+    <p>A closed-end home equity loan operates similarly to a traditional mortgage installment loan:</p>
+    <ul>
+      <li><strong>Lump-Sum Disbursement:</strong> The total approved principal balance is funded in a single transaction at loan closing.</li>
+      <li><strong>Fixed Interest Rate:</strong> The interest rate remains set for the life of the loan and does not fluctuate with financial market benchmarks.</li>
+      <li><strong>Predictable Amortization:</strong> Monthly payments of principal and interest remain identical over a defined term (such as a multi-year repayment schedule).</li>
+      <li><strong>No Reborrowing:</strong> As the principal is repaid over time, the available credit does not replenish; the balance steadily amortizes down to zero.</li>
+    </ul>
+  </section>
+
+  <section class="card" aria-labelledby="heloc-heading">
+    <h2 id="heloc-heading">Home Equity Lines of Credit (Open-End Credit)</h2>
+    <p>A Home Equity Line of Credit (HELOC) operates as an open-end revolving credit line secured by the property:</p>
+    <ul>
+      <li><strong>Draw and Repayment Periods:</strong> A HELOC has two distinct lifecycle stages. During the initial draw period, the borrower may repeatedly borrow, repay, and reborrow funds up to an established credit limit, often making interest-only payments. At the conclusion of the draw period, the line enters the repayment period, during which further draws are prohibited and the remaining balance must be amortized.</li>
+      <li><strong>Variable Benchmark Rates:</strong> HELOC interest rates are generally variable and linked to a reference benchmark (such as the Prime rate) plus a stated lender margin. As the underlying benchmark shifts, the borrowing rate adjusts accordingly.</li>
+      <li><strong>Introductory Teaser Rates:</strong> Lenders frequently advertise discounted promotional rates that expire after a specified number of introductory months. The subsequent ongoing rate is governed by benchmark fluctuations, subject to contractually established floors and lifetime ceilings.</li>
+    </ul>
+  </section>
+
+  <section class="card" aria-labelledby="comparison-summary-heading">
+    <h2 id="comparison-summary-heading">Structural Comparison</h2>
+    <p>Comparing fixed home equity loans directly with HELOCs requires recognizing their distinct contractual mechanics. A headline introductory rate on a HELOC cannot be equated with a multi-year fixed interest rate on a closed-end loan, because the HELOC rate carries interest rate adjustment risk once the promotional period concludes.</p>
+  </section>
+
+  <section class="sources-section" aria-labelledby="sources-heading">
+    <h2 id="sources-heading">Authoritative Sources and Regulatory References</h2>
+    <p class="unverified-citation-notice"><em>Citations below cite public regulatory guidance:</em></p>
+    <ul>
+      <li>
+        <a href="https://consumer.ftc.gov/articles/home-equity-loans-and-credit-lines" rel="noopener noreferrer">Federal Trade Commission (FTC): Home Equity Loans and Home Equity Lines of Credit</a>
+        <span class="citation-tag">(unverified - reviewer must confirm the link and the claim)</span>
+      </li>
+      <li>
+        <a href="https://www.consumerfinance.gov/ask-cfpb/what-is-the-difference-between-a-home-equity-loan-and-a-heloc-en-106/" rel="noopener noreferrer">Consumer Financial Protection Bureau (CFPB): What is the difference between a home equity loan and a home equity line of credit?</a>
+        <span class="citation-tag">(unverified - reviewer must confirm the link and the claim)</span>
+      </li>
+    </ul>
+  </section>
+</article>
+{% endblock %}
