@@ -5,8 +5,17 @@ not foreign keys, because a successor may not be in this roster. Canonical
 comparison scenarios stay in code. Nested offer details, conditions, tiers,
 and scenario matches are JSON text; headline rates and provenance are columns.
 A withdrawal lift is its own append-only row so the original entry is not updated.
+
+Fetched bodies live once in ``artifact_blobs`` (content hash, size). Every fetch
+writes its own ``artifact_observations`` row, so a second fetch of identical
+bytes is a new observation of the same blob.
+
+Rows an audited record cites are append-only, including extraction history and
+evidence links. Offer lifecycle is the one exception, and it is narrow: see
+the comment on ``normalized_offers``.
 """
 
+from collections import Counter
 from enum import StrEnum
 
 from sqlalchemy import (
@@ -50,29 +59,58 @@ from cu_rates.db.types import DecimalText, JsonDocument, UtcDateTime
 
 metadata = MetaData()
 
-# Observations, reviews, withdrawals, and findings. Child rows that belong to
-# those records are included so their evidence cannot be rewritten either.
-APPEND_ONLY_TABLES = frozenset(
-    {
-        "fetch_runs",
-        "not_modified_observations",
-        "review_decisions",
-        "withdrawal_entries",
-        "withdrawal_lifts",
-        "product_findings",
-        "finding_evidence",
-        "finding_purposes",
-        "raw_artifacts",
-        "provenance",
-        "source_approvals",
-        "source_approval_evidence",
-        "corrections",
-        "published_snapshots",
-        "snapshot_entries",
-    }
-)
+# Primary-key columns of every append-only table, in constraint order. The
+# replace guard aborts when this key is already present. SQLite otherwise
+# implements REPLACE as a delete plus an insert and skips the delete trigger
+# unless recursive_triggers is enabled.
+APPEND_ONLY_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
+    "fetch_runs": ("run_id",),
+    "not_modified_observations": ("run_id",),
+    "review_decisions": ("review_id",),
+    "review_evidence": ("review_id", "provenance_id"),
+    "withdrawal_entries": ("withdrawal_id",),
+    "withdrawal_lifts": ("withdrawal_id",),
+    "product_findings": ("finding_id",),
+    "finding_evidence": ("finding_id", "provenance_id"),
+    "finding_purposes": ("finding_id", "purpose"),
+    "artifact_blobs": ("artifact_id",),
+    "artifact_observations": ("fetch_run_id", "source_url"),
+    "provenance": ("provenance_id",),
+    "source_approvals": ("approval_id",),
+    "source_approval_evidence": ("approval_id", "provenance_id"),
+    "extraction_runs": ("run_id",),
+    "extracted_candidates": ("candidate_id",),
+    "offer_evidence": ("offer_id", "provenance_id", "role", "field_path"),
+    "validation_results": ("validation_id",),
+    "corrections": ("correction_id",),
+    "correction_evidence": ("correction_id", "provenance_id"),
+    "published_snapshots": ("snapshot_id",),
+    "snapshot_entries": ("snapshot_id", "offer_id"),
+    "snapshot_reviews": ("snapshot_id", "review_id"),
+}
+APPEND_ONLY_TABLES = frozenset(APPEND_ONLY_PRIMARY_KEYS)
+# Offers may change lifecycle columns. They still cannot be replaced, because
+# REPLACE would delete the cited row and insert a different one.
+REPLACE_GUARDED_TABLES = APPEND_ONLY_TABLES | frozenset({"normalized_offers"})
+# ``published_at`` may be filled once; ``status`` may move. Nothing else may.
+OFFER_MUTABLE_COLUMNS = frozenset({"status", "published_at"})
 
 ENUM_CHECKS: list[tuple[str, str, type[StrEnum]]] = []
+
+
+# Text that canonical_decimal never emits for a finite Decimal, plus the
+# spellings SQLite would store if a writer bypassed the type decorator.
+_NONFINITE_DECIMALS = (
+    "'nan', '-nan', '+nan', 'inf', '-inf', '+inf', "
+    "'infinity', '-infinity', '+infinity', 'snan', '-snan', '+snan'"
+)
+
+
+def _finite_decimal(table: str, column: str) -> CheckConstraint:
+    return CheckConstraint(
+        f"{column} IS NULL OR lower({column}) NOT IN ({_NONFINITE_DECIMALS})",
+        name=f"ck_{table}_{column}_finite",
+    )
 
 
 def _enum_check(table: str, column: str, enum_cls: type[StrEnum]) -> CheckConstraint:
@@ -271,6 +309,7 @@ fetch_runs = Table(
     Column("error", SqlText),
     Column("validator_kind", SqlText),
     Column("validator_value", SqlText),
+    UniqueConstraint("run_id", "source_id", name="uq_fetch_runs_source"),
     CheckConstraint("finished_at >= started_at", name="ck_fetch_runs_order"),
     CheckConstraint(
         "(status = 'succeeded' AND error IS NULL)"
@@ -286,19 +325,40 @@ fetch_runs = Table(
     _enum_check("fetch_runs", "status", RunStatus),
 )
 
-raw_artifacts = Table(
-    "raw_artifacts",
+# One row per distinct body. ``artifact_id`` is the SHA-256 of the bytes and
+# ``byte_length`` is their size. A later fetch of the same bytes inserts an
+# observation, not another blob.
+artifact_blobs = Table(
+    "artifact_blobs",
     metadata,
     _id("artifact_id", primary_key=True),
+    Column("byte_length", Integer, nullable=False),
+    CheckConstraint("byte_length >= 0", name="ck_artifact_blobs_byte_length"),
+)
+
+# One row per fetch of a URL, including a repeat of bytes already stored.
+# ``(fetch_run_id, artifact_id)`` is unique so a 304 can cite the run and body
+# that belong together. One run therefore records each body once.
+artifact_observations = Table(
+    "artifact_observations",
+    metadata,
+    Column("fetch_run_id", SqlText, primary_key=True),
+    Column("source_url", SqlText, primary_key=True),
     _schema_version(),
+    Column("artifact_id", SqlText, ForeignKey("artifact_blobs.artifact_id"), nullable=False),
     Column("media_type", SqlText, nullable=False),
-    Column("source_url", SqlText, nullable=False),
     Column("fetched_at", UtcDateTime, nullable=False),
     Column("http_status", Integer, nullable=False),
-    Column("byte_length", Integer, nullable=False),
-    Column("fetch_run_id", SqlText, ForeignKey("fetch_runs.run_id"), nullable=False),
-    CheckConstraint("http_status BETWEEN 100 AND 599", name="ck_raw_artifacts_http_status"),
-    CheckConstraint("byte_length >= 0", name="ck_raw_artifacts_byte_length"),
+    UniqueConstraint("fetch_run_id", "artifact_id", name="uq_observations_run_artifact"),
+    CheckConstraint(
+        "http_status BETWEEN 100 AND 599",
+        name="ck_artifact_observations_http_status",
+    ),
+    ForeignKeyConstraint(
+        ["fetch_run_id"],
+        ["fetch_runs.run_id"],
+        name="fk_observations_fetch_run",
+    ),
 )
 
 not_modified_observations = Table(
@@ -312,10 +372,8 @@ not_modified_observations = Table(
     Column("git_sha", SqlText, nullable=False),
     Column("started_at", UtcDateTime, nullable=False),
     Column("observed_at", UtcDateTime, nullable=False),
-    Column("original_run_id", SqlText, ForeignKey("fetch_runs.run_id"), nullable=False),
-    Column(
-        "original_artifact_id", SqlText, ForeignKey("raw_artifacts.artifact_id"), nullable=False
-    ),
+    Column("original_run_id", SqlText, nullable=False),
+    Column("original_artifact_id", SqlText, nullable=False),
     Column("validator_kind", SqlText, nullable=False),
     Column("validator_value", SqlText, nullable=False),
     Column("response_etag", SqlText),
@@ -327,13 +385,29 @@ not_modified_observations = Table(
         "validator_kind IN ('etag', 'last_modified')",
         name="ck_not_modified_observations_validator_kind",
     ),
+    ForeignKeyConstraint(
+        ["original_run_id", "source_id"],
+        ["fetch_runs.run_id", "fetch_runs.source_id"],
+        name="fk_not_modified_same_source",
+    ),
+    ForeignKeyConstraint(
+        ["original_run_id", "original_artifact_id"],
+        ["artifact_observations.fetch_run_id", "artifact_observations.artifact_id"],
+        name="fk_not_modified_run_artifact",
+    ),
 )
 
 provenance = Table(
     "provenance",
     metadata,
     _id("provenance_id", primary_key=True),
-    Column("artifact_id", SqlText, ForeignKey("raw_artifacts.artifact_id"), nullable=False),
+    Column(
+        "institution_charter",
+        Integer,
+        ForeignKey("institutions.charter_number"),
+        nullable=False,
+    ),
+    Column("artifact_id", SqlText, ForeignKey("artifact_blobs.artifact_id"), nullable=False),
     Column("locator_kind", SqlText, nullable=False),
     Column("locator_json", JsonDocument, nullable=False),
     Column("source_text", SqlText, nullable=False),
@@ -343,6 +417,7 @@ provenance = Table(
     Column("configuration_sha256", SqlText, nullable=False),
     Column("normalization_version", SqlText, nullable=False),
     Column("rule_id", SqlText),
+    UniqueConstraint("institution_charter", "provenance_id", name="uq_provenance_institution"),
     _enum_check("provenance", "locator_kind", EvidenceKind),
 )
 
@@ -353,7 +428,7 @@ source_fingerprints = Table(
     _schema_version(),
     Column("source_id", SqlText, ForeignKey("rate_sources.source_id"), nullable=False),
     Column("fetch_run_id", SqlText, ForeignKey("fetch_runs.run_id"), nullable=False),
-    Column("artifact_id", SqlText, ForeignKey("raw_artifacts.artifact_id"), nullable=False),
+    Column("artifact_id", SqlText, ForeignKey("artifact_blobs.artifact_id"), nullable=False),
     Column("observed_at", UtcDateTime, nullable=False),
     Column("content_sha256", SqlText, nullable=False),
     Column("structure_sha256", SqlText, nullable=False),
@@ -418,6 +493,13 @@ extracted_candidates = Table(
     Column("provenance_id", SqlText, ForeignKey("provenance.provenance_id"), nullable=False),
 )
 
+# Lifecycle status is not a new offer row. Evidence, reviews, validations,
+# corrections, and snapshots cite ``offer_id``, so a later status keeps that
+# identity. UPDATE may change only ``status`` and ``published_at``, and
+# ``published_at`` may be filled in once, never rewritten or cleared. DELETE
+# and REPLACE are rejected. Withdrawal and publication audit detail stay in
+# ``withdrawal_entries`` and ``published_snapshots``; this row is the current
+# lifecycle state, not a history of previous states.
 normalized_offers = Table(
     "normalized_offers",
     metadata,
@@ -473,19 +555,58 @@ normalized_offers = Table(
         "(points IS NULL) = (points_provenance_id IS NULL)",
         name="ck_normalized_offers_points_provenance",
     ),
+    # Published and withdrawn offers must name when they were published.
+    # Superseded may still carry published_at, but a pre-publication status
+    # cannot. valid_until, when stated, is strictly after the observation.
+    CheckConstraint(
+        "status NOT IN ('published', 'withdrawn') OR published_at IS NOT NULL",
+        name="ck_normalized_offers_published_at",
+    ),
+    CheckConstraint(
+        "published_at IS NULL OR status IN ('published', 'withdrawn', 'superseded')",
+        name="ck_normalized_offers_published_at_status",
+    ),
+    CheckConstraint(
+        "valid_until IS NULL OR valid_until > observed_at",
+        name="ck_normalized_offers_valid_until",
+    ),
+    _finite_decimal("normalized_offers", "note_rate"),
+    _finite_decimal("normalized_offers", "apr"),
+    _finite_decimal("normalized_offers", "points"),
     _enum_check("normalized_offers", "status", OfferStatus),
     _enum_check("normalized_offers", "scenario_id", CanonicalScenarioId),
 )
 
+# ``field_path`` is part of the key. It is empty for rate and supporting rows
+# because a NULL primary-key column would not keep those rows unique. Field
+# evidence stores the semantic path (``details.term_months`` and the rest).
 offer_evidence = Table(
     "offer_evidence",
     metadata,
-    Column("offer_id", SqlText, ForeignKey("normalized_offers.offer_id"), primary_key=True),
-    Column("provenance_id", SqlText, ForeignKey("provenance.provenance_id"), primary_key=True),
+    Column("offer_id", SqlText, primary_key=True),
+    Column("provenance_id", SqlText, primary_key=True),
     Column("role", SqlText, primary_key=True),
+    Column("field_path", SqlText, primary_key=True),
+    Column("institution_charter", Integer, nullable=False),
+    Column("ordinal", Integer, nullable=False),
     CheckConstraint(
         "role IN ('supporting', 'note_rate', 'apr', 'points', 'field')",
         name="ck_offer_evidence_role",
+    ),
+    CheckConstraint(
+        "(role = 'field' AND field_path != '') OR (role != 'field' AND field_path = '')",
+        name="ck_offer_evidence_field_path",
+    ),
+    CheckConstraint("ordinal >= 0", name="ck_offer_evidence_ordinal"),
+    ForeignKeyConstraint(
+        ["institution_charter", "offer_id"],
+        ["normalized_offers.institution_charter", "normalized_offers.offer_id"],
+        name="fk_offer_evidence_same_institution",
+    ),
+    ForeignKeyConstraint(
+        ["institution_charter", "provenance_id"],
+        ["provenance.institution_charter", "provenance.provenance_id"],
+        name="fk_offer_evidence_provenance_institution",
     ),
 )
 
@@ -541,6 +662,16 @@ review_decisions = Table(
     ),
     _enum_check("review_decisions", "subject", ReviewSubject),
     _enum_check("review_decisions", "verdict", ReviewVerdict),
+)
+
+# Provenance cited by a review decision. The decision row alone does not keep it.
+review_evidence = Table(
+    "review_evidence",
+    metadata,
+    Column("review_id", SqlText, ForeignKey("review_decisions.review_id"), primary_key=True),
+    Column("provenance_id", SqlText, ForeignKey("provenance.provenance_id"), primary_key=True),
+    Column("ordinal", Integer, nullable=False),
+    CheckConstraint("ordinal >= 0", name="ck_review_evidence_ordinal"),
 )
 
 withdrawal_entries = Table(
@@ -686,3 +817,87 @@ snapshot_reviews = Table(
     Column("snapshot_id", SqlText, ForeignKey("published_snapshots.snapshot_id"), primary_key=True),
     Column("review_id", SqlText, ForeignKey("review_decisions.review_id"), primary_key=True),
 )
+
+
+def offer_frozen_columns() -> tuple[str, ...]:
+    """Columns on ``normalized_offers`` that a lifecycle update must not touch."""
+    return tuple(
+        column.name for column in normalized_offers.c if column.name not in OFFER_MUTABLE_COLUMNS
+    )
+
+
+def _append_only_message(table: str) -> str:
+    return f"{table} is append-only"
+
+
+def schema_triggers() -> tuple[tuple[str, str], ...]:
+    """``(name, CREATE TRIGGER statement)`` for the operational database.
+
+    Update and delete triggers reject ordinary mutation. The insert trigger
+    rejects ``REPLACE`` even when ``recursive_triggers`` is off, because the
+    old primary key is still visible to ``BEFORE INSERT``.
+    """
+    statements: list[tuple[str, str]] = []
+    for table_name, keys in APPEND_ONLY_PRIMARY_KEYS.items():
+        message = _append_only_message(table_name)
+        for action in ("update", "delete"):
+            name = f"{table_name}_no_{action}"
+            statements.append(
+                (
+                    name,
+                    f"CREATE TRIGGER {name} BEFORE {action.upper()} ON {table_name} "
+                    f"BEGIN SELECT RAISE(ABORT, '{message}'); END",
+                )
+            )
+        match = " AND ".join(f"{column} = NEW.{column}" for column in keys)
+        replace_name = f"{table_name}_no_replace"
+        statements.append(
+            (
+                replace_name,
+                f"CREATE TRIGGER {replace_name} BEFORE INSERT ON {table_name} "
+                f"WHEN EXISTS (SELECT 1 FROM {table_name} WHERE {match}) "
+                f"BEGIN SELECT RAISE(ABORT, '{message}'); END",
+            )
+        )
+    frozen = " OR ".join(f"OLD.{column} IS NOT NEW.{column}" for column in offer_frozen_columns())
+    published = "OLD.published_at IS NOT NULL AND OLD.published_at IS NOT NEW.published_at"
+    lifecycle = "normalized_offers_lifecycle_only"
+    statements.append(
+        (
+            lifecycle,
+            "CREATE TRIGGER normalized_offers_lifecycle_only BEFORE UPDATE ON normalized_offers "
+            f"WHEN {frozen} OR ({published}) "
+            "BEGIN SELECT RAISE(ABORT, 'normalized_offers allows only a lifecycle status change'); "
+            "END",
+        )
+    )
+    for action, timing in (("delete", "DELETE"), ("replace", "INSERT")):
+        name = f"normalized_offers_no_{action}"
+        if action == "delete":
+            body = (
+                f"CREATE TRIGGER {name} BEFORE {timing} ON normalized_offers "
+                "BEGIN SELECT RAISE(ABORT, 'normalized_offers is append-only'); END"
+            )
+        else:
+            body = (
+                f"CREATE TRIGGER {name} BEFORE {timing} ON normalized_offers "
+                "WHEN EXISTS (SELECT 1 FROM normalized_offers WHERE offer_id = NEW.offer_id) "
+                "BEGIN SELECT RAISE(ABORT, 'normalized_offers is append-only'); END"
+            )
+        statements.append((name, body))
+    return tuple(statements)
+
+
+def expected_trigger_names() -> frozenset[str]:
+    return frozenset(name for name, _statement in schema_triggers())
+
+
+def expected_check_names() -> Counter[tuple[str, str]]:
+    """Multiset of ``(table, check name)`` declared on the metadata."""
+    counts: Counter[tuple[str, str]] = Counter()
+    for table in metadata.tables.values():
+        for constraint in table.constraints:
+            name = constraint.name
+            if isinstance(constraint, CheckConstraint) and isinstance(name, str):
+                counts[(table.name, name)] += 1
+    return counts

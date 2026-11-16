@@ -26,6 +26,8 @@ class DecimalText(TypeDecorator[Decimal]):
             return None
         if isinstance(value, float) or not isinstance(value, Decimal):
             raise TypeError("binary floats are rejected; pass Decimal")
+        if not value.is_finite():
+            raise ValueError("decimal must be finite")
         return canonical_decimal(value)
 
     def process_result_value(self, value: str | None, dialect: Any) -> Decimal | None:
@@ -35,7 +37,12 @@ class DecimalText(TypeDecorator[Decimal]):
 
 
 class UtcDateTime(TypeDecorator[datetime]):
-    """Timezone-aware UTC timestamp stored as text."""
+    """Timezone-aware UTC timestamp stored as fixed-width text.
+
+    Fractional seconds are always six digits. That keeps two instants in the
+    same second distinct, and it keeps lexicographic order equal to time order
+    for the ``valid_until`` and ``published_at`` checks.
+    """
 
     impl = Text
     cache_ok = True
@@ -45,7 +52,9 @@ class UtcDateTime(TypeDecorator[datetime]):
             return None
         if value.utcoffset() is None:
             raise ValueError("datetime must be timezone-aware")
-        return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        # ``%f`` is zero-padded to six digits; the offset is written explicitly
+        # so the stored text does not depend on ``%z`` dropping the colon.
+        return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f+00:00")
 
     def process_result_value(self, value: str | None, dialect: Any) -> datetime | None:
         if value is None:
@@ -60,6 +69,8 @@ def _reject_float(value: object) -> object:
     if isinstance(value, float):
         raise TypeError("binary floats are rejected")
     if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ValueError("decimal must be finite")
         return canonical_decimal(value)
     if isinstance(value, dict):
         return {str(key): _reject_float(item) for key, item in value.items()}

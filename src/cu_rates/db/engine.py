@@ -1,7 +1,13 @@
 """SQLite operational database connections.
 
-Every connection turns on foreign keys and WAL. History tables have no update
-or delete path through this connection.
+Every connection turns on foreign keys, WAL, and recursive triggers. History
+tables have no update, delete, or replace path through this connection.
+
+SQLite implements ``REPLACE`` / ``INSERT OR REPLACE`` as a delete plus an
+insert, and it does not fire the delete trigger unless ``recursive_triggers``
+is on. The pragma closes that hole on this connection. ``BEFORE INSERT``
+triggers in the schema close it for every other connection, including a raw
+``sqlite3`` connection that never sets the pragma.
 """
 
 import re
@@ -11,10 +17,15 @@ from typing import Any
 from sqlalchemy import Engine, create_engine, event
 from sqlalchemy.pool import NullPool
 
-from cu_rates.db.schema import APPEND_ONLY_TABLES
+from cu_rates.db.schema import APPEND_ONLY_TABLES, REPLACE_GUARDED_TABLES
 
+_TABLE = r"""["'`]?(?P<table>[A-Za-z_][A-Za-z0-9_]*)["'`]?"""
 _MUTATION = re.compile(
-    r"""^\s*(update|delete)\s+(?:from\s+)?["'`]?(?P<table>[A-Za-z_][A-Za-z0-9_]*)""",
+    rf"""^\s*(update|delete)\s+(?:from\s+)?{_TABLE}""",
+    re.IGNORECASE,
+)
+_REPLACE = re.compile(
+    rf"""^\s*(?:insert\s+or\s+replace|replace)\s+into\s+{_TABLE}""",
     re.IGNORECASE,
 )
 
@@ -51,6 +62,7 @@ def _on_connect(dbapi_connection: Any, connection_record: Any) -> None:
     try:
         cursor.execute("PRAGMA foreign_keys=ON")
         cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA recursive_triggers=ON")
     finally:
         cursor.close()
         dbapi_connection.autocommit = previous
@@ -65,6 +77,9 @@ def _reject_history_mutation(
     executemany: bool,
 ) -> None:
     del conn, cursor, parameters, context, executemany
+    replace = _REPLACE.match(statement)
+    if replace is not None and replace.group("table") in REPLACE_GUARDED_TABLES:
+        raise AppendOnlyError(f"{replace.group('table')} is append-only")
     match = _MUTATION.match(statement)
     if match is not None and match.group("table") in APPEND_ONLY_TABLES:
         raise AppendOnlyError(f"{match.group('table')} is append-only")

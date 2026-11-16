@@ -9,6 +9,7 @@ import sqlalchemy as sa
 from alembic import op
 
 import cu_rates.db.types
+from cu_rates.db.schema import schema_triggers
 
 revision = "t012_initial"
 down_revision = None
@@ -16,36 +17,16 @@ branch_labels = None
 depends_on = None
 
 # Frozen at T012. Do not rebuild this revision from live metadata.
-_APPEND_ONLY = (
-    "corrections",
-    "fetch_runs",
-    "finding_evidence",
-    "finding_purposes",
-    "not_modified_observations",
-    "product_findings",
-    "provenance",
-    "published_snapshots",
-    "raw_artifacts",
-    "review_decisions",
-    "snapshot_entries",
-    "source_approval_evidence",
-    "source_approvals",
-    "withdrawal_entries",
-    "withdrawal_lifts",
-)
+# Trigger text is the schema guard for this revision (append-only keys,
+# replace guards, and the offer lifecycle path). CREATE TABLE stays hand-written.
 
 
 def _append_only_triggers(present: bool) -> None:
-    for table_name in _APPEND_ONLY:
-        for action in ("update", "delete"):
-            if present:
-                op.execute(
-                    f"CREATE TRIGGER {table_name}_no_{action} "
-                    f"BEFORE {action.upper()} ON {table_name} "
-                    f"BEGIN SELECT RAISE(ABORT, '{table_name} is append-only'); END"
-                )
-            else:
-                op.execute(f"DROP TRIGGER IF EXISTS {table_name}_no_{action}")
+    for name, statement in schema_triggers():
+        if present:
+            op.execute(statement)
+        else:
+            op.execute(f"DROP TRIGGER IF EXISTS {name}")
 
 
 def upgrade() -> None:
@@ -323,6 +304,7 @@ def upgrade() -> None:
             ["rate_sources.source_id"],
         ),
         sa.PrimaryKeyConstraint("run_id"),
+        sa.UniqueConstraint("run_id", "source_id", name="uq_fetch_runs_source"),
     )
     op.create_table(
         "institution_source_relationships",
@@ -498,22 +480,35 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("finding_id", "purpose"),
     )
     op.create_table(
-        "raw_artifacts",
+        "artifact_blobs",
         sa.Column("artifact_id", sa.Text(), nullable=False),
-        sa.Column("schema_version", sa.Text(), nullable=False),
-        sa.Column("media_type", sa.Text(), nullable=False),
+        sa.Column("byte_length", sa.Integer(), nullable=False),
+        sa.CheckConstraint("byte_length >= 0", name="ck_artifact_blobs_byte_length"),
+        sa.PrimaryKeyConstraint("artifact_id"),
+    )
+    op.create_table(
+        "artifact_observations",
+        sa.Column("fetch_run_id", sa.Text(), nullable=False),
         sa.Column("source_url", sa.Text(), nullable=False),
+        sa.Column("schema_version", sa.Text(), nullable=False),
+        sa.Column("artifact_id", sa.Text(), nullable=False),
+        sa.Column("media_type", sa.Text(), nullable=False),
         sa.Column("fetched_at", cu_rates.db.types.UtcDateTime(), nullable=False),
         sa.Column("http_status", sa.Integer(), nullable=False),
-        sa.Column("byte_length", sa.Integer(), nullable=False),
-        sa.Column("fetch_run_id", sa.Text(), nullable=False),
-        sa.CheckConstraint("byte_length >= 0", name="ck_raw_artifacts_byte_length"),
-        sa.CheckConstraint("http_status BETWEEN 100 AND 599", name="ck_raw_artifacts_http_status"),
+        sa.CheckConstraint(
+            "http_status BETWEEN 100 AND 599", name="ck_artifact_observations_http_status"
+        ),
+        sa.ForeignKeyConstraint(
+            ["artifact_id"],
+            ["artifact_blobs.artifact_id"],
+        ),
         sa.ForeignKeyConstraint(
             ["fetch_run_id"],
             ["fetch_runs.run_id"],
+            name="fk_observations_fetch_run",
         ),
-        sa.PrimaryKeyConstraint("artifact_id"),
+        sa.PrimaryKeyConstraint("fetch_run_id", "source_url"),
+        sa.UniqueConstraint("fetch_run_id", "artifact_id", name="uq_observations_run_artifact"),
     )
     op.create_table(
         "not_modified_observations",
@@ -541,12 +536,14 @@ def upgrade() -> None:
             "run_id != original_run_id", name="ck_not_modified_observations_distinct_run"
         ),
         sa.ForeignKeyConstraint(
-            ["original_artifact_id"],
-            ["raw_artifacts.artifact_id"],
+            ["original_run_id", "source_id"],
+            ["fetch_runs.run_id", "fetch_runs.source_id"],
+            name="fk_not_modified_same_source",
         ),
         sa.ForeignKeyConstraint(
-            ["original_run_id"],
-            ["fetch_runs.run_id"],
+            ["original_run_id", "original_artifact_id"],
+            ["artifact_observations.fetch_run_id", "artifact_observations.artifact_id"],
+            name="fk_not_modified_run_artifact",
         ),
         sa.ForeignKeyConstraint(
             ["profile_id"],
@@ -561,6 +558,7 @@ def upgrade() -> None:
     op.create_table(
         "provenance",
         sa.Column("provenance_id", sa.Text(), nullable=False),
+        sa.Column("institution_charter", sa.Integer(), nullable=False),
         sa.Column("artifact_id", sa.Text(), nullable=False),
         sa.Column("locator_kind", sa.Text(), nullable=False),
         sa.Column("locator_json", cu_rates.db.types.JsonDocument(), nullable=False),
@@ -577,9 +575,32 @@ def upgrade() -> None:
         ),
         sa.ForeignKeyConstraint(
             ["artifact_id"],
-            ["raw_artifacts.artifact_id"],
+            ["artifact_blobs.artifact_id"],
+        ),
+        sa.ForeignKeyConstraint(
+            ["institution_charter"],
+            ["institutions.charter_number"],
         ),
         sa.PrimaryKeyConstraint("provenance_id"),
+        sa.UniqueConstraint(
+            "institution_charter", "provenance_id", name="uq_provenance_institution"
+        ),
+    )
+    op.create_table(
+        "review_evidence",
+        sa.Column("review_id", sa.Text(), nullable=False),
+        sa.Column("provenance_id", sa.Text(), nullable=False),
+        sa.Column("ordinal", sa.Integer(), nullable=False),
+        sa.CheckConstraint("ordinal >= 0", name="ck_review_evidence_ordinal"),
+        sa.ForeignKeyConstraint(
+            ["provenance_id"],
+            ["provenance.provenance_id"],
+        ),
+        sa.ForeignKeyConstraint(
+            ["review_id"],
+            ["review_decisions.review_id"],
+        ),
+        sa.PrimaryKeyConstraint("review_id", "provenance_id"),
     )
     op.create_table(
         "source_fingerprints",
@@ -593,7 +614,7 @@ def upgrade() -> None:
         sa.Column("structure_sha256", sa.Text(), nullable=False),
         sa.ForeignKeyConstraint(
             ["artifact_id"],
-            ["raw_artifacts.artifact_id"],
+            ["artifact_blobs.artifact_id"],
         ),
         sa.ForeignKeyConstraint(
             ["fetch_run_id"],
@@ -682,6 +703,30 @@ def upgrade() -> None:
             name="ck_normalized_offers_points_provenance",
         ),
         sa.CheckConstraint(
+            "status NOT IN ('published', 'withdrawn') OR published_at IS NOT NULL",
+            name="ck_normalized_offers_published_at",
+        ),
+        sa.CheckConstraint(
+            "published_at IS NULL OR status IN ('published', 'withdrawn', 'superseded')",
+            name="ck_normalized_offers_published_at_status",
+        ),
+        sa.CheckConstraint(
+            "valid_until IS NULL OR valid_until > observed_at",
+            name="ck_normalized_offers_valid_until",
+        ),
+        sa.CheckConstraint(
+            "note_rate IS NULL OR lower(note_rate) NOT IN ('nan', '-nan', '+nan', 'inf', '-inf', '+inf', 'infinity', '-infinity', '+infinity', 'snan', '-snan', '+snan')",  # noqa: E501
+            name="ck_normalized_offers_note_rate_finite",
+        ),
+        sa.CheckConstraint(
+            "apr IS NULL OR lower(apr) NOT IN ('nan', '-nan', '+nan', 'inf', '-inf', '+inf', 'infinity', '-infinity', '+infinity', 'snan', '-snan', '+snan')",  # noqa: E501
+            name="ck_normalized_offers_apr_finite",
+        ),
+        sa.CheckConstraint(
+            "points IS NULL OR lower(points) NOT IN ('nan', '-nan', '+nan', 'inf', '-inf', '+inf', 'infinity', '-infinity', '+infinity', 'snan', '-snan', '+snan')",  # noqa: E501
+            name="ck_normalized_offers_points_finite",
+        ),
+        sa.CheckConstraint(
             "headline_is_as_low_as IN (0, 1)", name="ck_normalized_offers_as_low_as"
         ),
         sa.ForeignKeyConstraint(
@@ -754,19 +799,29 @@ def upgrade() -> None:
         sa.Column("offer_id", sa.Text(), nullable=False),
         sa.Column("provenance_id", sa.Text(), nullable=False),
         sa.Column("role", sa.Text(), nullable=False),
+        sa.Column("field_path", sa.Text(), nullable=False),
+        sa.Column("institution_charter", sa.Integer(), nullable=False),
+        sa.Column("ordinal", sa.Integer(), nullable=False),
         sa.CheckConstraint(
             "role IN ('supporting', 'note_rate', 'apr', 'points', 'field')",
             name="ck_offer_evidence_role",
         ),
+        sa.CheckConstraint(
+            "(role = 'field' AND field_path != '') OR (role != 'field' AND field_path = '')",
+            name="ck_offer_evidence_field_path",
+        ),
+        sa.CheckConstraint("ordinal >= 0", name="ck_offer_evidence_ordinal"),
         sa.ForeignKeyConstraint(
-            ["offer_id"],
-            ["normalized_offers.offer_id"],
+            ["institution_charter", "offer_id"],
+            ["normalized_offers.institution_charter", "normalized_offers.offer_id"],
+            name="fk_offer_evidence_same_institution",
         ),
         sa.ForeignKeyConstraint(
-            ["provenance_id"],
-            ["provenance.provenance_id"],
+            ["institution_charter", "provenance_id"],
+            ["provenance.institution_charter", "provenance.provenance_id"],
+            name="fk_offer_evidence_provenance_institution",
         ),
-        sa.PrimaryKeyConstraint("offer_id", "provenance_id", "role"),
+        sa.PrimaryKeyConstraint("offer_id", "provenance_id", "role", "field_path"),
     )
     op.create_table(
         "snapshot_entries",
@@ -835,9 +890,11 @@ def downgrade() -> None:
     op.drop_table("finding_evidence")
     op.drop_table("extracted_candidates")
     op.drop_table("source_fingerprints")
+    op.drop_table("review_evidence")
     op.drop_table("provenance")
     op.drop_table("not_modified_observations")
-    op.drop_table("raw_artifacts")
+    op.drop_table("artifact_observations")
+    op.drop_table("artifact_blobs")
     op.drop_table("finding_purposes")
     op.drop_table("extraction_runs")
     op.drop_table("product_partner_programs")
