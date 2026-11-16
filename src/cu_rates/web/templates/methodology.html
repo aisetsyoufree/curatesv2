@@ -8,11 +8,11 @@
 
   <section class="card" aria-labelledby="provenance-heading">
     <h2 id="provenance-heading">Provenance and Verification Architecture</h2>
-    <p>CU-Rates.org operates under a deterministic, evidence-backed data architecture. Automated routines and deterministic parsers extract published lending terms from approved sources without altering their meaning.</p>
+    <p>CU-Rates.org is designed around a deterministic, evidence-backed data architecture. Once data collection is live, automated routines and deterministic parsers are designed to extract public lending terms from approved sources without altering their meaning.</p>
     <ul>
-      <li><strong>Immutable Storage:</strong> Raw responses (HTML, documents, and network responses) are archived in a content-addressed storage repository before any parsing occurs.</li>
-      <li><strong>Field-Level Traceability:</strong> Every published data point retains its exact locator path, text hash, collection timestamp, and parser version.</li>
-      <li><strong>Human-Approved Sources:</strong> Third-party sources and discovered URLs are treated as untrusted until verified by human reviewers.</li>
+      <li><strong>Immutable Storage:</strong> Raw responses (HTML, documents, and network responses) will be archived in content-addressed storage before any parsing occurs.</li>
+      <li><strong>Field-Level Traceability:</strong> Once data is published, every data point will retain its exact locator path, text hash, collection timestamp, and parser version.</li>
+      <li><strong>Human-Approved Sources:</strong> Third-party sources and discovered URLs will be treated as untrusted until verified by human reviewers.</li>
     </ul>
   </section>
 
@@ -23,17 +23,17 @@
       <li><strong>Product Family Separation:</strong> First mortgages, closed-end home equity loans, and open-end lines of credit are modeled as distinct financial structures.</li>
       <li><strong>Purpose Distinction:</strong> Refinancing is modeled as a loan purpose, not an independent product family. Purchase loans and refinancing programs are never conflated.</li>
       <li><strong>Interest Rates and APRs:</strong> The initial interest rate and the Annual Percentage Rate represent different financial measurements and are never substituted for one another.</li>
-      <li><strong>Variable and Introductory Terms:</strong> Introductory teaser rates on credit lines are tracked separately from ongoing index-and-margin variable structures.</li>
+      <li><strong>Variable and Introductory Terms:</strong> Introductory teaser rates on credit lines are designed to be tracked separately from ongoing index-and-margin variable structures.</li>
     </ul>
   </section>
 
   <section class="card" aria-labelledby="freshness-heading">
     <h2 id="freshness-heading">Bounded Freshness and Emergency Suppression</h2>
-    <p>Advertised loan offerings change frequently. To prevent outdated data from remaining visible:</p>
+    <p>Advertised loan offerings change frequently. Once data publication is live, the platform is designed to prevent outdated data from remaining visible through strict planned controls:</p>
     <ul>
-      <li><strong>Automated Freshness Expiry:</strong> Observations undergo scheduled re-observation. Unconfirmed observations degrade and comparison rankings are automatically withdrawn if timely updates are not received.</li>
-      <li><strong>Emergency Suppression:</strong> An independent denylist mechanism allows immediate suppression of any offer, product, or institution record upon review.</li>
-      <li><strong>No Runtime Artificial Intelligence:</strong> Routine collection, extraction, normalization, and publication run deterministically without runtime language models.</li>
+      <li><strong>Planned Freshness Expiry:</strong> Once collection is live, observations will undergo scheduled daily re-observation. The platform is designed so that unconfirmed observations will degrade after 72 hours, and comparison rankings will be withdrawn after 96 hours if timely updates are not received.</li>
+      <li><strong>Planned Emergency Suppression:</strong> An independent denylist mechanism is designed to allow immediate suppression of any offer, product, or institution record upon reviewer action.</li>
+      <li><strong>No Runtime Artificial Intelligence:</strong> Routine collection, extraction, normalization, and publication are designed to run deterministically without runtime language models.</li>
     </ul>
   </section>
 </article>

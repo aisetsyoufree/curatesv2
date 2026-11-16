@@ -331,3 +331,35 @@ def test_web_package_does_not_import_database() -> None:
     for mod in web_modules:
         for term in ["sqlite3", "sqlalchemy"]:
             assert term not in mod.__dict__
+
+
+def test_no_present_tense_operational_claims(client: FlaskClient) -> None:
+    """Public pages describe collection, freshness, and withdrawal as planned, not live."""
+    forbidden_operational_phrases = [
+        "are re-observed",
+        "undergo scheduled re-observation",
+        "automatically withdrawn",
+        "runs daily",
+        "run daily",
+        "are archived",
+        "parsers extract",
+        "is quarantined and never published",
+        "entry traces to",
+    ]
+    for path in VERIFIED_PAGES:
+        resp = client.get(path)
+        text_lower = resp.get_data(as_text=True).lower()
+        for phrase in forbidden_operational_phrases:
+            assert phrase not in text_lower, (
+                f"Found present-tense operational claim '{phrase}' on {path}"
+            )
+
+    # Verify planned and conditional wording on key pages
+    home_text = client.get("/").get_data(as_text=True).lower()
+    assert "will be governed" in home_text
+    assert "will be quarantined" in home_text
+
+    methodology_text = client.get("/methodology").get_data(as_text=True).lower()
+    assert "is designed around" in methodology_text
+    assert "will be archived" in methodology_text
+    assert "planned freshness expiry" in methodology_text
