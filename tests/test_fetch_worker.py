@@ -1,7 +1,7 @@
 """Offline T032 tests. The only HTTP transport is synthetic."""
 
 import fcntl
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
@@ -31,6 +31,12 @@ from cu_rates.fetch_worker import (
 
 URL = "https://credit-union.test/rates"
 BODY = b"<html>Synthetic fixture</html>"
+PUBLIC = ("8.8.8.8",)
+
+
+def public_resolver(host: str) -> tuple[str, ...]:
+    del host
+    return PUBLIC
 
 
 @dataclass
@@ -91,6 +97,7 @@ class Pilot:
     def worker(
         self,
         handler: Callable[[httpx.Request], httpx.Response],
+        resolve: Callable[[str], Iterable[str]] | None = None,
     ) -> FetchWorker:
         def send(request: httpx.Request) -> httpx.Response:
             self.calls.append((self.clock.now(), request))
@@ -104,6 +111,7 @@ class Pilot:
             clock=self.clock.now,
             monotonic=self.clock.now,
             sleep=self.clock.sleep,
+            resolve=public_resolver if resolve is None else resolve,
         )
 
     def fetch(self, handler: Callable[[httpx.Request], httpx.Response]) -> FetchResult:
@@ -263,6 +271,7 @@ def test_forward_wall_clock_jump_does_not_shorten_spacing(pilot: Pilot) -> None:
         clock=pilot.clock.now,
         monotonic=tick.now,
         sleep=wait,
+        resolve=public_resolver,
     )
     assert (
         worker.fetch(pilot.source, pilot.profile, pilot.approval, pilot.terms).reason == "fetched"
@@ -466,3 +475,96 @@ def test_http_date_backoff_is_honored(pilot: Pilot) -> None:
 
     assert pilot.fetch(handler).reason == "fetched"
     assert pilot.calls[2][0] - pilot.calls[1][0] >= 90
+
+
+@pytest.mark.parametrize(
+    "answers",
+    [
+        ("127.0.0.1",),
+        ("10.1.2.3",),
+        ("192.168.1.1",),
+        ("169.254.1.1",),
+        ("169.254.169.254",),
+        ("::ffff:127.0.0.1",),
+        ("::ffff:10.0.0.1",),
+        ("::ffff:169.254.169.254",),
+        ("8.8.8.8", "10.0.0.8"),
+    ],
+)
+def test_non_routable_resolution_is_refused_before_connect(
+    pilot: Pilot, answers: tuple[str, ...]
+) -> None:
+    result = pilot.worker(ok, resolve=lambda host: answers).fetch(
+        pilot.source, pilot.profile, pilot.approval, pilot.terms
+    )
+    assert result.reason == "non-routable-address"
+    assert pilot.calls == []
+
+
+@pytest.mark.parametrize("failure", [OSError("dns failed"), ()])
+def test_resolution_failure_is_refused(pilot: Pilot, failure: OSError | tuple[()]) -> None:
+    def resolve(host: str) -> tuple[str, ...]:
+        del host
+        if isinstance(failure, OSError):
+            raise failure
+        return failure
+
+    result = pilot.worker(ok, resolve=resolve).fetch(
+        pilot.source, pilot.profile, pilot.approval, pilot.terms
+    )
+    assert result.reason == "address-resolution-failed"
+    assert pilot.calls == []
+
+
+def test_redirect_to_non_routable_host_is_not_connected(pilot: Pilot) -> None:
+    def resolve(host: str) -> tuple[str, ...]:
+        if host == "elsewhere.test":
+            return ("169.254.169.254",)
+        return PUBLIC
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/robots.txt":
+            return robots()
+        return httpx.Response(302, headers={"Location": "https://elsewhere.test/latest"})
+
+    result = pilot.worker(handler, resolve=resolve).fetch(
+        pilot.source, pilot.profile, pilot.approval, pilot.terms
+    )
+    assert result.reason == "non-routable-address"
+    assert [req.url.host for _, req in pilot.calls] == ["credit-union.test", "credit-union.test"]
+
+
+@pytest.mark.parametrize("encoding", [{}, {"Content-Encoding": "gzip"}])
+def test_compressed_403_still_counts_toward_the_block_rule(
+    pilot: Pilot, encoding: dict[str, str]
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/robots.txt":
+            return robots()
+        return httpx.Response(403, headers=encoding)
+
+    for _ in range(3):
+        assert (
+            pilot.worker(handler)
+            .fetch(pilot.source, pilot.profile, pilot.approval, pilot.terms)
+            .reason
+            == "http-403"
+        )
+        pilot.clock.sleep(60)
+    assert pilot.fetch(ok).reason == "source-paused"
+
+
+@pytest.mark.parametrize("encoding", [{}, {"Content-Encoding": "gzip"}])
+def test_compressed_429_honors_retry_after(pilot: Pilot, encoding: dict[str, str]) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/robots.txt":
+            return robots()
+        return httpx.Response(429, headers={"Retry-After": "1200", **encoding})
+
+    assert (
+        pilot.worker(handler).fetch(pilot.source, pilot.profile, pilot.approval, pilot.terms).reason
+        == "http-429-deferred"
+    )
+    pilot.clock.sleep(600)
+    assert pilot.fetch(ok).reason == "not-due"
+    assert len(pilot.calls) == 2

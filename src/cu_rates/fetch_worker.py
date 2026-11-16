@@ -8,7 +8,7 @@ import re
 import sqlite3
 import stat
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -118,6 +118,76 @@ class _Stopped(Exception):
     pass
 
 
+_IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
+Resolver = Callable[[str], Iterable[_IPAddress | str]]
+
+
+def _globally_routable(address: _IPAddress) -> bool:
+    """True only for a public unicast address, after unwrapping IPv4-mapped IPv6."""
+    mapped = address.ipv4_mapped if isinstance(address, ipaddress.IPv6Address) else None
+    if mapped is not None:
+        return _globally_routable(mapped)
+    return not (
+        address.is_loopback
+        or address.is_private
+        or address.is_link_local
+        or address.is_multicast
+        or address.is_reserved
+        or address.is_unspecified
+        or not address.is_global
+    )
+
+
+def _require_routable(host: str, resolve: Resolver) -> None:
+    """Refuse the connection unless every answer is globally routable.
+
+    A live transport must connect to these validated addresses, not a second
+    lookup of the same name. Resolving again at connect time leaves a
+    DNS-rebinding gap between this check and the socket.
+    """
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        answers: tuple[_IPAddress | str, ...] = (literal,)
+    else:
+        try:
+            answers = tuple(resolve(host))
+        except OSError as exc:
+            raise _Stopped("address-resolution-failed") from exc
+    if not answers:
+        raise _Stopped("address-resolution-failed")
+    for item in answers:
+        try:
+            address = (
+                item
+                if isinstance(item, ipaddress.IPv4Address | ipaddress.IPv6Address)
+                else ipaddress.ip_address(item)
+            )
+        except ValueError as exc:
+            raise _Stopped("address-resolution-failed") from exc
+        if not _globally_routable(address):
+            raise _Stopped("non-routable-address")
+
+
+def _resolution_disabled(host: str) -> tuple[_IPAddress, ...]:
+    raise OSError(f"name resolution is not configured for {host}")
+
+
+def _redirect_host(status: int, headers: httpx.Headers) -> str | None:
+    if status not in {301, 302, 303, 307, 308}:
+        return None
+    location = headers.get("location", "").strip()
+    if not location:
+        return None
+    try:
+        target = httpx.URL(location)
+    except httpx.InvalidURL:
+        return None
+    return target.host or None
+
+
 def _public_url(text: str) -> httpx.URL:
     try:
         url = httpx.URL(text)
@@ -211,6 +281,7 @@ class FetchWorker:
         clock: Callable[[], float] = time.time,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        resolve: Resolver | None = None,
     ) -> None:
         if not re.fullmatch(r"[0-9a-f]{40}", git_sha):
             raise ValueError("invalid Git revision")
@@ -221,6 +292,7 @@ class FetchWorker:
         self._root, self._store, self._transport = root, store, transport
         self._git_sha, self._clock, self._sleep = git_sha, clock, sleep
         self._monotonic = monotonic
+        self._resolve = resolve if resolve is not None else _resolution_disabled
 
     @contextmanager
     def _state(self) -> Iterator[sqlite3.Connection]:
@@ -280,6 +352,9 @@ class FetchWorker:
         limit: int,
         spacing: int = 5,
     ) -> _Response:
+        # Check the destination before waiting or opening a socket. The comment
+        # on _require_routable is the pin a live transport has to keep.
+        _require_routable(url.host, self._resolve)
         origin = f"https://{url.host}"
         self._wait(
             max(
@@ -317,11 +392,19 @@ class FetchWorker:
             # A server can signal a challenge even when its body uses an
             # unsupported encoding. Preserve the stop signal without decoding.
             headers_only = _Response(response.status_code, response.headers, b"")
+            redirect_host = _redirect_host(response.status_code, response.headers)
+            if redirect_host is not None:
+                _require_routable(redirect_host, self._resolve)
             if _is_challenge(headers_only):
+                return headers_only
+            # Denial and Retry-After live in the status line and headers. A
+            # compressed 403 or 429 must still count; do not require a decoded body.
+            encoding = response.headers.get("content-encoding", "identity").lower()
+            if response.status_code in (403, 429) and encoding != "identity":
                 return headers_only
             if response.status_code != 200 and response.status_code not in (401, 403, 429, 503):
                 return headers_only
-            if response.headers.get("content-encoding", "identity").lower() != "identity":
+            if encoding != "identity":
                 raise _Stopped("unsupported-encoding")
             body = bytearray()
             chunks: Iterator[bytes] = (
