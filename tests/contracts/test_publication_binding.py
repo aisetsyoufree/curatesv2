@@ -239,7 +239,12 @@ def test_source_approval_is_immutable_and_audited() -> None:
             type(approval).model_validate({k: v for k, v in payload.items() if k != missing})
     with pytest.raises(ValidationError, match="schema_version"):
         type(approval).model_validate({k: v for k, v in payload.items() if k != "schema_version"})
-    assert decide(source_approval=source_approval(decided_at=EVALUATED_AT)).publishable_now
+    # The approval must predate the fetch. A decision at evaluation time is too late.
+    started = fetch_run().started_at
+    assert decide(source_approval=source_approval(decided_at=started)).publishable_now
+    late = decide(source_approval=source_approval(decided_at=EVALUATED_AT))
+    assert R.PROFILE_UNAPPROVED in late.reasons
+    assert not late.publishable_now
 
 
 # --- 3. contract fields are compared with the canonical scenario -----------------------------
@@ -659,7 +664,15 @@ def test_correction_bound_to_the_current_content_clears() -> None:
     recent = {"corrected_at": T0 - timedelta(hours=1)}  # newer than the prior review
     unbound = _correction(**recent)
     blocked(decide(offer, corrections=(unbound,)), R.CORRECTION_PENDING, RV)
-    bound = _correction(corrected_fingerprints=offer_fingerprints(offer), **recent)
+    # A fingerprint alone does not clear a replacement that is not on the offer.
+    contradictory = _correction(corrected_fingerprints=offer_fingerprints(offer), **recent)
+    blocked(decide(offer, corrections=(contradictory,)), R.CORRECTION_PENDING, RV)
+    bound = _correction(
+        corrected_fingerprints=offer_fingerprints(offer),
+        corrected_value="6.125",
+        evidence=(provenance("6.125%"),),
+        **recent,
+    )
     assert decide(offer, corrections=(bound,)).publishable_now
     other = offer_fingerprints(purchase_offer(note_rate=rate("6.200")))
     mismatched = _correction(corrected_fingerprints=other, **recent)

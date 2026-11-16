@@ -27,8 +27,10 @@ from cu_rates.contracts.enums import (
     Occupancy,
     ProductFamily,
     PropertyType,
+    RateType,
     ScenarioDimension,
 )
+from cu_rates.contracts.evidence import Provenance
 
 _D = ScenarioDimension
 
@@ -174,12 +176,46 @@ CANONICAL_SCENARIOS: Mapping[CanonicalScenarioId, ComparisonScenario] = MappingP
 )
 
 
+class StatedBound(ContractModel):
+    """A typed source statement: an exact value, an inclusive range, or a token.
+
+    ``source_text`` on a match is the excerpt. This is the value publication compares
+    to the canonical scenario. A token and a number are never both set.
+    """
+
+    exact: Measure | None = None
+    lower: Measure | None = None
+    upper: Measure | None = None
+    token: Text | None = None
+
+    @model_validator(mode="after")
+    def _one_form(self) -> Self:
+        numeric = self.exact is not None or self.lower is not None or self.upper is not None
+        if self.token is not None and numeric:
+            raise ValueError("a stated dimension is a token or a number, not both")
+        if self.exact is not None and (self.lower is not None or self.upper is not None):
+            raise ValueError("pass either an exact value or a range, not both")
+        if self.token is None and not numeric:
+            raise ValueError("a stated dimension needs a token, exact value, or range")
+        if self.lower is not None and self.upper is not None and self.lower > self.upper:
+            raise ValueError("range lower bound exceeds upper bound")
+        return self
+
+
 class DimensionMatch(ContractModel):
-    """Whether one scenario dimension matches what the source states."""
+    """Whether one scenario dimension matches what the source states.
+
+    A match or conflict still quotes ``source_text``. Publication does not trust that
+    prose: a claimed match counts only when ``stated`` is typed and ``provenance``
+    locates it. Both fields are optional so an unstated dimension and older records
+    still load.
+    """
 
     dimension: ScenarioDimension
     state: MatchState
     source_text: Text | None = None
+    stated: StatedBound | None = None
+    provenance: Provenance | None = None
 
     @model_validator(mode="after")
     def _text_iff_stated(self) -> Self:
@@ -223,6 +259,81 @@ def aggregate_match(states: Iterable[MatchState]) -> MatchState:
     if MatchState.UNSTATED in seen or not seen:
         return MatchState.UNSTATED
     return MatchState.MATCHES
+
+
+def expected_dimension_number(
+    scenario: ComparisonScenario, dimension: ScenarioDimension
+) -> Decimal | None:
+    """The canonical numeric value for ``dimension``, if the scenario states one."""
+    raw: object
+    if dimension is _D.TERM_MONTHS:
+        raw = scenario.term_months
+    elif dimension is _D.LTV:
+        raw = scenario.ltv
+    elif dimension is _D.CLTV:
+        raw = scenario.cltv
+    elif dimension is _D.LOAN_AMOUNT:
+        raw = scenario.loan_amount
+    elif dimension is _D.CREDIT_SCORE:
+        raw = scenario.credit_score
+    elif dimension is _D.LOCK_DAYS:
+        raw = scenario.lock_days
+    elif dimension is _D.POINTS:
+        raw = scenario.points
+    else:
+        return None
+    if isinstance(raw, Decimal):
+        return raw
+    if isinstance(raw, int):
+        return Decimal(raw)
+    return None
+
+
+def expected_dimension_token(
+    scenario: ComparisonScenario, dimension: ScenarioDimension
+) -> str | None:
+    """The canonical token for a non-numeric dimension. Cash-out and discounts use yes/no."""
+    if dimension is _D.OCCUPANCY:
+        return scenario.occupancy.value
+    if dimension is _D.PROPERTY_TYPE:
+        return scenario.property_type.value
+    if dimension is _D.RATE_TYPE:
+        fixed = {
+            CanonicalScenarioId.PURCHASE_30Y_FIXED,
+            CanonicalScenarioId.RATE_TERM_REFI_30Y_FIXED,
+        }
+        return RateType.FIXED.value if scenario.scenario_id in fixed else None
+    if dimension is _D.CASH_OUT:
+        return "no"
+    if dimension is _D.RELATIONSHIP_DISCOUNT:
+        return "yes" if scenario.relationship_discount_applied else "no"
+    return None
+
+
+def matching_statement(scenario: ComparisonScenario, dimension: ScenarioDimension) -> StatedBound:
+    """The typed statement that exactly matches this canonical dimension."""
+    number = expected_dimension_number(scenario, dimension)
+    if number is not None:
+        return StatedBound(exact=number)
+    token = expected_dimension_token(scenario, dimension)
+    if token is None:
+        raise ValueError(f"{dimension.value} has no canonical statement on {scenario.scenario_id}")
+    return StatedBound(token=token)
+
+
+def computed_match_state(
+    scenario: ComparisonScenario, stated: StatedBound, dimension: ScenarioDimension
+) -> MatchState:
+    """Match ``stated`` against the scenario. Unrelated excerpt text is not an input."""
+    if stated.token is not None:
+        expected = expected_dimension_token(scenario, dimension)
+        if expected is None:
+            return MatchState.UNSTATED
+        return MatchState.MATCHES if stated.token == expected else MatchState.CONFLICTS
+    number = expected_dimension_number(scenario, dimension)
+    if number is None:
+        return MatchState.UNSTATED
+    return match_numeric(number, exact=stated.exact, lower=stated.lower, upper=stated.upper)
 
 
 def evaluate_scenario_match(

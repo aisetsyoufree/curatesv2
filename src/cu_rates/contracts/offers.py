@@ -493,8 +493,8 @@ class NormalizedOffer(VersionedModel):
         """Every publicly material non-rate field that needs a field-level evidence mapping.
 
         Sourced rates and points carry their own provenance inline, so they are not listed.
-        Scenario matches carry their quoted ``source_text`` instead of provenance (typed
-        limitation: they are evidence-quoted, not evidence-addressable).
+        Scenario matches carry their own stated value and locator; publication recomputes
+        the match and does not treat the excerpt alone as evidence.
         """
         paths = set(self.details.material_paths())
         paths |= {f"conditions.{c.condition_id}" for c in self.conditions}

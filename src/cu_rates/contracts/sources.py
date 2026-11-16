@@ -43,6 +43,13 @@ class SourceApproval(VersionedModel):
     Bound to the exact ``source_id`` and ``source_url`` it reviewed, so a later URL change
     on the ``RateSource`` is not covered. ``policy_id``/``policy_version`` name the review
     policy applied.
+
+    ``approved_profile_sha256`` is the digest of the fetch profile the human approved.
+    T014 must copy it from that approval record. The fetch worker does not get to supply
+    it, and publication fails closed when it is absent. ``approved_layout_sha256`` and
+    ``adapter`` are the page layout and parser reviewed with the source. T040/T045 compute
+    the layout digest; T014 stores it here. ``approved_origins`` lists extra origins a
+    rendered page may call. The source URL's own origin is approved without being listed.
     """
 
     approval_id: Identifier
@@ -55,6 +62,10 @@ class SourceApproval(VersionedModel):
     policy_version: Text
     rationale: Text
     evidence: tuple[Provenance, ...] = ()
+    approved_profile_sha256: Sha256Hex | None = None
+    approved_layout_sha256: Sha256Hex | None = None
+    adapter: ParserVersion | None = None
+    approved_origins: tuple[HttpUrlText, ...] = ()
 
     @property
     def approved(self) -> bool:
@@ -162,7 +173,12 @@ class NotModifiedObservation(VersionedModel):
 
 
 class SourceFingerprint(VersionedModel):
-    """Content and layout digests of one fetched artifact, for drift detection."""
+    """Content and layout digests of one fetched artifact, for drift detection.
+
+    ``adapter`` names the parser that produced ``structure_sha256``. T040/T045 must fill
+    both. Publication compares them to the human ``SourceApproval`` and does not derive
+    a layout digest itself. Absent adapter or digest fails closed.
+    """
 
     source_id: Identifier
     fetch_run_id: Identifier
@@ -170,6 +186,7 @@ class SourceFingerprint(VersionedModel):
     observed_at: UtcDatetime
     content_sha256: Sha256Hex
     structure_sha256: Sha256Hex
+    adapter: ParserVersion | None = None
 
 
 class ExtractionRun(VersionedModel):

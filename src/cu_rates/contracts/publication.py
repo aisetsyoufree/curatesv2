@@ -9,9 +9,10 @@ authority here.
 """
 
 from datetime import datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Annotated, Self
+from urllib.parse import urlsplit
 
 from pydantic import Field, model_validator
 
@@ -20,10 +21,12 @@ from cu_rates.contracts.base import (
     ContractModel,
     FieldPath,
     Identifier,
+    Sha256Hex,
     SortedUnique,
     Text,
     UtcDatetime,
     VersionedModel,
+    canonical_decimal,
 )
 from cu_rates.contracts.enums import (
     ChangeKind,
@@ -68,6 +71,8 @@ from cu_rates.contracts.registry import Institution, InstitutionSourceRelationsh
 from cu_rates.contracts.scenarios import (
     CANONICAL_SCENARIOS,
     ComparisonScenario,
+    DimensionMatch,
+    computed_match_state,
     evaluate_scenario_match,
 )
 from cu_rates.contracts.sources import (
@@ -76,6 +81,7 @@ from cu_rates.contracts.sources import (
     NotModifiedObservation,
     RateSource,
     SourceApproval,
+    SourceFingerprint,
     is_strong_etag,
     profile_sha256,
 )
@@ -125,6 +131,7 @@ class ReasonCode(StrEnum):
     ARTIFACT_SOURCE_MISMATCH = "artifact_source_mismatch"
     ARTIFACT_HTTP_STATUS = "artifact_http_status"
     FETCH_NOT_VERIFIED = "fetch_not_verified"
+    PROFILE_UNAPPROVED = "profile_unapproved"
     REOBSERVATION_UNVERIFIED = "reobservation_unverified"
     OBSERVATION_UNBOUND = "observation_unbound"
     FIELD_EVIDENCE_MISSING = "field_evidence_missing"
@@ -142,6 +149,8 @@ class ReasonCode(StrEnum):
     PRODUCT_NOT_REVIEWED = "product_not_reviewed"
     PRODUCT_IDENTITY_CHANGED = "product_identity_changed"
     STRUCTURAL_CHANGE = "structural_change"
+    LAYOUT_UNREVIEWED = "layout_unreviewed"
+    REOBSERVATION_CLAIM_CHANGED = "reobservation_claim_changed"
     CORRECTION_PENDING = "correction_pending"
     POINTS_CHANGED = "points_changed"
     RATE_MOVEMENT_EXCEEDS_LIMIT = "rate_movement_exceeds_limit"
@@ -165,6 +174,7 @@ class ReasonCode(StrEnum):
     CONDITION_NOT_SATISFIED = "condition_not_satisfied"
     TIER_NOT_COVERING_SCENARIO = "tier_not_covering_scenario"
     TIER_RATE_MISMATCH = "tier_rate_mismatch"
+    HELOC_PERIODS_INCOMPLETE = "heloc_periods_incomplete"
     # Informational.
     STALE_DEGRADED = "stale_degraded"
 
@@ -205,6 +215,7 @@ QUARANTINE_REASONS = frozenset(
         R.ARTIFACT_SOURCE_MISMATCH,
         R.ARTIFACT_HTTP_STATUS,
         R.FETCH_NOT_VERIFIED,
+        R.PROFILE_UNAPPROVED,
         R.REOBSERVATION_UNVERIFIED,
         R.OBSERVATION_UNBOUND,
         R.FIELD_EVIDENCE_MISSING,
@@ -225,6 +236,8 @@ REVIEW_REASONS = frozenset(
         R.PRODUCT_NOT_REVIEWED,
         R.PRODUCT_IDENTITY_CHANGED,
         R.STRUCTURAL_CHANGE,
+        R.LAYOUT_UNREVIEWED,
+        R.REOBSERVATION_CLAIM_CHANGED,
         R.CORRECTION_PENDING,
         R.POINTS_CHANGED,
         R.RATE_MOVEMENT_EXCEEDS_LIMIT,
@@ -251,6 +264,7 @@ BROWSE_ONLY_REASONS = frozenset(
         R.CONDITION_NOT_SATISFIED,
         R.TIER_NOT_COVERING_SCENARIO,
         R.TIER_RATE_MISMATCH,
+        R.HELOC_PERIODS_INCOMPLETE,
         R.CONDITIONS_INCOMPLETE,
         R.ARM_TERMS_INCOMPLETE,
     }
@@ -317,6 +331,11 @@ class PriorPublication(ContractModel):
     published: PublishedSnapshot
     review: ReviewDecision | None = None
     last_value_change_at: UtcDatetime
+    # Set together. T014 copies them from the extraction that was verified against the
+    # original artifact. A 304 cannot extend claims when any of them is missing.
+    verified_artifact_id: Sha256Hex | None = None
+    verified_configuration_sha256: Sha256Hex | None = None
+    verified_parser: ParserVersion | None = None
 
     @model_validator(mode="after")
     def _links_and_review_cover_snapshot(self) -> Self:
@@ -343,6 +362,17 @@ class PriorPublication(ContractModel):
         return self
 
     @model_validator(mode="after")
+    def _verified_extraction_is_complete(self) -> Self:
+        present = (
+            self.verified_artifact_id is not None,
+            self.verified_configuration_sha256 is not None,
+            self.verified_parser is not None,
+        )
+        if any(present) and not all(present):
+            raise ValueError("verified artifact, parser, and configuration must be set together")
+        return self
+
+    @model_validator(mode="after")
     def _value_change_not_after_publication(self) -> Self:
         if self.last_value_change_at > self.published.published_at:
             raise ValueError("the last value change cannot postdate the publication")
@@ -365,6 +395,7 @@ class PublicationContext(ContractModel):
     fetch_runs: tuple[FetchRun, ...] = ()
     reobservations: tuple[NotModifiedObservation, ...] = ()
     approved_profile: FetchProfile | None = None
+    source_fingerprints: tuple[SourceFingerprint, ...] = ()
     validations: tuple[ValidationResult, ...] = ()
     prior: PriorPublication | None = None
     product_review: ReviewDecision | None = None
@@ -384,6 +415,9 @@ class PublicationContext(ContractModel):
                 *(o.run_id for o in self.reobservations),
             ],
             "validation rule result": [(v.offer_id, v.rule_id) for v in self.validations],
+            "source fingerprint": [
+                (item.source_id, item.artifact_id) for item in self.source_fingerprints
+            ],
             "withdrawal": [w.withdrawal_id for w in self.withdrawals],
             "correction": [c.correction_id for c in self.corrections],
         }
@@ -418,12 +452,55 @@ class PublicationDecision(ContractModel):
         return ReasonCode.STALE_DEGRADED in self.reasons
 
 
+def _origin(url: str) -> str:
+    parts = urlsplit(url)
+    port = f":{parts.port}" if parts.port else ""
+    return f"{parts.scheme}://{parts.hostname or ''}{port}"
+
+
+def _origin_approved(url: str, ctx: PublicationContext) -> bool:
+    """The source page's origin is approved. Any other origin must be named on the approval."""
+    approval = ctx.source_approval
+    if approval is None:
+        return False
+    allowed = {_origin(ctx.source.url)}
+    allowed.update(_origin(item) for item in approval.approved_origins)
+    return _origin(url) in allowed
+
+
+def _profile_is_approved(run: FetchRun, ctx: PublicationContext) -> bool:
+    """The run must carry the digest stored on the human approval.
+
+    T014 supplies ``SourceApproval.approved_profile_sha256`` from the approval record.
+    A caller-supplied ``approved_profile``, or a fetch that started before that approval,
+    does not qualify. Missing digest fails closed.
+    """
+    approval, profile = ctx.source_approval, ctx.approved_profile
+    if (
+        approval is None
+        or not approval.approved
+        or approval.approved_profile_sha256 is None
+        or profile is None
+        or run.profile_sha256 is None
+    ):
+        return False
+    digest = profile_sha256(profile)
+    return (
+        approval.approved_profile_sha256 == digest
+        and run.profile_sha256 == digest
+        and run.profile_id == profile.profile_id
+        and profile.source_id == run.source_id
+        and approval.decided_at <= run.started_at
+    )
+
+
 def _withdrawn(offer: NormalizedOffer, ctx: PublicationContext) -> bool:
     targets = {
         (WithdrawalScope.OFFER, offer.offer_id),
         (WithdrawalScope.PRODUCT, offer.product_id),
         (WithdrawalScope.INSTITUTION, str(offer.institution_charter)),
         (WithdrawalScope.INSTITUTION, str(ctx.institution.charter_number)),
+        (WithdrawalScope.SOURCE, offer.source_id),
     }
     if ctx.snapshot_id is not None:
         targets.add((WithdrawalScope.SNAPSHOT, ctx.snapshot_id))
@@ -524,6 +601,8 @@ def _reobservation_proven(
         and profile.source_id == observation.source_id
         and observation.profile_id == run.profile_id == profile.profile_id
         and run.profile_sha256 == observation.profile_sha256 == profile_sha256(profile)
+        and approval.approved_profile_sha256 == profile_sha256(profile)
+        and approval.decided_at <= run.started_at
         and validator is not None
         and validator.kind == "etag"
         and is_strong_etag(validator.value)
@@ -577,6 +656,9 @@ def _artifact_reasons(
         or run.finished_at > ctx.evaluated_at
     ):
         reasons.add(R.FETCH_NOT_VERIFIED)
+    elif not _profile_is_approved(run, ctx):
+        # Every qualifying fetch, including an ordinary 200, must match the approved profile.
+        reasons.add(R.PROFILE_UNAPPROVED)
     if not 200 <= artifact.http_status < 300:
         reasons.add(R.ARTIFACT_HTTP_STATUS)
     if artifact.fetched_at > ctx.evaluated_at:
@@ -596,6 +678,7 @@ def _evidence_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[Re
     used: dict[str, datetime] = {}
     for provenance in offer.iter_provenance():
         locator = provenance.locator
+        primary_artifact = stored.get(provenance.artifact_id)
         referenced = [(provenance.artifact_id, True)]
         if isinstance(locator, RenderedDomLocator):
             referenced += [(response_id, False) for response_id in locator.response_ids]
@@ -611,6 +694,14 @@ def _evidence_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[Re
                 reasons.add(R.REOBSERVATION_UNVERIFIED)
             reasons |= _artifact_reasons(artifact, offer, ctx, primary=primary, observed=observed)
             if not primary:
+                # A linked XHR must be from this render run and an approved origin.
+                if (
+                    primary_artifact is None
+                    or artifact.fetch_run_id != primary_artifact.fetch_run_id
+                ):
+                    reasons.add(R.FETCH_NOT_VERIFIED)
+                if not _origin_approved(artifact.source_url, ctx):
+                    reasons.add(R.ARTIFACT_SOURCE_MISMATCH)
                 continue
             used[artifact_id] = observed or artifact.fetched_at
             if not locator_fits_media_type(locator, artifact.media_type) or (
@@ -660,6 +751,13 @@ def _validation_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[
             passed.add(result.rule_id)  # the APR rule only counts if it examined both rates
     if not required or required - passed:
         reasons.add(R.VALIDATIONS_MISSING)
+    # A recorded pass does not outrank the rates on the offer.
+    if (
+        offer.apr is not None
+        and offer.note_rate is not None
+        and offer.apr.value < offer.note_rate.value
+    ):
+        reasons.add(R.VALIDATION_FAILED)
     return reasons
 
 
@@ -702,6 +800,147 @@ def _identity_and_evidence_reasons(
     return reasons
 
 
+def _field_text(offer: NormalizedOffer, path: str) -> str | None:
+    """Canonical text of one offer field, or None when the path is not on the offer."""
+    if path == "points" and offer.points is not None:
+        return canonical_decimal(offer.points.value)
+    rates = offer.rate_values()
+    if path in rates:
+        return canonical_decimal(rates[path])
+    if path.startswith("details."):
+        name = path.removeprefix("details.")
+        if name == "intro.duration_months":
+            intro = getattr(offer.details, "intro", None)
+            duration = None if intro is None else intro.duration_months
+            return None if duration is None else str(duration)
+        if not hasattr(offer.details, name):
+            return None
+        value = getattr(offer.details, name)
+        if value is None or isinstance(value, tuple):
+            return None
+        if isinstance(value, Decimal):
+            return canonical_decimal(value)
+        if isinstance(value, StrEnum):
+            return value.value
+        if isinstance(value, int):
+            return str(value)
+        return None
+    return None
+
+
+def _same_stated_value(actual: str, claimed: str) -> bool:
+    if actual == claimed:
+        return True
+    try:
+        return Decimal(actual) == Decimal(claimed)
+    except InvalidOperation:
+        return False
+
+
+def _correction_value_matches(offer: NormalizedOffer, path: str, corrected_value: str) -> bool:
+    actual = _field_text(offer, path)
+    return actual is not None and _same_stated_value(actual, corrected_value)
+
+
+def _correction_evidence_stored(correction: Correction, ctx: PublicationContext) -> bool:
+    if not correction.evidence:
+        return False
+    stored = {artifact.artifact_id for artifact in ctx.known_artifacts}
+    return all(item.artifact_id in stored for item in correction.evidence)
+
+
+def _proven_refresh(offer: NormalizedOffer, ctx: PublicationContext) -> bool:
+    """True when a fully proven 304, and no unproven one, is this offer's observation."""
+    stored = {artifact.artifact_id: artifact for artifact in ctx.known_artifacts}
+    proven = False
+    for item in offer.iter_provenance():
+        artifact = stored.get(item.artifact_id)
+        if artifact is None:
+            continue
+        claimed = [
+            observation
+            for observation in ctx.reobservations
+            if observation.original_artifact_id == artifact.artifact_id
+            and observation.observed_at == offer.observed_at
+            and observation.observed_at != artifact.fetched_at
+        ]
+        if not claimed:
+            continue
+        if not all(
+            _reobservation_proven(observation, artifact, offer, ctx) for observation in claimed
+        ):
+            return False
+        proven = True
+    return proven
+
+
+def _claims_extend(offer: NormalizedOffer, prior: PriorPublication) -> bool:
+    """A 304 may extend only values already verified against the original artifact."""
+    artifact_id = prior.verified_artifact_id
+    parser = prior.verified_parser
+    configuration = prior.verified_configuration_sha256
+    if artifact_id is None or parser is None or configuration is None:
+        return False
+    current = OfferSnapshot.from_offer(offer)
+    if current.rates != prior.snapshot.rates or current.points != prior.snapshot.points:
+        return False
+    for item in offer.iter_provenance():
+        extraction = item.extraction
+        if (
+            item.artifact_id != artifact_id
+            or extraction.parser != parser
+            or extraction.configuration_sha256 != configuration
+        ):
+            return False
+    return True
+
+
+def _layout_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[ReasonCode]:
+    """Require the layout digest reviewed for this source and adapter.
+
+    T040/T045 compute ``structure_sha256`` and name the adapter. T014 stores that pair
+    on the human ``SourceApproval`` and passes the artifact's ``SourceFingerprint``.
+    This function does not parse HTML. A missing record, a different adapter, or a
+    layout hash other than the one reviewed goes to review.
+    """
+    approval = ctx.source_approval
+    if (
+        approval is None
+        or approval.approved_layout_sha256 is None
+        or approval.adapter is None
+        or approval.adapter not in ctx.approved_parsers
+    ):
+        return {R.LAYOUT_UNREVIEWED}
+    stored = {artifact.artifact_id: artifact for artifact in ctx.known_artifacts}
+    cited = {
+        item.artifact_id
+        for item in offer.iter_provenance()
+        if (artifact := stored.get(item.artifact_id)) is not None
+        and artifact.source_url == ctx.source.url
+    }
+    if not cited:
+        return {R.LAYOUT_UNREVIEWED}
+    for artifact_id in cited:
+        artifact = stored[artifact_id]
+        match = next(
+            (
+                fingerprint
+                for fingerprint in ctx.source_fingerprints
+                if fingerprint.source_id == offer.source_id
+                and fingerprint.artifact_id == artifact_id
+                and fingerprint.fetch_run_id == artifact.fetch_run_id
+                and fingerprint.content_sha256 == artifact.artifact_id
+                and fingerprint.structure_sha256 == approval.approved_layout_sha256
+                and fingerprint.adapter == approval.adapter
+                and fingerprint.observed_at <= ctx.evaluated_at
+            ),
+            None,
+        )
+        if match is None:
+            return {R.LAYOUT_UNREVIEWED}
+    return set()
+
+
 def _corrections_cleared(offer: NormalizedOffer, ctx: PublicationContext) -> bool:
     """Each correction needs a matching content-bound record or a later review of this state."""
     current = offer_fingerprints(offer)
@@ -717,7 +956,15 @@ def _corrections_cleared(offer: NormalizedOffer, ctx: PublicationContext) -> boo
             continue
         if correction.corrected_at > ctx.evaluated_at:
             return False
-        bound = correction.corrected_fingerprints == current
+        # A matching fingerprint clears a correction only when the offer now carries the
+        # stated replacement and new source evidence for it. A contradictory value, or
+        # evidence that was never stored, stays pending. A later human review of this
+        # exact state can still clear it.
+        bound = (
+            correction.corrected_fingerprints == current
+            and _correction_value_matches(offer, correction.field_path, correction.corrected_value)
+            and _correction_evidence_stored(correction, ctx)
+        )
         if not bound and not (
             reviewed_current and review is not None and review.decided_at >= correction.corrected_at
         ):
@@ -769,6 +1016,8 @@ def _change_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[Reas
         reasons.add(R.RATE_MOVEMENT_EXCEEDS_LIMIT)
     if proof.unbounded:
         reasons.add(R.RATE_MOVEMENT_UNBOUNDED)
+    if _proven_refresh(offer, ctx) and not _claims_extend(offer, prior):
+        reasons.add(R.REOBSERVATION_CLAIM_CHANGED)
     last_change = prior.last_value_change_at
     if last_change > ctx.evaluated_at:
         reasons.add(R.CLOCK_SKEW)
@@ -853,6 +1102,37 @@ def _terms_match_scenario(details: OfferDetails, scenario: ComparisonScenario) -
     return True
 
 
+def _verified_scenario_matches(
+    offer: NormalizedOffer, ctx: PublicationContext
+) -> tuple[tuple[DimensionMatch, ...], set[ReasonCode]]:
+    """Recompute claimed matches from typed, located statements.
+
+    A conflict is already fail-closed. A claimed match with no locator, no typed
+    value, or an unstored artifact does not count as a match.
+    """
+    assert offer.scenario_id is not None
+    stored = {artifact.artifact_id for artifact in ctx.known_artifacts}
+    scenario = CANONICAL_SCENARIOS[offer.scenario_id]
+    reasons: set[ReasonCode] = set()
+    adjusted: list[DimensionMatch] = []
+    for match in offer.scenario_matches:
+        if match.state is not MatchState.MATCHES:
+            adjusted.append(match)
+            continue
+        provenance = match.provenance
+        if match.stated is None or provenance is None or provenance.artifact_id not in stored:
+            if provenance is not None and provenance.artifact_id not in stored:
+                reasons.add(R.ARTIFACT_NOT_STORED)
+            adjusted.append(
+                match.model_copy(update={"state": MatchState.UNSTATED, "source_text": None})
+            )
+            continue
+        computed = computed_match_state(scenario, match.stated, match.dimension)
+        source_text = None if computed is MatchState.UNSTATED else match.source_text
+        adjusted.append(match.model_copy(update={"state": computed, "source_text": source_text}))
+    return tuple(adjusted), reasons
+
+
 def _placement_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[ReasonCode]:
     reasons = _tier_reasons(offer)
     product, details = ctx.product, offer.details
@@ -861,6 +1141,8 @@ def _placement_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[R
             reasons.add(R.HELOC_POST_INTRO_INCOMPLETE)
         if details.post_intro_conflicts():
             reasons.add(R.HELOC_POST_INTRO_CONFLICT)
+        if details.draw_period_months is None or details.repayment_period_months is None:
+            reasons.add(R.HELOC_PERIODS_INCOMPLETE)
     else:
         if offer.apr is None:
             reasons.add(R.NO_APR)
@@ -878,7 +1160,9 @@ def _placement_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[R
         reasons.add(R.SCENARIO_NOT_DECLARED)
         return reasons
     scenario = CANONICAL_SCENARIOS[offer.scenario_id]
-    overall = evaluate_scenario_match(offer.scenario_id, offer.scenario_matches)
+    verified, evidence_gaps = _verified_scenario_matches(offer, ctx)
+    reasons |= evidence_gaps
+    overall = evaluate_scenario_match(offer.scenario_id, verified)
     if overall is MatchState.CONFLICTS:
         reasons.add(R.SCENARIO_CONFLICT)
     elif overall is MatchState.UNSTATED:
@@ -899,6 +1183,7 @@ def evaluate_publication(offer: NormalizedOffer, ctx: PublicationContext) -> Pub
     reasons = _lifecycle_reasons(offer, ctx)
     reasons |= _identity_and_evidence_reasons(offer, ctx)
     reasons |= _change_reasons(offer, ctx)
+    reasons |= _layout_reasons(offer, ctx)
     reasons |= _shape_reasons(offer)
     reasons |= _placement_reasons(offer, ctx)
     ordered = tuple(code for code in ReasonCode if code in reasons)

@@ -193,6 +193,7 @@ class WithdrawalScope(StrEnum):
     OFFER = "offer"
     PRODUCT = "product"
     INSTITUTION = "institution"
+    SOURCE = "source"
     SNAPSHOT = "snapshot"
 
 
