@@ -1,16 +1,16 @@
 {% extends "base.html" %}
 
-{% block title %}Educational Guides and Lending Concepts{% endblock %}
-
 {% block meta %}
 <meta name="robots" content="noindex, follow">
 {% endblock %}
 
 {% block content %}
 <article>
+  {% if is_draft %}
   <div class="draft-banner" role="alert" aria-label="Draft notice">
     <p><strong>Draft - awaiting factual review:</strong> These educational guides are unreviewed drafts awaiting factual review. They provide general educational explanations and do not provide personalized financial advice, loan recommendations, or endorsements.</p>
   </div>
+  {% endif %}
 
   <h1>Educational Guides and Lending Concepts</h1>
 
@@ -25,9 +25,11 @@
     <ul class="article-list">
       {% for item in articles %}
       <li class="article-item">
-        <h2><a href="{{ url_for('web.learn_article', slug=item.slug) }}">{{ item.title }}</a></h2>
+        <h3><a href="{{ url_for('web.learn_article', slug=item.slug) }}">{{ item.title }}</a></h3>
         <p>{{ item.summary }}</p>
+        {% if not item.reviewed %}
         <div class="article-meta">Draft - awaiting factual review</div>
+        {% endif %}
       </li>
       {% endfor %}
     </ul>
