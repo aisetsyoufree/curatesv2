@@ -1141,3 +1141,23 @@ def test_gunicorn_control_socket_is_disabled() -> None:
     """The read-only sandbox cannot host Gunicorn's control socket; it stays disabled."""
     unit = (DEPLOY_DIR / "systemd" / "cu-rates-web.service").read_text()
     assert "--no-control-socket" in unit
+
+
+def test_runbook_withdrawal_example_actually_runs(tmp_path: Path) -> None:
+    """The emergency withdrawal snippet in the runbook must execute (AUD7-11e)."""
+    import re
+
+    readme = (DEPLOY_DIR / "README.md").read_text()
+    blocks = re.findall(r"```python\n(.*?)```", readme, flags=re.S)
+    snippet = next(b for b in blocks if "denylist.withdraw(entry)" in b)
+    ledger = tmp_path / "denylist.json"
+    from cu_rates.snapshot import Denylist
+
+    Denylist(ledger).initialize()
+    import textwrap
+
+    code = textwrap.dedent(snippet).replace(
+        "/var/lib/cu-rates/snapshots/denylist.json", str(ledger)
+    )
+    exec(compile(code, "runbook-withdrawal-example", "exec"), {})
+    assert "off-example-123" in ledger.read_text()
