@@ -10,7 +10,7 @@ Group=cu-rates
 WorkingDirectory=/var/lib/cu-rates/app
 EnvironmentFile=-/etc/cu-rates/cu-rates.env
 
-ExecStart=/var/lib/cu-rates/venv/bin/gunicorn --bind 127.0.0.1:18200 --workers 3 --threads 2 --worker-class gthread --access-logfile - --access-logformat '%%(h)s %%(l)s %%(u)s %%(t)s "%%(m)s %%(U)s %%(H)s" %%(s)s %%(b)s "%%(a)s"' --error-logfile - "cu_rates.web.app:create_app()"
+ExecStart=/var/lib/cu-rates/venv/bin/gunicorn --bind 127.0.0.1:18200 --no-control-socket --workers 3 --threads 2 --worker-class gthread --access-logfile - --access-logformat '%%(h)s %%(l)s %%(u)s %%(t)s "%%(m)s %%(U)s %%(H)s" %%(s)s %%(b)s "%%(a)s"' --error-logfile - "cu_rates.web.app:create_app()"
 ExecReload=/bin/kill -s HUP $MAINPID
 Restart=on-failure
 RestartSec=5s

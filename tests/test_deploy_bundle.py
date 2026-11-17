@@ -1122,3 +1122,9 @@ def test_gunicorn_port_is_consistent_and_avoids_the_known_busy_port() -> None:
     assert "127.0.0.1:18200" in readme
     for text in (unit, caddy, readme):
         assert "127.0.0.1:8000" not in text
+
+
+def test_gunicorn_control_socket_is_disabled() -> None:
+    """The read-only sandbox cannot host Gunicorn's control socket; it stays disabled."""
+    unit = (DEPLOY_DIR / "systemd" / "cu-rates-web.service").read_text()
+    assert "--no-control-socket" in unit
