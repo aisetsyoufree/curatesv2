@@ -10,8 +10,8 @@ http://cu-rates.org:8080 {
     # Listen only on loopback interface behind Cloudflare Tunnel (no external router port)
     bind 127.0.0.1
 
-    # Reverse proxy to Gunicorn WSGI server on 127.0.0.1:8000
-    reverse_proxy 127.0.0.1:8000 {
+    # Reverse proxy to Gunicorn WSGI server on 127.0.0.1:18200
+    reverse_proxy 127.0.0.1:18200 {
         header_up Host {host}
         # CF-Connecting-IP provided by Cloudflare is forwarded as an opaque header only.
         # The application must NOT trust CF-Connecting-IP or forwarded headers for security decisions.
