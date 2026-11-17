@@ -9,6 +9,7 @@
     Compare publicly advertised residential mortgage and home equity terms across Massachusetts credit unions.
     All comparisons use declared canonical borrower scenarios under like-for-like rules.
     Offers without full APR disclosure or matching assumptions are labeled and separated.
+    Coverage is limited to publicly advertised conventional conforming terms from verified Massachusetts credit union sources; quote-only, login-required, or offline institutions are not represented.
   </p>
 
   <form method="get" action="{{ url_for('web.compare') }}" class="compare-controls card" aria-label="Comparison filters">
@@ -103,6 +104,20 @@
 
       <div class="scenario-grid-panel">
         <h3>Comparable Offers (Standard Terms)</h3>
+        <div class="coverage-disclosure card" role="note" aria-label="Coverage disclosure for {{ section.spec.title }}">
+          <p class="coverage-disclosure-text">
+            <strong>Coverage disclosure:</strong>
+            {% if section.comparable_count > 0 %}
+            Representing <strong>{{ section.comparable_count }}</strong> comparable offer{{ 's' if section.comparable_count != 1 else '' }}
+            from <strong>{{ section.institution_count }}</strong> institution{{ 's' if section.institution_count != 1 else '' }}
+            ({% for inst_name in section.represented_institutions %}{{ inst_name }}{% if not loop.last %}, {% endif %}{% endfor %})
+            out of {{ section.total_count }} total offer{{ 's' if section.total_count != 1 else '' }} evaluated for this scenario.
+            {% else %}
+            0 comparable offers currently represented out of {{ section.total_count }} total offer{{ 's' if section.total_count != 1 else '' }} evaluated for this scenario.
+            {% endif %}
+            Coverage limits: Sorting and comparisons reflect only verified, publicly advertised offers meeting the canonical scenario. Institutions that quote only upon contact, require membership authentication, or lack automated collection are excluded. This sample does not represent the entire Massachusetts lending market.
+          </p>
+        </div>
         {% if section.structure_groups %}
           {% for group in section.structure_groups %}
           {% if group.label %}

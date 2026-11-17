@@ -205,3 +205,77 @@ def test_database_findings_narrows_snapshot_sqlite_to_readonly() -> None:
     }
     findings = database_findings(insert_sources, ["cu_rates.web"])
     assert any("sqlite write statement" in f for f in findings)
+
+
+def test_forbidden_ranking_words_split_markup_and_entities() -> None:
+    """Split markup and entities cannot bypass forbidden ranking word detection."""
+    from tests.site_audit import forbidden_ranking_problems
+
+    # Split markup words
+    assert "forbidden ranking word 'lowest'" in forbidden_ranking_problems("<b>low</b>est rate")
+    assert "forbidden ranking word 'best'" in forbidden_ranking_problems("The <i>be</i>st lender")
+    assert "forbidden ranking word '#1'" in forbidden_ranking_problems("Rated <b>#</b>1 CU")
+
+    # Decoded entity checks
+    assert "forbidden ranking word '#1'" in forbidden_ranking_problems("We are &#35;1 in MA")
+    assert "forbidden ranking word '#1'" in forbidden_ranking_problems("Rated &num;1 overall")
+    assert "forbidden ranking word 'lowest'" in forbidden_ranking_problems("low&#101;st rates")
+
+    # Clean text with no forbidden words passes
+    assert forbidden_ranking_problems("<p>Compare <b>advertised</b> mortgage terms</p>") == []
+
+
+def test_database_findings_forbids_variable_writes_mutating_pragmas_and_writable_connections() -> (
+    None
+):
+    """AST database scan catches variable SQL writes, mutating PRAGMAs,
+    executescript, and writable connections.
+    """
+    from tests.site_audit import database_findings
+
+    # Variable-built write statement
+    var_write_sources = {
+        "cu_rates.web": "import cu_rates.snapshot.reader",
+        "cu_rates.snapshot.reader": (
+            "import sqlite3\n"
+            "conn = sqlite3.connect('file:pub.sqlite?mode=ro')\n"
+            "sql = 'INSERT INTO snapshot VALUES (1)'\n"
+            "conn.execute(sql)"
+        ),
+    }
+    findings = database_findings(var_write_sources, ["cu_rates.web"])
+    assert any("sqlite write statement" in f for f in findings)
+
+    # Mutating PRAGMA
+    pragma_sources = {
+        "cu_rates.web": "import cu_rates.snapshot.reader",
+        "cu_rates.snapshot.reader": (
+            "import sqlite3\n"
+            "conn = sqlite3.connect('file:pub.sqlite?mode=ro')\n"
+            "conn.execute('PRAGMA journal_mode=WAL')"
+        ),
+    }
+    findings = database_findings(pragma_sources, ["cu_rates.web"])
+    assert any("sqlite mutating pragma" in f for f in findings)
+
+    # executescript
+    execscript_sources = {
+        "cu_rates.web": "import cu_rates.snapshot.reader",
+        "cu_rates.snapshot.reader": (
+            "import sqlite3\n"
+            "conn = sqlite3.connect('file:pub.sqlite?mode=ro')\n"
+            "conn.executescript('SELECT 1;')"
+        ),
+    }
+    findings = database_findings(execscript_sources, ["cu_rates.web"])
+    assert any("sqlite forbidden executescript" in f for f in findings)
+
+    # Writable connection without mode=ro
+    writable_sources = {
+        "cu_rates.web": "import cu_rates.snapshot.reader",
+        "cu_rates.snapshot.reader": (
+            "import sqlite3\nconn = sqlite3.connect('pub.sqlite')\nconn.execute('SELECT 1')"
+        ),
+    }
+    findings = database_findings(writable_sources, ["cu_rates.web"])
+    assert any("sqlite writable connection" in f for f in findings)

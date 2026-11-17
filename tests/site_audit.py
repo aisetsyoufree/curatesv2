@@ -5,6 +5,7 @@ slipping through, then the corrected detector catching it.
 """
 
 import ast
+import html
 import re
 from collections.abc import Mapping, Sequence
 from html.parser import HTMLParser
@@ -454,14 +455,36 @@ class _RankingScanner(HTMLParser):
 def forbidden_ranking_problems(text: str) -> list[str]:
     """Detect words that imply an unsupported ranking or endorsement in text or HTML elements."""
     matches: set[str] = set()
-    for m in FORBIDDEN_RANKING_PATTERN.finditer(text):
+
+    # 1. Normalized rendered text with tags stripped to catch split-markup
+    # (e.g. "<b>low</b>est", "<i>be</i>st")
+    stripped = re.sub(r"<[^>]+>", "", text)
+    decoded_stripped = html.unescape(stripped)
+    collapsed_stripped = re.sub(r"\s+", " ", decoded_stripped).strip()
+    folded_stripped = collapsed_stripped.casefold()
+    for m in FORBIDDEN_RANKING_PATTERN.finditer(folded_stripped):
         matches.add(m.group(0).lower())
+
+    # 2. Normalized rendered text with tags spaced to keep separate elements distinct
+    spaced = re.sub(r"<[^>]+>", " ", text)
+    decoded_spaced = html.unescape(spaced)
+    collapsed_spaced = re.sub(r"\s+", " ", decoded_spaced).strip()
+    folded_spaced = collapsed_spaced.casefold()
+    for m in FORBIDDEN_RANKING_PATTERN.finditer(folded_spaced):
+        matches.add(m.group(0).lower())
+
+    # 3. Direct unescaped text match
+    decoded_raw = html.unescape(text).casefold()
+    for m in FORBIDDEN_RANKING_PATTERN.finditer(decoded_raw):
+        matches.add(m.group(0).lower())
+
     if "<" in text and ">" in text:
         scanner = _RankingScanner()
         try:
             scanner.feed(text)
             for snippet in scanner.texts:
-                for m in FORBIDDEN_RANKING_PATTERN.finditer(snippet):
+                snip_dec = html.unescape(snippet).casefold()
+                for m in FORBIDDEN_RANKING_PATTERN.finditer(snip_dec):
                     matches.add(m.group(0).lower())
         except Exception:
             pass
@@ -469,9 +492,31 @@ def forbidden_ranking_problems(text: str) -> list[str]:
 
 
 _SQLITE_WRITE_KEYWORDS = re.compile(
-    r"\b(insert\s+into|update\s+\w+|delete\s+from|drop\s+table|create\s+table|alter\s+table|replace\s+into|vacuum)\b",
+    r"\b(insert\s+into|update\s+\w+|delete\s+from|drop\s+table|create\s+table|alter\s+table|replace\s+into|vacuum|attach\s+database)\b",
     re.IGNORECASE,
 )
+
+_MUTATING_PRAGMA_PATTERN = re.compile(
+    r"\bpragma\s+([a-zA-Z_]+)\s*(=|\()",
+    re.IGNORECASE,
+)
+
+
+def _check_sqlite_statement(stmt: str) -> str | None:
+    if _SQLITE_WRITE_KEYWORDS.search(stmt):
+        return f"sqlite write statement '{stmt.strip()[:30]}'"
+    pragma_match = _MUTATING_PRAGMA_PATTERN.search(stmt)
+    if pragma_match:
+        pragma_name = pragma_match.group(1).lower()
+        clean = re.sub(r"\s+", "", stmt.lower())
+        if pragma_name == "query_only" and ("query_only=on" in clean or "query_only=1" in clean):
+            return None
+        if pragma_name == "trusted_schema" and (
+            "trusted_schema=off" in clean or "trusted_schema=0" in clean
+        ):
+            return None
+        return f"sqlite mutating pragma '{stmt.strip()[:30]}'"
+    return None
 
 
 def is_forbidden_module(name: str, *, from_module: str = "") -> bool:
@@ -531,6 +576,32 @@ def _scan_module(
     tree = ast.parse(source)
     imports: set[str] = set()
     references: list[str] = []
+
+    # Map variable names to string values assigned in this module
+    var_values: dict[str, list[str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            assigned_strings: list[str] = []
+            if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                assigned_strings.append(node.value.value)
+            elif isinstance(node.value, ast.JoinedStr):
+                parts = [
+                    p.value
+                    for p in node.value.values
+                    if isinstance(p, ast.Constant) and isinstance(p.value, str)
+                ]
+                assigned_strings.append(" ".join(parts))
+            elif isinstance(node.value, ast.BinOp):
+                parts = [
+                    sub.value
+                    for sub in ast.walk(node.value)
+                    if isinstance(sub, ast.Constant) and isinstance(sub.value, str)
+                ]
+                assigned_strings.append(" ".join(parts))
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    var_values.setdefault(target.id, []).extend(assigned_strings)
+
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -560,15 +631,61 @@ def _scan_module(
                 method_name = called.rsplit(".", 1)[-1]
                 if method_name in {"commit", "rollback"}:
                     references.append(f"sqlite write method '{called}'")
-                elif method_name in {"execute", "executemany", "executescript"} and node.args:
+                elif method_name == "executescript":
+                    references.append(f"sqlite forbidden executescript '{called}'")
+                elif method_name in {"execute", "executemany"} and node.args:
+                    stmts_to_check: list[str] = []
                     first_arg = node.args[0]
-                    if (
-                        isinstance(first_arg, ast.Constant)
-                        and isinstance(first_arg.value, str)
-                        and _SQLITE_WRITE_KEYWORDS.search(first_arg.value)
+                    if isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str):
+                        stmts_to_check.append(first_arg.value)
+                    elif isinstance(first_arg, ast.Name):
+                        stmts_to_check.extend(var_values.get(first_arg.id, []))
+                    elif isinstance(first_arg, ast.JoinedStr):
+                        parts = [
+                            p.value
+                            for p in first_arg.values
+                            if isinstance(p, ast.Constant) and isinstance(p.value, str)
+                        ]
+                        stmts_to_check.append(" ".join(parts))
+                    elif isinstance(first_arg, ast.BinOp):
+                        parts = [
+                            sub.value
+                            for sub in ast.walk(first_arg)
+                            if isinstance(sub, ast.Constant) and isinstance(sub.value, str)
+                        ]
+                        stmts_to_check.append(" ".join(parts))
+                    for stmt in stmts_to_check:
+                        problem = _check_sqlite_statement(stmt)
+                        if problem:
+                            references.append(problem)
+                elif called in {"sqlite3.connect", "connect"}:
+                    # Enforce read-only SQLite use: mode=ro required
+                    conn_target_strings: list[str] = []
+                    if node.args:
+                        first_arg = node.args[0]
+                        if isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str):
+                            conn_target_strings.append(first_arg.value)
+                        elif isinstance(first_arg, ast.Name):
+                            conn_target_strings.extend(var_values.get(first_arg.id, []))
+                        elif isinstance(first_arg, ast.BinOp):
+                            parts = [
+                                sub.value
+                                for sub in ast.walk(first_arg)
+                                if isinstance(sub, ast.Constant) and isinstance(sub.value, str)
+                            ]
+                            conn_target_strings.append(" ".join(parts))
+                    for kw in node.keywords:
+                        if kw.arg == "database":
+                            if isinstance(kw.value, ast.Constant) and isinstance(
+                                kw.value.value, str
+                            ):
+                                conn_target_strings.append(kw.value.value)
+                            elif isinstance(kw.value, ast.Name):
+                                conn_target_strings.extend(var_values.get(kw.value.id, []))
+                    if not conn_target_strings or not any(
+                        "mode=ro" in s for s in conn_target_strings
                     ):
-                        stmt_preview = first_arg.value.strip()[:30]
-                        references.append(f"sqlite write statement '{stmt_preview}'")
+                        references.append(f"sqlite writable connection '{called}'")
     return imports, references
 
 
@@ -590,7 +707,12 @@ def database_findings(sources: Mapping[str, str], roots: Sequence[str]) -> list[
             continue
         imports, references = _scan_module(source, module=module, packages=packages)
         for reference in references:
-            if reference.startswith("sqlite write"):
+            if (
+                reference.startswith("sqlite write")
+                or reference.startswith("sqlite forbidden")
+                or reference.startswith("sqlite mutating")
+                or reference.startswith("sqlite writable")
+            ):
                 findings.append(f"{reference} in {module}")
             else:
                 findings.append(f"open {reference} in {module}")

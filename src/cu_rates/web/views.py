@@ -336,6 +336,7 @@ def compare() -> Response:
         # Incomparable/incomplete sections keep neutral institution ordering
         # regardless of sort parameters (Finding 4)
         sorted_incomparable = sort_offers(incomparable, "institution")
+        represented_institutions = tuple(sorted({o.institution_name for o in comparable}))
 
         scenario_sections.append(
             {
@@ -346,6 +347,8 @@ def compare() -> Response:
                 "comparable_count": len(comparable),
                 "incomparable_count": len(incomparable),
                 "total_count": len(scenario_offers),
+                "represented_institutions": represented_institutions,
+                "institution_count": len(represented_institutions),
             }
         )
 
@@ -421,9 +424,16 @@ def sitemap_xml() -> Response:
         f"{origin}/methodology",
         f"{origin}/privacy",
     ]
-    # Include /compare only when verified rates are published
-    _info, raw_offers = read_snapshot_offers()
-    if raw_offers:
+    # Include /compare only when display-eligible offers exist (same predicate as noindex)
+    now = datetime.now(UTC)
+    clock_override = current_app.config.get("SNAPSHOT_CLOCK")
+    if isinstance(clock_override, datetime):
+        now = clock_override
+    if now.utcoffset() is None:
+        now = now.replace(tzinfo=UTC)
+
+    _info, raw_offers = read_snapshot_offers(at=now)
+    if any(classify_and_format_offer(raw, now) is not None for raw in raw_offers):
         urls.append(f"{origin}/compare")
 
     # Unreviewed articles remain excluded from sitemap until verified

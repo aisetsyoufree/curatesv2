@@ -182,6 +182,7 @@ class FormattedOffer:
     draw_period_months: int | None = None
     repayment_period_months: int | None = None
     structure_label: str = ""
+    intro_rate_display: str = ""
 
 
 def format_age(delta: timedelta) -> str:
@@ -224,10 +225,10 @@ def format_conditions(offer: PublicOffer) -> str:
             elif bound.upper is not None:
                 items.append(f"Tier qualification ({dim} <= {bound.upper})")
 
-    # Flag conflicting scenario assumptions
+    # Flag conflicting scenario assumptions and disclose published bounds
     for assumption in offer.assumptions:
+        dim_name = assumption.dimension.value.replace("_", " ")
         if assumption.state is MatchState.CONFLICTS:
-            dim_name = assumption.dimension.value.replace("_", " ")
             if assumption.stated is not None:
                 st = assumption.stated
                 if st.exact is not None:
@@ -245,6 +246,18 @@ def format_conditions(offer: PublicOffer) -> str:
                 items.append(f"Conflicts with scenario {dim_name} ({val_str})")
             else:
                 items.append(f"Conflicts with scenario {dim_name}")
+        elif assumption.stated is not None:
+            st = assumption.stated
+            if st.lower is not None and st.upper is not None:
+                items.append(f"Published {dim_name}: {st.lower} to {st.upper}")
+            elif st.lower is not None:
+                items.append(f"Published min {dim_name}: {st.lower}")
+            elif st.upper is not None:
+                items.append(f"Published max {dim_name}: {st.upper}")
+            elif st.exact is not None:
+                items.append(f"Published {dim_name}: {st.exact}")
+            elif st.token is not None:
+                items.append(f"Published {dim_name}: {st.token}")
 
     # Condition kinds as condition disclosures (never asserted requirements)
     for cond in offer.conditions:
@@ -374,24 +387,34 @@ def classify_and_format_offer(offer: PublicOffer, now: datetime) -> FormattedOff
         else ""
     )
 
+    intro_label = ""
     if offer.family is ProductFamily.HELOC:
         # Use ONLY the proven details.post_intro_rate for post-intro figures
         post_intro = rates_by_path.get("details.post_intro_rate")
         stated_apr = rates_by_path.get("details.stated_post_intro_apr")
-        if stated_apr is not None:
-            apr = stated_apr
-        elif post_intro is not None and apr is None and note_rate is None:
-            # Post-intro figure is a variable rate, not an APR!
-            note_rate = post_intro
+        # For HELOC, post-intro APR is required for comparison; generic root APR does not apply
+        apr = stated_apr
+        note_rate = post_intro
+
+        # Disclose intro rate and duration separately and labeled
         intro_rate = rates_by_path.get("details.intro.rate")
         if intro_rate is not None:
-            note_rate = intro_rate
+            intro_duration = None
+            intro_raw = offer.details.get("intro")
+            if isinstance(intro_raw, dict):
+                dur_val = intro_raw.get("duration_months")
+                if isinstance(dur_val, int):
+                    intro_duration = dur_val
+            if intro_duration is not None:
+                intro_label = f"Intro: {intro_rate:.3f}% ({intro_duration} mos)"
+            else:
+                intro_label = f"Intro: {intro_rate:.3f}% (duration not published)"
+
+    # Decision D-05: Rate without APR is excluded from comparison tables entirely
+    if apr is None:
+        return None
 
     reasons: list[str] = []
-    if apr is None:
-        reasons.append(
-            "Lacks published APR disclosure (excluded from rankings under Decision D-05)"
-        )
     if note_rate is None and offer.family is not ProductFamily.HELOC:
         reasons.append("Missing note rate disclosure")
     if offer.placement is Placement.BROWSE_ONLY:
@@ -400,7 +423,24 @@ def classify_and_format_offer(offer: PublicOffer, now: datetime) -> FormattedOff
         elif any(a.state is MatchState.UNSTATED for a in offer.assumptions):
             reasons.append("Unstated borrower criteria in source publication")
         elif offer.conditions:
-            reasons.append("Conditional discount or relationship requirement")
+            cond_reasons: list[str] = []
+            for cond in offer.conditions:
+                if cond.kind is ConditionKind.BORROWER_REQUIREMENT:
+                    cond_reasons.append("Borrower eligibility requirement")
+                elif cond.kind is ConditionKind.AUTOPAY:
+                    cond_reasons.append("Autopay discount condition")
+                elif cond.kind is ConditionKind.RELATIONSHIP:
+                    cond_reasons.append("Account relationship condition")
+                elif cond.kind is ConditionKind.DISCOUNT:
+                    cond_reasons.append("Conditional discount")
+                elif cond.kind is ConditionKind.TIER:
+                    cond_reasons.append("Tier qualification condition")
+                elif cond.kind is ConditionKind.AS_LOW_AS:
+                    cond_reasons.append("As-low-as qualification condition")
+                else:
+                    cond_reasons.append(f"Condition: {cond.kind.value.replace('_', ' ')}")
+            for r in dict.fromkeys(cond_reasons):
+                reasons.append(r)
         else:
             reasons.append("Browse-only publication status")
     if any(a.state is MatchState.CONFLICTS for a in offer.assumptions):
@@ -409,11 +449,15 @@ def classify_and_format_offer(offer: PublicOffer, now: datetime) -> FormattedOff
     is_comparable = len(reasons) == 0 and offer.placement is Placement.RANKED
     separation_reason = "; ".join(reasons) if reasons else ""
 
-    note_rate_display = (
-        f"As low as {note_rate:.3f}%"
-        if (note_rate is not None and offer.headline_is_as_low_as)
-        else (f"{note_rate:.3f}%" if note_rate is not None else "Not published")
-    )
+    if note_rate is not None:
+        base_rate_str = (
+            f"As low as {note_rate:.3f}%" if offer.headline_is_as_low_as else f"{note_rate:.3f}%"
+        )
+        note_rate_display = f"{base_rate_str} ({intro_label})" if intro_label else base_rate_str
+    elif intro_label:
+        note_rate_display = f"Post-intro not published ({intro_label})"
+    else:
+        note_rate_display = "Not published"
     apr_display = f"{apr:.3f}%" if apr is not None else "Not published"
     points_display = f"{offer.points:.3f}" if offer.points is not None else "Not published"
     term_display = format_term(offer)
@@ -461,6 +505,7 @@ def classify_and_format_offer(offer: PublicOffer, now: datetime) -> FormattedOff
         draw_period_months=draw_period,
         repayment_period_months=repay_period,
         structure_label=structure_label,
+        intro_rate_display=intro_label,
     )
 
 
