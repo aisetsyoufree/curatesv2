@@ -399,6 +399,113 @@ def test_registering_concurrently_with_abort_never_leaves_a_live_socket() -> Non
         assert all(s.fileno() == -1 for s in socks) and not run._sockets
 
 
+def test_tls_wrap_racing_an_abort_closes_both_sockets_and_no_unrelated_descriptor() -> None:
+    run = fetch_dialer._Run(60)
+    raw = socket.socket()
+    run.register(raw)
+    bystander = socket.socket()  # an unrelated descriptor that must survive
+    context = ssl.create_default_context()
+    aborter = threading.Thread(target=run.abort)
+
+    def wrap(sock: socket.socket) -> socket.socket:
+        wrapped = context.wrap_socket(sock, server_hostname=HOST, do_handshake_on_connect=False)
+        aborter.start()  # abort lands between wrapping and registration
+        time.sleep(0.2)
+        return wrapped
+
+    secured = run.adopt_tls(raw, wrap)
+    aborter.join()
+    assert secured.fileno() == -1 and raw.fileno() == -1 and not run._sockets
+    assert bystander.fileno() != -1
+    bystander.close()
+
+
+def test_tls_wrap_after_the_run_is_sealed_never_wraps_and_closes_the_raw_socket() -> None:
+    run = fetch_dialer._Run(60)
+    raw = socket.socket()
+    run.register(raw)
+    run.abort()
+    wrapped: list[socket.socket] = []
+
+    def wrap(sock: socket.socket) -> socket.socket:
+        wrapped.append(sock)
+        return sock
+
+    with pytest.raises(httpcore.ConnectTimeout):
+        run.adopt_tls(raw, wrap)
+    assert not wrapped and raw.fileno() == -1
+
+
+def test_request_racing_transport_close_is_refused_and_sends_nothing(
+    lab: Lab, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = lab.serve(lambda conn, path: reply(conn))
+    transport = lab.transport(server)
+    real_pool = httpcore.ConnectionPool
+
+    def pool_then_close(*args: Any, **kwargs: Any) -> httpcore.ConnectionPool:
+        transport.close()  # lands after the request began, before it registers
+        return real_pool(*args, **kwargs)
+
+    monkeypatch.setattr(httpcore, "ConnectionPool", pool_then_close)
+    with pytest.raises(httpx.TransportError):
+        transport.handle_request(httpx.Request("GET", url_for(server)))
+    assert not transport._runs and not server.requests
+
+
+def test_a_closed_transport_refuses_every_later_request(lab: Lab) -> None:
+    server = lab.serve(lambda conn, path: reply(conn))
+    transport = lab.transport(server)
+    transport.close()
+    with pytest.raises(httpx.TransportError):
+        transport.handle_request(httpx.Request("GET", url_for(server)))
+    assert not server.requests
+
+
+def test_keyboard_interrupt_during_connect_releases_the_socket_and_the_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created: list[socket.socket] = []
+    real_socket = socket.socket
+
+    def tracking(*args: Any, **kwargs: Any) -> socket.socket:
+        created.append(real_socket(*args, **kwargs))
+        return created[-1]
+
+    def interrupt(self: socket.socket, address: Any) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(socket, "socket", tracking)
+    monkeypatch.setattr(real_socket, "connect", interrupt, raising=False)
+    transport = PinnedTransport([ipaddress.ip_address("8.8.8.8")], total_timeout=20)
+    with pytest.raises(KeyboardInterrupt):
+        transport.handle_request(httpx.Request("GET", f"https://{HOST}/"))
+    assert created and all(s.fileno() == -1 for s in created)
+    assert not transport._runs
+
+
+def test_keyboard_interrupt_from_the_pool_finishes_the_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runs: list[fetch_dialer._Run] = []
+    real_start = fetch_dialer._Run.start
+
+    def start(self: fetch_dialer._Run) -> None:
+        runs.append(self)
+        real_start(self)
+
+    def interrupt(self: httpcore.ConnectionPool, request: Any) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(fetch_dialer._Run, "start", start)
+    monkeypatch.setattr(httpcore.ConnectionPool, "handle_request", interrupt)
+    transport = PinnedTransport([ipaddress.ip_address("8.8.8.8")], total_timeout=20)
+    with pytest.raises(KeyboardInterrupt):
+        transport.handle_request(httpx.Request("GET", f"https://{HOST}/"))
+    (run,) = runs
+    assert run._state == run._CLOSED and not transport._runs
+
+
 def test_closing_the_transport_wakes_a_blocked_tls_read(lab: Lab) -> None:
     def stall(conn: ssl.SSLSocket, path: str) -> None:
         conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n")

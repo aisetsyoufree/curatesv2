@@ -166,6 +166,32 @@ class _Run:
         _sever(sock)
         raise httpcore.ConnectTimeout("total time limit exceeded")
 
+    def adopt_tls(
+        self, raw: socket.socket, wrap: Callable[[socket.socket], socket.socket]
+    ) -> socket.socket:
+        """Replace the tracked raw socket with its TLS wrapper in one locked step.
+
+        Wrapping detaches the raw socket's descriptor, so the run must never hold a window
+        where neither object is tracked (the watchdog would miss it) or where it closes by
+        descriptor number. Everything is closed by object, and only while this run still owns
+        ``raw``; otherwise ``raw`` is closed and nothing is wrapped. The wrap is non-blocking
+        (the handshake happens afterwards, on the tracked TLS socket).
+        """
+        with self._lock:
+            if self._state == self._OPEN and self.remaining() > 0 and raw in self._sockets:
+                index = self._sockets.index(raw)
+                try:
+                    secured = wrap(raw)
+                except BaseException:
+                    self._sockets.pop(index)
+                    raise
+                self._sockets[index] = secured
+                return secured
+            with contextlib.suppress(ValueError):
+                self._sockets.remove(raw)
+        _sever(raw)
+        raise httpcore.ConnectTimeout("total time limit exceeded")
+
     def _seal(self, state: str) -> list[socket.socket]:
         """Atomically move out of open (once) and take ownership of every tracked socket."""
         with self._lock:
@@ -245,19 +271,23 @@ class _PinnedStream(httpcore.NetworkStream):
             or ssl_context.verify_mode is not ssl.CERT_REQUIRED
             or not ssl_context.check_hostname
         ):
-            self._sock.close()
+            self._drop(None)
             raise PinViolation("TLS must verify the original hostname")
         run = self._backend.run
-        secured: ssl.SSLSocket | None = None
+        secured: socket.socket | None = None
         try:
-            secured = ssl_context.wrap_socket(
-                self._sock, server_hostname=server_hostname, do_handshake_on_connect=False
+            secured = run.adopt_tls(
+                self._sock,
+                lambda raw: ssl_context.wrap_socket(
+                    raw, server_hostname=server_hostname, do_handshake_on_connect=False
+                ),
             )
-            run.register(secured)
             # One call, bounded by what is left of the single deadline.
             secured.settimeout(run.bound(timeout))
-            secured.do_handshake()
+            secured.do_handshake()  # type: ignore[attr-defined]
+            return self._backend.accept(_PinnedStream(secured, self._backend))
         except httpcore.ConnectTimeout:
+            self._drop(secured)
             raise
         except TimeoutError as exc:
             self._drop(secured)
@@ -268,7 +298,6 @@ class _PinnedStream(httpcore.NetworkStream):
         except BaseException:
             self._drop(secured)
             raise
-        return self._backend.accept(_PinnedStream(secured, self._backend))
 
     def get_extra_info(self, info: str) -> Any:
         sock = self._sock
@@ -348,6 +377,10 @@ class _PinnedBackend(httpcore.NetworkBackend):
                 _sever(sock)
                 failure = httpcore.ConnectError(str(exc))
                 continue
+            except BaseException:
+                self.run.forget(sock)
+                _sever(sock)
+                raise
             return self.accept(_PinnedStream(sock, self))
         raise failure if failure is not None else PinViolation("no pinned address")
 
@@ -483,6 +516,7 @@ class PinnedTransport(httpx.BaseTransport):
         self._override = test_override
         self._runs: set[_Run] = set()
         self._runs_lock = threading.Lock()
+        self._closed = False  # guarded by _runs_lock
 
     def _finish(self, run: _Run) -> None:
         with self._runs_lock:
@@ -490,8 +524,9 @@ class PinnedTransport(httpx.BaseTransport):
         run.abort()
 
     def close(self) -> None:
-        """Sever every outstanding request, including streaming bodies not yet closed."""
+        """Seal the transport and sever every outstanding request, streaming bodies included."""
         with self._runs_lock:
+            self._closed = True  # sealed for good: later requests are refused
             runs = list(self._runs)
         for run in runs:
             self._finish(run)
@@ -547,9 +582,13 @@ class PinnedTransport(httpx.BaseTransport):
         )
         run.pool = pool
         with self._runs_lock:
+            if self._closed:
+                # Sealed: a request that raced close() must not dial or send anything.
+                run.abort()
+                raise httpx.TransportError("transport is closed")
             self._runs.add(run)
-        run.start()
         try:
+            run.start()
             response = pool.handle_request(core_request)
         except Exception as exc:
             mapped = _map_error(exc, run)  # before sealing, so a sealed run is not "expired"
@@ -557,24 +596,32 @@ class PinnedTransport(httpx.BaseTransport):
             if mapped is exc:
                 raise
             raise mapped from exc
-        if run.expired:
+        except BaseException:
+            self._finish(run)  # KeyboardInterrupt etc.: release everything, re-raise unchanged
+            raise
+        try:
+            if run.expired:
+                with contextlib.suppress(Exception):
+                    response.close()
+                raise httpx.ReadTimeout("total time limit exceeded")
+            body = _GuardedBody(
+                response,
+                lambda: self._finish(run),
+                run,
+                self._max_bytes,
+                _is_encoded(response.headers),
+            )
+            return httpx.Response(
+                status_code=response.status,
+                headers=response.headers,
+                stream=body,
+                extensions=response.extensions,
+            )
+        except BaseException:
             with contextlib.suppress(Exception):
                 response.close()
             self._finish(run)
-            raise httpx.ReadTimeout("total time limit exceeded")
-        body = _GuardedBody(
-            response,
-            lambda: self._finish(run),
-            run,
-            self._max_bytes,
-            _is_encoded(response.headers),
-        )
-        return httpx.Response(
-            status_code=response.status,
-            headers=response.headers,
-            stream=body,
-            extensions=response.extensions,
-        )
+            raise
 
 
 def _is_ip_literal(host: str) -> bool:
