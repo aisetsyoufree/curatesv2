@@ -64,9 +64,8 @@ metadata = MetaData()
 # Primary-key columns of every append-only table, in constraint order. The
 # replace guard aborts when this key is already present. SQLite otherwise
 # implements REPLACE as a delete plus an insert and skips the delete trigger
-# unless recursive_triggers is enabled. Roster tables also name every extra
-# unique key in ROSTER_CONFLICT_KEYS, because REPLACE can delete through
-# artifact_id without matching the primary key.
+# unless recursive_triggers is enabled. Alternate unique keys are enumerated
+# below too: a conflict on any one of them can replace history.
 APPEND_ONLY_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "fetch_runs": ("run_id",),
     "not_modified_observations": ("run_id",),
@@ -100,12 +99,15 @@ APPEND_ONLY_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "roster_imports": ("import_id",),
     "roster_import_entries": ("import_id", "charter_number"),
 }
-# Every unique conflict key on the roster history tables. A completed import
-# stays sealed when any of these keys already exists: REPLACE must not delete
-# the row through artifact_id and leave its entries orphaned.
-ROSTER_CONFLICT_KEYS: dict[str, tuple[tuple[str, ...], ...]] = {
-    "roster_imports": (("import_id",), ("artifact_id",)),
-    "roster_import_entries": (("import_id", "charter_number"),),
+# All alternate UNIQUE constraints on append-only tables, including the
+# institution-bound keys that contain a primary key. Keep this inventory in
+# sync with metadata; tests also inspect the deployed SQLite unique indexes.
+APPEND_ONLY_ALTERNATE_KEYS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "fetch_runs": (("run_id", "source_id"),),
+    "artifact_observations": (("fetch_run_id", "artifact_id"),),
+    "provenance": (("institution_charter", "provenance_id"),),
+    "verified_scenario_statements": (("offer_id", "dimension", "fetch_run_id"),),
+    "roster_imports": (("artifact_id",),),
 }
 APPEND_ONLY_TABLES = frozenset(APPEND_ONLY_PRIMARY_KEYS)
 # Offers may change lifecycle columns. They still cannot be replaced, because
@@ -971,7 +973,7 @@ def _append_only_message(table: str) -> str:
 
 def _conflict_predicate(table_name: str, keys: tuple[str, ...]) -> str:
     """SQL boolean that is true when ``NEW`` hits any unique conflict key."""
-    groups = ROSTER_CONFLICT_KEYS.get(table_name, (keys,))
+    groups = (keys, *APPEND_ONLY_ALTERNATE_KEYS.get(table_name, ()))
     parts = [" AND ".join(f"{column} = NEW.{column}" for column in group) for group in groups]
     if len(parts) == 1:
         return parts[0]
@@ -983,8 +985,8 @@ def schema_triggers(tables: Iterable[str] | None = None) -> tuple[tuple[str, str
 
     Update and delete triggers reject ordinary mutation. The insert trigger
     rejects ``REPLACE`` even when ``recursive_triggers`` is off, because the
-    conflicting row is still visible to ``BEFORE INSERT``. Roster replace
-    guards name every unique key, not only the primary key.
+    conflicting row is still visible to ``BEFORE INSERT``. Replace guards
+    name every unique key, not only the primary key.
     """
     target_tables: frozenset[str] | None = frozenset(tables) if tables is not None else None
     if target_tables is None:
