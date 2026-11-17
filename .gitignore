@@ -31,3 +31,6 @@ playwright/.cache/
 node_modules/
 dist/
 site/
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,22 @@
+name: Task / story
+description: A unit of planned work with acceptance criteria
+labels: []
+body:
+  - type: textarea
+    id: story
+    attributes: {label: Story, description: What and why}
+    validations: {required: true}
+  - type: input
+    id: dependencies
+    attributes: {label: Dependencies, placeholder: "T010, T012"}
+  - type: textarea
+    id: acceptance
+    attributes: {label: Acceptance criteria}
+    validations: {required: true}
+  - type: textarea
+    id: nongoals
+    attributes: {label: Non-goals and allowed change scope}
+  - type: textarea
+    id: verification
+    attributes: {label: Verification, description: Exact commands or required evidence}
+    validations: {required: true}

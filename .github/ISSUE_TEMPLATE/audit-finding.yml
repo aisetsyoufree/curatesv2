@@ -1,0 +1,16 @@
+name: Audit finding
+description: A defect found by an independent review or audit
+labels: [audit-finding]
+body:
+  - type: input
+    id: source
+    attributes: {label: Reviewer and commit reviewed, placeholder: "GPT read-only, main abc1234"}
+    validations: {required: true}
+  - type: textarea
+    id: findings
+    attributes: {label: "Findings (severity, file:line, failure scenario, suggested fix)"}
+    validations: {required: true}
+  - type: textarea
+    id: acceptance
+    attributes: {label: Acceptance criteria, description: Each finding needs a failing-then-passing test}
+    validations: {required: true}
