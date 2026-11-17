@@ -10,13 +10,16 @@ Group=cu-rates
 WorkingDirectory=/var/lib/cu-rates/app
 EnvironmentFile=-/etc/cu-rates/cu-rates.env
 
-ExecStart=/var/lib/cu-rates/venv/bin/gunicorn --bind 127.0.0.1:8000 --workers 3 --threads 2 --worker-class gthread --access-logfile - --error-logfile - "cu_rates.web.app:create_app()"
+ExecStart=/var/lib/cu-rates/venv/bin/gunicorn --bind 127.0.0.1:8000 --workers 3 --threads 2 --worker-class gthread --access-logfile - --access-logformat '%(h)s %(l)s %(u)s %(t)s "%(m)s %(U)s %(H)s" %(s)s %(b)s "%(f)s" "%(a)s"' --error-logfile - "cu_rates.web.app:create_app()"
 ExecReload=/bin/kill -s HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
 
 RuntimeDirectory=cu-rates-web
 RuntimeDirectoryMode=0755
+StateDirectory=cu-rates
+LogsDirectory=cu-rates
+UMask=0077
 
 # Hardening
 NoNewPrivileges=true
@@ -30,6 +33,16 @@ RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
+PrivateDevices=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
 
 # Filesystem Access: Web process reads published snapshots and app code only.
 # It NEVER opens or references the worker database (/var/lib/cu-rates/data).

@@ -18,6 +18,9 @@ RestartSec=30s
 
 RuntimeDirectory=cu-rates-worker
 RuntimeDirectoryMode=0750
+StateDirectory=cu-rates
+LogsDirectory=cu-rates
+UMask=0077
 
 # Hardening
 NoNewPrivileges=true
@@ -31,6 +34,16 @@ RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
+PrivateDevices=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
 
 # Filesystem Access: Worker writes to operational data, artifacts, and snapshots.
 ReadWritePaths=/var/lib/cu-rates/data /var/lib/cu-rates/artifacts /var/lib/cu-rates/snapshots /run/cu-rates-worker /tmp

@@ -1,29 +1,31 @@
 # CU-Rates.org V2 — Caddy Reverse Proxy Configuration
 # Behind Cloudflare Tunnel with no inbound router port (MASTER.md D-09).
-# Cloudflared handles edge TLS termination and routes traffic to loopback.
+# Cloudflared terminates edge TLS and routes plain HTTP to loopback port 8080.
 # No secrets are stored in this file.
 
+{
+    # Cloudflare Tunnel terminates TLS at edge; serve plain HTTP on loopback
+    auto_https off
+}
+
 # Canonical domain configuration
-cu-rates.org {
+http://cu-rates.org:8080 {
     # Listen only on loopback interface behind Cloudflare Tunnel (no external router port)
     bind 127.0.0.1
 
     # Reverse proxy to Gunicorn WSGI server on 127.0.0.1:8000
     reverse_proxy 127.0.0.1:8000 {
         header_up Host {host}
-        header_up X-Real-IP {remote_host}
-        header_up X-Forwarded-For {remote_host}
-        header_up X-Forwarded-Proto {scheme}
+        # CF-Connecting-IP provided by Cloudflare is forwarded as an opaque header only.
+        # The application must NOT trust CF-Connecting-IP or forwarded headers for security decisions.
+        header_up CF-Connecting-IP {header.CF-Connecting-IP}
+        header_up X-Forwarded-For {header.CF-Connecting-IP}
+        header_up X-Forwarded-Proto https
     }
 
-    # Security headers aligned with src/cu_rates/web/app.py
+    # Response headers: do NOT duplicate application security headers here
+    # (browser security headers are managed in src/cu_rates/web/app.py to prevent drift).
     header {
-        Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
-        X-Content-Type-Options "nosniff"
-        X-Frame-Options "DENY"
-        Referrer-Policy "strict-origin-when-cross-origin"
-        Permissions-Policy "geolocation=(), camera=(), microphone=(), payment=()"
-        Strict-Transport-Security "max-age=31536000; includeSubDomains"
         -Server
     }
 
@@ -39,7 +41,7 @@ cu-rates.org {
 }
 
 # Redirect www to apex canonical origin (MASTER.md §8: https://cu-rates.org)
-www.cu-rates.org {
+http://www.cu-rates.org:8080 {
     bind 127.0.0.1
     redir https://cu-rates.org{uri} permanent
 }

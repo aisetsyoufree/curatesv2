@@ -19,6 +19,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 APPLY=0
 DRY_RUN=1
+ADOPT=0
 
 usage() {
     cat <<EOF
@@ -30,6 +31,7 @@ Defaults to --dry-run. Refuses to apply any changes without --apply.
 Options:
     --dry-run   Simulate execution and print intended actions (default).
     --apply     Actually apply configuration and create filesystem layout.
+    --adopt     Proceed when CU_RATES_ROOT exists and is not empty without recursive chown.
     --help      Show this help message.
 
 Environment:
@@ -47,6 +49,10 @@ while [[ $# -gt 0 ]]; do
         --apply)
             APPLY=1
             DRY_RUN=0
+            shift
+            ;;
+        --adopt)
+            ADOPT=1
             shift
             ;;
         --help|-h)
@@ -98,6 +104,14 @@ validate_path() {
 }
 validate_path "${NVME_ROOT}"
 
+# Guard against existing non-empty root directory unless --adopt is given
+if [[ -d "${NVME_ROOT}" ]] && [[ "${ADOPT}" -ne 1 ]]; then
+    if [[ -n "$(ls -A "${NVME_ROOT}" 2>/dev/null)" ]]; then
+        echo "Error: Root directory '${NVME_ROOT}' exists and is not empty. Refusing to proceed unless --adopt is specified." >&2
+        exit 1
+    fi
+fi
+
 # 2. User & group creation (unprivileged, system service account)
 create_user() {
     if id "${APP_USER}" >/dev/null 2>&1; then
@@ -110,6 +124,7 @@ create_user() {
 create_user
 
 # 3. Create disk layout under single NVMe root
+# Only chown directories that were created; never recursively chown an existing directory.
 DIRS=(
     "${NVME_ROOT}"
     "${NVME_ROOT}/app"
@@ -129,15 +144,14 @@ for dir in "${DIRS[@]}"; do
         echo "Directory '${dir}' already exists."
     else
         run_action "create directory '${dir}'" mkdir -p "${dir}"
+        run_action "set ownership of created directory '${dir}' to ${APP_USER}:${APP_GROUP}" \
+            chown "${APP_USER}:${APP_GROUP}" "${dir}"
     fi
 done
 
-# Restrictive permissions and ownership
-run_action "set ownership of '${NVME_ROOT}' to ${APP_USER}:${APP_GROUP}" \
-    chown -R "${APP_USER}:${APP_GROUP}" "${NVME_ROOT}" 2>/dev/null || true
-
+# Restrictive permissions on data directories (fail loudly in apply mode)
 run_action "set 0750 permissions on data directories" \
-    chmod 0750 "${NVME_ROOT}/data" "${NVME_ROOT}/artifacts" "${NVME_ROOT}/backups" 2>/dev/null || true
+    chmod 0750 "${NVME_ROOT}/data" "${NVME_ROOT}/artifacts" "${NVME_ROOT}/backups"
 
 # 4. Install environment template if /etc/cu-rates/cu-rates.env does not exist
 ENV_FILE="${CONFIG_DIR}/cu-rates.env"
@@ -145,7 +159,7 @@ if [[ -f "${ENV_FILE}" ]]; then
     echo "Configuration '${ENV_FILE}' already exists (not overwriting)."
 else
     run_action "install environment file template to '${ENV_FILE}' (mode 0600)" \
-        install -m 0600 -o "${APP_USER}" -g "${APP_GROUP}" "${SCRIPT_DIR}/env.example" "${ENV_FILE}" 2>/dev/null || true
+        install -m 0600 -o "${APP_USER}" -g "${APP_GROUP}" "${SCRIPT_DIR}/env.example" "${ENV_FILE}"
 fi
 
 # 5. Install systemd units
@@ -160,24 +174,24 @@ for unit in "${UNITS[@]}"; do
     dst="${SYSTEMD_DIR}/${unit}"
     if [[ -f "${src}" ]]; then
         run_action "install systemd unit '${unit}' to '${SYSTEMD_DIR}'" \
-            install -m 0644 "${src}" "${dst}" 2>/dev/null || true
+            install -m 0644 "${src}" "${dst}"
     fi
 done
 
 # 6. Service activation policy (D-15)
 # Web service: enabled to start on boot
 run_action "reload systemd daemon" \
-    systemctl daemon-reload 2>/dev/null || true
+    systemctl daemon-reload
 
 run_action "enable cu-rates-web.service (starts on boot)" \
-    systemctl enable cu-rates-web.service 2>/dev/null || true
+    systemctl enable cu-rates-web.service
 
 # Worker service and timer: INSTALLED DISABLED per MASTER.md decision D-15
 run_action "ensure cu-rates-worker.service is disabled (D-15)" \
-    systemctl disable cu-rates-worker.service 2>/dev/null || true
+    systemctl disable cu-rates-worker.service
 
 run_action "ensure cu-rates-worker.timer is disabled (D-15)" \
-    systemctl disable cu-rates-worker.timer 2>/dev/null || true
+    systemctl disable cu-rates-worker.timer
 
 # 7. Safety check: never touch existing host services
 echo "Notice: Existing host services, Caddy sites, and other system units were NOT modified."

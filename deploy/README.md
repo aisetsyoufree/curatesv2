@@ -6,10 +6,10 @@
 >
 > **REQUIRED OWNER APPROVALS BEFORE LIVE EXECUTION:**
 > 1. **Product Owner Approval:** Formal review and approval of the deployment plan and target environment.
-> 2. **Host Review:** Review of the existing services currently running on the Raspberry Pi 5 to confirm isolated port allocations (127.0.0.1:8000 for Gunicorn), dedicated service user (`cu-rates`), and NVMe filesystem capacity.
+> 2. **Host Review:** Review of the existing services currently running on the Raspberry Pi 5 to confirm isolated port allocations (127.0.0.1:8080 for Caddy reverse proxy, 127.0.0.1:8000 for Gunicorn), dedicated service user (`cu-rates`), and NVMe filesystem capacity.
 > 3. **Counsel / Policy Clearance:** Verification of data collection and terms boundaries per `MASTER.md` §5 before any collection enablement.
 > 4. **Worker Transport Restriction (Decision D-15):** The worker service and timer MUST remain **INSTALLED DISABLED**. Live collection is prohibited until the gateway pinned dialer (issue #68) is implemented, reviewed, and approved.
-> 5. **Cloudflare Tunnel Routing:** Verification of the `cloudflared` tunnel ingress configuration routing `cu-rates.org` to the local Caddy reverse proxy without inbound router ports (`MASTER.md` D-09).
+> 5. **Cloudflare Tunnel Routing:** Verification of the `cloudflared` tunnel ingress configuration routing `cu-rates.org` to the local Caddy reverse proxy on loopback port 8080 (`http://127.0.0.1:8080`) without inbound router ports (`MASTER.md` D-09). Caddy in turn proxies traffic to Gunicorn on `127.0.0.1:8000`.
 
 ---
 
@@ -25,7 +25,7 @@
   - `caddy` (version 2.7+ HTTP reverse proxy)
   - `cloudflared` (Cloudflare Tunnel daemon, edge-authenticated)
   - `git`
-- **Host Co-existence:** Other services already run on this Pi 5. CU-Rates runs under an isolated unprivileged user (`cu-rates`) and binds strictly to loopback (`127.0.0.1:8000`), ensuring zero port collisions and zero interference with host services.
+- **Host Co-existence:** Other services already run on this Pi 5. CU-Rates runs under an isolated unprivileged user (`cu-rates`) and binds strictly to loopback (`127.0.0.1:8080` for Caddy and `127.0.0.1:8000` for Gunicorn), ensuring zero port collisions and zero interference with host services.
 
 ---
 
@@ -55,7 +55,7 @@ All persistent data, code, virtual environments, and evidence artifacts reside u
 ### Architectural Isolation Principles (`MASTER.md` §6, §7)
 - **Separation of Web and Worker:** The web service process (`cu-rates-web.service`) **NEVER opens or references the worker database** (`/var/lib/cu-rates/data`). The web process reads only verified public snapshots (`/var/lib/cu-rates/snapshots/`) and static application code.
 - **Unprivileged Execution:** All services execute as the dedicated system user `cu-rates` (group `cu-rates`) with no interactive shell (`/usr/sbin/nologin`).
-- **Hardened Sandboxing:** Systemd units enforce `ProtectSystem=strict`, `ProtectHome=true`, `PrivateTmp=true`, `NoNewPrivileges=true`, kernel tunables protection, strict `ReadWritePaths`, and resource quotas (`MemoryMax`, `TasksMax`, `CPUQuota`).
+- **Hardened Sandboxing:** Systemd units enforce `ProtectSystem=strict`, `ProtectHome=true`, `PrivateTmp=true`, `NoNewPrivileges=true`, `PrivateDevices=true`, `ProtectClock=true`, `ProtectHostname=true`, `ProtectProc=invisible`, `ProcSubset=pid`, `CapabilityBoundingSet=` (empty), `AmbientCapabilities=` (empty), `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`, `SystemCallArchitectures=native`, `SystemCallFilter=@system-service`, `UMask=0077`, kernel tunables protection, strict `ReadWritePaths`, and resource quotas (`MemoryMax`, `TasksMax`, `CPUQuota`).
 
 ---
 
@@ -82,9 +82,11 @@ Execute idempotent provisioning:
 ```bash
 sudo bash deploy/install.sh --apply
 ```
+*(If `/var/lib/cu-rates` already exists and is non-empty, pass `--adopt` to proceed without recursive chown).*
+
 This step:
 - Creates the unprivileged `cu-rates` user and group.
-- Creates the layout under `/var/lib/cu-rates` with safe ownership and permissions.
+- Creates the layout under `/var/lib/cu-rates` with safe ownership and permissions (chowning only what is created; never running `chown -R` on existing directories).
 - Copies `deploy/env.example` to `/etc/cu-rates/cu-rates.env` (mode 0600) if not present.
 - Installs `cu-rates-web.service`, `cu-rates-worker.service`, and `cu-rates-worker.timer` into `/etc/systemd/system/`.
 - Enables `cu-rates-web.service` on boot.
@@ -104,12 +106,24 @@ sudo nano /etc/cu-rates/cu-rates.env
 # Ensure mode 0600 is retained:
 sudo chmod 0600 /etc/cu-rates/cu-rates.env
 ```
+> **Note on Environment Variables:** The Flask application in `src/cu_rates/web/` does NOT read environment variables today (`create_app` takes an explicit configuration dictionary). Therefore, application variables in `/etc/cu-rates/cu-rates.env` (such as `CANONICAL_ORIGIN`, `ENABLE_ANALYTICS`, `CU_RATES_SNAPSHOT_DIR`) currently have no effect until environment-to-config wiring is implemented in task T055. Only `GUNICORN_CMD_ARGS` is read by Gunicorn directly.
 
-### Step 6: Configure Caddy Reverse Proxy
-Integrate `deploy/caddy/Caddyfile` into Caddy's configuration:
+### Step 6: Configure Caddy Reverse Proxy & Cloudflare Tunnel
+1. Integrate `deploy/caddy/Caddyfile` into Caddy's configuration:
 ```bash
 sudo cp deploy/caddy/Caddyfile /etc/caddy/conf.d/cu-rates.caddyfile
 sudo systemctl reload caddy
+```
+Caddy listens on loopback plain HTTP port 8080 (`http://127.0.0.1:8080`) with `auto_https off` and proxies upstream to Gunicorn on `127.0.0.1:8000`.
+
+2. In Cloudflare Tunnel (`cloudflared` configuration), configure ingress to route `cu-rates.org` to Caddy at `http://127.0.0.1:8080`:
+```yaml
+ingress:
+  - hostname: cu-rates.org
+    service: http://127.0.0.1:8080
+  - hostname: www.cu-rates.org
+    service: http://127.0.0.1:8080
+  - service: http_status:404
 ```
 
 ### Step 7: Start Web Service
