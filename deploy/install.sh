@@ -200,7 +200,7 @@ if [[ "${APPLY}" -eq 1 ]]; then
     echo "=== Installation Applied Successfully ==="
     echo "Next steps for operator:"
     echo "1. Review and populate /etc/cu-rates/cu-rates.env"
-    echo "2. Build venv using: uv sync --locked --no-dev --group deploy"
+    echo "2. Build venv using: UV_PROJECT_ENVIRONMENT=${NVME_ROOT}/venv uv sync --locked --no-dev --group deploy"
     echo "3. Configure Caddy: copy deploy/caddy/Caddyfile to /etc/caddy/conf.d/cu-rates.caddyfile"
     echo "4. Start web service: sudo systemctl start cu-rates-web.service"
     echo "5. Note: Worker timer remains DISABLED per MASTER.md D-15."

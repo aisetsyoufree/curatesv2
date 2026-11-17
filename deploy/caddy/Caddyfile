@@ -19,7 +19,6 @@ http://cu-rates.org:8080 {
         # CF-Connecting-IP provided by Cloudflare is forwarded as an opaque header only.
         # The application must NOT trust CF-Connecting-IP or forwarded headers for security decisions.
         header_up CF-Connecting-IP {header.CF-Connecting-IP}
-        header_up X-Forwarded-For {header.CF-Connecting-IP}
         header_up X-Forwarded-Proto https
     }
 
@@ -29,14 +28,10 @@ http://cu-rates.org:8080 {
         -Server
     }
 
-    # Structured access logging
+    # Access logging: disabled at Caddy proxy layer to avoid logging raw URI query strings;
+    # structured query-free access logging is handled upstream by Gunicorn in cu-rates-web.service.
     log {
-        output file /var/log/caddy/cu-rates-access.log {
-            roll_size 10MiB
-            roll_keep 5
-            roll_keep_for 90d
-        }
-        format json
+        output discard
     }
 }
 

@@ -13,8 +13,7 @@ EnvironmentFile=-/etc/cu-rates/cu-rates.env
 # Live collection is DISABLED per MASTER.md decision D-15 until gateway pinned dialer is implemented.
 # ExecStart fails safely if invoked while live collection remains unapproved.
 ExecStart=/var/lib/cu-rates/venv/bin/python -c "import sys; print('Worker execution disabled per MASTER.md D-15: live collection not approved.', file=sys.stderr); sys.exit(1)"
-Restart=on-failure
-RestartSec=30s
+Restart=no
 
 RuntimeDirectory=cu-rates-worker
 RuntimeDirectoryMode=0750

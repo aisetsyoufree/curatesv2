@@ -53,7 +53,7 @@ All persistent data, code, virtual environments, and evidence artifacts reside u
 ```
 
 ### Architectural Isolation Principles (`MASTER.md` §6, §7)
-- **Separation of Web and Worker:** The web service process (`cu-rates-web.service`) **NEVER opens or references the worker database** (`/var/lib/cu-rates/data`). The web process reads only verified public snapshots (`/var/lib/cu-rates/snapshots/`) and static application code.
+- **Separation of Web and Worker:** The web service process (`cu-rates-web.service`) **NEVER opens or references the worker database** (`/var/lib/cu-rates/data`). The web process reads only verified public snapshots (`/var/lib/cu-rates/snapshots/`) and static application code. Inaccessible paths are enforced in systemd (`InaccessiblePaths=/var/lib/cu-rates/data /var/lib/cu-rates/artifacts /var/lib/cu-rates/backups`) and `StateDirectory` is omitted from the web unit so it cannot write application data.
 - **Unprivileged Execution:** All services execute as the dedicated system user `cu-rates` (group `cu-rates`) with no interactive shell (`/usr/sbin/nologin`).
 - **Hardened Sandboxing:** Systemd units enforce `ProtectSystem=strict`, `ProtectHome=true`, `PrivateTmp=true`, `NoNewPrivileges=true`, `PrivateDevices=true`, `ProtectClock=true`, `ProtectHostname=true`, `ProtectProc=invisible`, `ProcSubset=pid`, `CapabilityBoundingSet=` (empty), `AmbientCapabilities=` (empty), `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`, `SystemCallArchitectures=native`, `SystemCallFilter=@system-service`, `UMask=0077`, kernel tunables protection, strict `ReadWritePaths`, and resource quotas (`MemoryMax`, `TasksMax`, `CPUQuota`).
 
@@ -72,17 +72,17 @@ cd /var/lib/cu-rates/app
 ```
 
 ### Step 2: Preview Installation (Dry-Run)
-Inspect the planned actions without modifying the system:
+Inspect the planned actions without modifying the system (pass `--adopt` because Step 1 cloned into `/var/lib/cu-rates/app`, creating a non-empty root):
 ```bash
-sudo bash deploy/install.sh --dry-run
+sudo bash deploy/install.sh --dry-run --adopt
 ```
 
 ### Step 3: Apply Filesystem and Service Setup
-Execute idempotent provisioning:
+Execute idempotent provisioning adopting the existing repository tree:
 ```bash
-sudo bash deploy/install.sh --apply
+sudo bash deploy/install.sh --apply --adopt
 ```
-*(If `/var/lib/cu-rates` already exists and is non-empty, pass `--adopt` to proceed without recursive chown).*
+*(Passing `--adopt` instructs `install.sh` to safely adopt `/var/lib/cu-rates` and its existing `/var/lib/cu-rates/app` clone without failing on the non-empty root guard).*
 
 This step:
 - Creates the unprivileged `cu-rates` user and group.
@@ -93,10 +93,10 @@ This step:
 - **Explicitly ensures `cu-rates-worker.service` and `cu-rates-worker.timer` remain DISABLED per Decision D-15.**
 
 ### Step 4: Provision Virtual Environment
-Install production dependencies including Gunicorn into the isolated venv:
+Install production dependencies including Gunicorn into the isolated venv at `/var/lib/cu-rates/venv`:
 ```bash
 cd /var/lib/cu-rates/app
-sudo -u cu-rates uv sync --locked --no-dev --group deploy
+sudo -u cu-rates UV_PROJECT_ENVIRONMENT=/var/lib/cu-rates/venv uv sync --locked --no-dev --group deploy
 ```
 
 ### Step 5: Configure Environment
@@ -114,7 +114,7 @@ sudo chmod 0600 /etc/cu-rates/cu-rates.env
 sudo cp deploy/caddy/Caddyfile /etc/caddy/conf.d/cu-rates.caddyfile
 sudo systemctl reload caddy
 ```
-Caddy listens on loopback plain HTTP port 8080 (`http://127.0.0.1:8080`) with `auto_https off` and proxies upstream to Gunicorn on `127.0.0.1:8000`.
+Caddy listens on loopback plain HTTP port 8080 (`http://127.0.0.1:8080`) with `auto_https off` and proxies upstream to Gunicorn on `127.0.0.1:8000`. Caddy access logging is discarded (`output discard`) to prevent query strings from being logged; Gunicorn handles query-free access logging.
 
 2. In Cloudflare Tunnel (`cloudflared` configuration), configure ingress to route `cu-rates.org` to Caddy at `http://127.0.0.1:8080`:
 ```yaml
@@ -148,7 +148,7 @@ Upgrades preserve operational state and snapshot data.
 
 2. **Update Virtual Environment:**
    ```bash
-   sudo -u cu-rates uv sync --locked --no-dev --group deploy
+   sudo -u cu-rates UV_PROJECT_ENVIRONMENT=/var/lib/cu-rates/venv uv sync --locked --no-dev --group deploy
    ```
 
 3. **Reload Systemd Units (if changed):**
@@ -181,7 +181,7 @@ To roll back application code to a prior commit:
 ```bash
 cd /var/lib/cu-rates/app
 sudo -u cu-rates git checkout <previous-tag-or-sha>
-sudo -u cu-rates uv sync --locked --no-dev --group deploy
+sudo -u cu-rates UV_PROJECT_ENVIRONMENT=/var/lib/cu-rates/venv uv sync --locked --no-dev --group deploy
 sudo systemctl restart cu-rates-web.service
 ```
 

@@ -46,7 +46,7 @@ def test_systemd_hardening_and_resource_limits() -> None:
         SYSTEMD_DIR / "cu-rates-worker.service",
     ]
 
-    required_keys = [
+    common_required_keys = [
         "NoNewPrivileges",
         "PrivateTmp",
         "ProtectSystem",
@@ -62,7 +62,6 @@ def test_systemd_hardening_and_resource_limits() -> None:
         "SystemCallArchitectures",
         "SystemCallFilter",
         "UMask",
-        "StateDirectory",
         "LogsDirectory",
         "ReadWritePaths",
         "MemoryMax",
@@ -75,7 +74,7 @@ def test_systemd_hardening_and_resource_limits() -> None:
         parsed = parse_systemd_unit(service_file)
         service_sec = parsed.get("Service", {})
 
-        for key in required_keys:
+        for key in common_required_keys:
             assert key in service_sec, f"{service_file.name} is missing required key '{key}'"
 
         # Assert hardening values
@@ -94,14 +93,23 @@ def test_systemd_hardening_and_resource_limits() -> None:
         assert service_sec["SystemCallArchitectures"] == ["native"]
         assert service_sec["SystemCallFilter"] == ["@system-service"]
         assert service_sec["UMask"] == ["0077"]
-        assert service_sec["StateDirectory"] == ["cu-rates"]
         assert service_sec["LogsDirectory"] == ["cu-rates"]
-        assert service_sec["Restart"] == ["on-failure"]
 
         # Assert resource limits are specified
         assert any("M" in limit or "G" in limit for limit in service_sec["MemoryMax"])
         assert any(int(tasks) > 0 for tasks in service_sec["TasksMax"])
         assert any("%" in quota for quota in service_sec["CPUQuota"])
+
+    # Service-specific checks
+    web_parsed = parse_systemd_unit(SYSTEMD_DIR / "cu-rates-web.service")
+    web_sec = web_parsed.get("Service", {})
+    assert "StateDirectory" not in web_sec, "cu-rates-web.service must not define StateDirectory"
+    assert web_sec["Restart"] == ["on-failure"]
+
+    worker_parsed = parse_systemd_unit(SYSTEMD_DIR / "cu-rates-worker.service")
+    worker_sec = worker_parsed.get("Service", {})
+    assert worker_sec["StateDirectory"] == ["cu-rates"]
+    assert worker_sec["Restart"] == ["no"], "cu-rates-worker.service must have Restart=no"
 
 
 def test_loopback_only_binding() -> None:
@@ -179,6 +187,68 @@ def test_web_unit_does_not_reference_worker_database() -> None:
     assert "/var/lib/cu-rates/app" in ro_paths
 
 
+def test_web_unit_cannot_write_app_data_and_inaccessible_paths() -> None:
+    """Verify that web unit cannot write app data: no StateDirectory, strict InaccessiblePaths."""
+    web_unit = parse_systemd_unit(SYSTEMD_DIR / "cu-rates-web.service")
+    service_sec = web_unit.get("Service", {})
+
+    # StateDirectory must be absent to prevent systemd from creating/granting write access
+    assert "StateDirectory" not in service_sec, (
+        "StateDirectory must be absent from web unit so it cannot write application data"
+    )
+
+    # InaccessiblePaths must block data, artifacts, and backup directories
+    inaccessible_entries = service_sec.get("InaccessiblePaths", [])
+    inaccessible_paths = [p for entry in inaccessible_entries for p in entry.split()]
+
+    required_inaccessible = [
+        "/var/lib/cu-rates/data",
+        "/var/lib/cu-rates/artifacts",
+        "/var/lib/cu-rates/backups",
+    ]
+    for req in required_inaccessible:
+        assert req in inaccessible_paths, (
+            f"cu-rates-web.service must have {req} in InaccessiblePaths"
+        )
+
+    # ReadWritePaths must strictly contain only ephemeral runtime dirs
+    rw_entries = service_sec.get("ReadWritePaths", [])
+    rw_paths = [p for entry in rw_entries for p in entry.split()]
+    for req in required_inaccessible:
+        assert req not in rw_paths, f"ReadWritePaths must not include {req}"
+    assert "/var/lib/cu-rates" not in rw_paths
+
+
+def test_execstart_binary_paths_match_readme_venv() -> None:
+    """Verify that ExecStart binaries in all units reside under the venv path in README."""
+    readme_content = (DEPLOY_DIR / "README.md").read_text(encoding="utf-8")
+
+    # Extract documented venv environment path from README
+    match = re.search(r"UV_PROJECT_ENVIRONMENT=([^\s]+)", readme_content)
+    assert match is not None, "README.md must document UV_PROJECT_ENVIRONMENT"
+    documented_venv = match.group(1)
+    assert documented_venv == "/var/lib/cu-rates/venv"
+    assert (
+        "UV_PROJECT_ENVIRONMENT=/var/lib/cu-rates/venv uv sync --locked --no-dev --group deploy"
+        in (readme_content)
+    )
+
+    # Verify each systemd service unit's ExecStart binary is under documented venv
+    service_files = [
+        SYSTEMD_DIR / "cu-rates-web.service",
+        SYSTEMD_DIR / "cu-rates-worker.service",
+    ]
+    for sf in service_files:
+        unit = parse_systemd_unit(sf)
+        exec_start_lines = unit.get("Service", {}).get("ExecStart", [])
+        assert exec_start_lines, f"{sf.name} is missing ExecStart"
+        binary = exec_start_lines[0].split()[0]
+        expected_prefix = f"{documented_venv}/bin/"
+        assert binary.startswith(expected_prefix), (
+            f"{sf.name} binary '{binary}' is not under documented venv '{expected_prefix}'"
+        )
+
+
 def test_install_script_syntax() -> None:
     """Verify that deploy/install.sh passes bash syntax validation."""
     install_sh = DEPLOY_DIR / "install.sh"
@@ -237,15 +307,17 @@ def test_install_script_apply_fails_loudly_on_error(tmp_path: Path) -> None:
         "CU_RATES_ROOT": str(test_root),
     }
 
-    # --apply must fail loudly when a command fails
+    # --apply must fail loudly when a command fails with exact exit code 1 and error output
     res_apply = subprocess.run(
         ["bash", str(install_sh), "--apply"],
         capture_output=True,
         text=True,
         env=env,
     )
-    assert res_apply.returncode != 0, "--apply must fail loudly on error"
-    assert "chown error" in res_apply.stderr or res_apply.returncode != 0
+    assert res_apply.returncode == 1, (
+        f"--apply must fail with exit code 1 on command error, got {res_apply.returncode}"
+    )
+    assert "chown error" in res_apply.stderr
 
     # Plain run (dry-run default) must succeed without error and change nothing on disk
     dry_root = tmp_path / "cu-rates-dry-noop"
@@ -294,6 +366,44 @@ def test_install_script_refuses_non_empty_root(tmp_path: Path) -> None:
     assert "[DRY-RUN]" in res_adopt.stdout
 
 
+def test_documented_runbook_order_against_install_checks(tmp_path: Path) -> None:
+    """Verify that documented runbook order (clone then install --adopt) passes checks."""
+    readme = (DEPLOY_DIR / "README.md").read_text(encoding="utf-8")
+
+    # Assert that README documents --adopt for Step 2 and Step 3
+    assert "install.sh --dry-run --adopt" in readme, "README must document --adopt for dry-run"
+    assert "install.sh --apply --adopt" in readme, "README must document --adopt for apply"
+
+    # Simulate Step 1: clone creates app subdirectory inside CU_RATES_ROOT
+    simulated_root = tmp_path / "var-lib-cu-rates"
+    simulated_app = simulated_root / "app"
+    simulated_app.mkdir(parents=True)
+    (simulated_app / "README.md").write_text("simulated repo", encoding="utf-8")
+
+    install_sh = DEPLOY_DIR / "install.sh"
+    env = {**os.environ, "CU_RATES_ROOT": str(simulated_root)}
+
+    # Without --adopt, running install.sh against the cloned root must fail
+    res_fail = subprocess.run(
+        ["bash", str(install_sh), "--dry-run"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert res_fail.returncode != 0
+    assert "--adopt" in res_fail.stderr
+
+    # With the documented --adopt flag, running install.sh must succeed
+    res_adopt = subprocess.run(
+        ["bash", str(install_sh), "--dry-run", "--adopt"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert res_adopt.returncode == 0
+    assert "[DRY-RUN]" in res_adopt.stdout
+
+
 def test_install_script_no_hidden_failures_or_recursive_chown() -> None:
     """Verify that install.sh never does recursive chown or swallows errors with || true."""
     install_sh = (DEPLOY_DIR / "install.sh").read_text(encoding="utf-8")
@@ -316,9 +426,15 @@ def test_caddyfile_configuration() -> None:
 
     # Forwarded client IP header (CF-Connecting-IP)
     assert "CF-Connecting-IP" in caddyfile
+    # Must NOT rewrite or forward client-IP as X-Forwarded-For
+    assert "X-Forwarded-For" not in caddyfile
 
     # Must contain comment stating app must not trust forwarded header for security decisions
     assert "must not trust" in caddyfile.lower() or "not trust" in caddyfile.lower()
+
+    # Access logs must be discarded at Caddy layer to avoid logging URI query strings
+    assert "output discard" in caddyfile
+    assert "cu-rates-access.log" not in caddyfile
 
     # Must NOT duplicate app security headers from src/cu_rates/web/app.py
     duplicated_headers = [
@@ -346,15 +462,50 @@ def test_tunnel_port_consistency() -> None:
     assert "http://127.0.0.1:8080" in readme
 
 
-def test_web_unit_access_log_format_omits_query_string() -> None:
-    """Verify that web unit access log format omits query strings (use %(U)s not %(r)s)."""
+def test_web_unit_access_log_format_escaped_and_omits_query_and_referer() -> None:
+    """Verify web access log format escapes %% specifiers and omits query and referer."""
     web_unit = parse_systemd_unit(SYSTEMD_DIR / "cu-rates-web.service")
     exec_start = " ".join(web_unit.get("Service", {}).get("ExecStart", []))
 
     assert "--access-logformat" in exec_start
-    assert "%(U)s" in exec_start
+
+    # Systemd percent-sign escaping: all access-logformat specifiers must be doubled (%%)
+    doubled_specifiers = [
+        "%%(h)s",
+        "%%(l)s",
+        "%%(u)s",
+        "%%(t)s",
+        "%%(m)s",
+        "%%(U)s",
+        "%%(H)s",
+        "%%(s)s",
+        "%%(b)s",
+        "%%(a)s",
+    ]
+    for spec in doubled_specifiers:
+        assert spec in exec_start, f"ExecStart missing escaped specifier '{spec}'"
+
+    # Confirm there are NO unescaped single percent signs followed by ( or specifier letters
+    unescaped = re.findall(r"(?<!%)%[a-zA-Z(]", exec_start)
+    assert not unescaped, f"ExecStart contains unescaped systemd specifiers: {unescaped}"
+
+    # Query string must be omitted (use %%(U)s, not %%(r)s or %%(q)s)
     assert "%(r)s" not in exec_start
+    assert "%%(r)s" not in exec_start
     assert "%(q)s" not in exec_start
+    assert "%%(q)s" not in exec_start
+
+    # Referer must be dropped completely
+    assert "%(f)s" not in exec_start
+    assert "%%(f)s" not in exec_start
+
+
+def test_worker_unit_restart_is_no() -> None:
+    """Verify cu-rates-worker.service has Restart=no so failing oneshot does not retry."""
+    worker_unit = parse_systemd_unit(SYSTEMD_DIR / "cu-rates-worker.service")
+    service_sec = worker_unit.get("Service", {})
+    assert service_sec.get("Restart") == ["no"]
+    assert "RestartSec" not in service_sec
 
 
 def test_env_example_content_and_annotations() -> None:
