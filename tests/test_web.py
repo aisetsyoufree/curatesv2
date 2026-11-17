@@ -1,8 +1,11 @@
 """Offline acceptance and foundation tests for the CU-Rates.org website."""
 
-import importlib
+import json
 import re
+import sqlite3
 from html.parser import HTMLParser
+from pathlib import Path
+from typing import Any
 from xml.etree import ElementTree
 
 import pytest
@@ -10,6 +13,20 @@ from flask import Flask
 from flask.testing import FlaskClient
 
 from cu_rates.web import create_app
+from cu_rates.web.app import validate_canonical_origin
+from cu_rates.web.views import ARTICLES
+from tests.site_audit import (
+    RATE_FIGURE,
+    automatic_request_urls,
+    consent_default_calls,
+    consent_update_calls,
+    csp_problems,
+    database_findings,
+    executable_inline_scripts,
+    load_cu_rates_sources,
+    publication_problems,
+    script_request_urls,
+)
 
 VERIFIED_PAGES = ["/", "/methodology", "/privacy"]
 
@@ -116,6 +133,7 @@ def test_verified_pages_return_200_and_headers(client: FlaskClient) -> None:
         assert "frame-ancestors 'none'" in csp
         assert "base-uri 'self'" in csp
         assert "form-action 'self'" in csp
+        assert csp_problems(csp) == []
 
         # Standard security headers
         assert resp.headers.get("X-Content-Type-Options") == "nosniff"
@@ -212,35 +230,30 @@ def test_educational_disclaimer_on_every_page(client: FlaskClient) -> None:
 
 
 def test_no_external_urls_in_rendered_pages_or_headers(client: FlaskClient) -> None:
-    """No rendered page contains external links, scripts, or assets."""
-    canonical_origin = "https://cu-rates.org"
+    """No rendered page loads a foreign origin through markup, headers, or a loose CSP."""
+    origin = str(client.application.config["CANONICAL_ORIGIN"])
     for path in VERIFIED_PAGES:
         resp = client.get(path)
-        doc = parse_page(resp.get_data(as_text=True))
-
-        for tag, url in doc.resource_urls:
-            if (
-                url
-                and not url.startswith("#")
-                and (url.startswith("http://") or url.startswith("https://"))
-            ):
-                assert url.startswith(canonical_origin), (
-                    f"External URL found in <{tag}> on {path}: {url}"
-                )
+        headers = {key: value for key, value in resp.headers.items()}
+        assert publication_problems(resp.get_data(as_text=True), headers, origin) == []
 
 
 def test_analytics_disabled_by_default(client: FlaskClient) -> None:
-    """Analytics and tracking tags are off by default with zero external requests."""
+    """Analytics stays off: no consent script runs and no third-party URL is requested."""
     for path in VERIFIED_PAGES:
         resp = client.get(path)
-        text = resp.get_data(as_text=True)
-        assert "gtag" not in text
-        assert "googletagmanager" not in text
-        assert "google-analytics" not in text
+        html = resp.get_data(as_text=True)
+        assert executable_inline_scripts(html) == 0
+        assert consent_default_calls(html) == []
+        assert all("consent.js" not in url for url in automatic_request_urls(html))
+        assert "googletagmanager" not in html
+        assert "google-analytics" not in html
+        headers = {key: value for key, value in resp.headers.items()}
+        assert publication_problems(html, headers, "https://cu-rates.org") == []
 
 
 def test_optional_analytics_consent_integration_point() -> None:
-    """When enabled by config, Consent Mode v2 default denials are rendered without live tags."""
+    """Enabled analytics serves denied consent from a same-origin file and loads no tag."""
     analytics_app = create_app(
         {
             "TESTING": True,
@@ -250,11 +263,31 @@ def test_optional_analytics_consent_integration_point() -> None:
     )
     test_client = analytics_app.test_client()
     resp = test_client.get("/")
-    text = resp.get_data(as_text=True)
-    assert "gtag('consent', 'default'" in text
-    assert "'analytics_storage': 'denied'" in text
-    # No live external google script loaded even when enabled
-    assert "googletagmanager.com/gtag/js" not in text
+    html = resp.get_data(as_text=True)
+    assert executable_inline_scripts(html) == 0
+    assert "G-MEASURETEST" not in html
+    assert "googletagmanager" not in html
+    assert "google-analytics" not in html
+    sources = [
+        url
+        for url in automatic_request_urls(html)
+        if url.endswith("/static/consent.js") or url.endswith("consent.js")
+    ]
+    assert sources == ["/static/consent.js"]
+    script_resp = test_client.get(sources[0])
+    assert script_resp.status_code == 200
+    script = script_resp.get_data(as_text=True)
+    assert consent_default_calls(script) == [
+        {
+            "analytics_storage": "denied",
+            "ad_storage": "denied",
+            "ad_user_data": "denied",
+            "ad_personalization": "denied",
+        }
+    ]
+    assert consent_update_calls(script) == 0
+    assert script_request_urls(script) == []
+    assert csp_problems(resp.headers.get("Content-Security-Policy", "")) == []
 
 
 def test_robots_txt_and_sitemap_xml(client: FlaskClient) -> None:
@@ -296,41 +329,23 @@ def test_no_ads_and_no_ads_txt(client: FlaskClient) -> None:
 
 def test_no_rates_aprs_or_financial_figures(client: FlaskClient) -> None:
     """Site shows no rates, APRs, or financial figures until data is verified."""
-    rate_pattern = re.compile(r"\b\d+(\.\d+)?%\b")
     apr_pattern = re.compile(r"(?i)\bapr\b\s*:?\s*\d+")
 
     for path in VERIFIED_PAGES:
         resp = client.get(path)
         text = resp.get_data(as_text=True)
-        assert not rate_pattern.search(text), f"Found rate/percentage pattern on {path}"
+        assert not RATE_FIGURE.search(text), f"Found rate/percentage pattern on {path}"
         assert not apr_pattern.search(text), f"Found APR with digits pattern on {path}"
 
 
 def test_web_package_does_not_import_database() -> None:
-    """The web layer never imports sqlite, sqlalchemy, or worker database components."""
-    forbidden = ["sqlite3", "sqlalchemy", "cu_rates.artifact_store"]
-
-    importlib.invalidate_caches()
-    import cu_rates.web.app
-    import cu_rates.web.views
-
-    web_modules = [
-        cu_rates.web,
-        cu_rates.web.app,
-        cu_rates.web.views,
-    ]
-
-    for mod in web_modules:
-        mod_file = getattr(mod, "__file__", None)
-        if mod_file and mod_file.endswith(".py"):
-            with open(mod_file, encoding="utf-8") as f:
-                content = f.read()
-            for term in forbidden:
-                assert term not in content, f"Forbidden database import '{term}' in {mod_file}"
-
-    for mod in web_modules:
-        for term in ["sqlite3", "sqlalchemy"]:
-            assert term not in mod.__dict__
+    """The web layer never imports or opens the database, including through another module."""
+    sources = load_cu_rates_sources(Path(__file__).resolve().parents[1] / "src")
+    findings = database_findings(
+        sources,
+        ["cu_rates.web", "cu_rates.web.app", "cu_rates.web.views"],
+    )
+    assert findings == []
 
 
 def test_no_present_tense_operational_claims(client: FlaskClient) -> None:
@@ -363,3 +378,178 @@ def test_no_present_tense_operational_claims(client: FlaskClient) -> None:
     assert "is designed around" in methodology_text
     assert "will be archived" in methodology_text
     assert "planned freshness expiry" in methodology_text
+
+
+def _json_ld(html: str) -> dict[str, Any]:
+    match = re.search(r'<script type="application/ld\+json">(.*?)</script>', html, re.S)
+    assert match is not None
+    loaded = json.loads(match.group(1))
+    assert isinstance(loaded, dict)
+    return loaded
+
+
+def _json_keys(value: object) -> set[str]:
+    found: set[str] = set()
+    if isinstance(value, dict):
+        for key, item in value.items():
+            found.add(str(key))
+            found.update(_json_keys(item))
+    elif isinstance(value, list):
+        for item in value:
+            found.update(_json_keys(item))
+    return found
+
+
+def _file_label(file: object) -> str:
+    if isinstance(file, str):
+        return file
+    name = getattr(file, "name", None)
+    if isinstance(name, str):
+        return name
+    return str(file)
+
+
+def _runtime_db_path(label: str) -> bool:
+    normalized = label.replace("\\", "/").lower()
+    filename = normalized.rsplit("/", 1)[-1]
+    return "cu_rates.db" in normalized or filename.endswith((".db", ".sqlite", ".sqlite3"))
+
+
+def test_rendered_pages_do_not_open_a_database(
+    client: FlaskClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A page render does not open cu_rates.db or call sqlite3.connect."""
+    import builtins
+    import pathlib
+
+    real_open: Any = builtins.open
+
+    def guarded_open(*args: Any, **kwargs: Any) -> Any:
+        if args and _runtime_db_path(_file_label(args[0])):
+            raise AssertionError(f"web opened database path {args[0]}")
+        return real_open(*args, **kwargs)
+
+    real_path_open = pathlib.Path.open
+
+    def guarded_path_open(self: pathlib.Path, *args: Any, **kwargs: Any) -> Any:
+        if _runtime_db_path(str(self)):
+            raise AssertionError(f"web opened database path {self}")
+        return real_path_open(self, *args, **kwargs)
+
+    def refuse_connect(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("web request called sqlite3.connect")
+
+    monkeypatch.setattr(builtins, "open", guarded_open)
+    monkeypatch.setattr(pathlib.Path, "open", guarded_path_open)
+    monkeypatch.setattr(sqlite3, "connect", refuse_connect)
+    for path in ("/", "/methodology", "/privacy", "/learn", "/learn/mortgage-basics", "/missing"):
+        client.get(path)
+
+
+def test_html_and_not_found_require_revalidation(client: FlaskClient) -> None:
+    """HTML responses, including the 404 page, must be revalidated before reuse."""
+    for path in (
+        "/",
+        "/methodology",
+        "/privacy",
+        "/learn",
+        "/learn/mortgage-basics",
+        "/missing-page",
+    ):
+        response = client.get(path)
+        assert "text/html" in response.content_type
+        assert response.headers.get("Cache-Control") == "no-cache, must-revalidate"
+    missing = client.get("/missing-page")
+    assert missing.status_code == 404
+    assert 'rel="canonical"' not in missing.get_data(as_text=True)
+    stylesheet = client.get("/static/style.css")
+    assert stylesheet.status_code == 200
+    assert stylesheet.headers.get("Cache-Control") != "no-cache, must-revalidate"
+
+
+def test_public_pages_expose_canonical_open_graph_breadcrumbs_and_json_ld(
+    client: FlaskClient,
+) -> None:
+    """Verified pages publish conservative metadata from the configured origin."""
+    methodology = client.get("/methodology")
+    html = methodology.get_data(as_text=True)
+    assert 'rel="canonical" href="https://cu-rates.org/methodology"' in html
+    assert 'property="og:url" content="https://cu-rates.org/methodology"' in html
+    assert 'property="og:title"' in html
+    assert 'property="og:description"' in html
+    assert 'property="og:type" content="website"' in html
+    assert 'property="og:site_name" content="CU-Rates.org"' in html
+    assert 'aria-label="Breadcrumb"' in html
+    payload = _json_ld(html)
+    assert payload["@type"] == "WebPage"
+    assert payload["url"] == "https://cu-rates.org/methodology"
+    forbidden = {"aggregateRating", "offers", "review", "price", "ratingValue"}
+    assert _json_keys(payload).isdisjoint(forbidden)
+    crumbs = payload["breadcrumb"]["itemListElement"]
+    assert [item["name"] for item in crumbs] == ["Home", "Methodology and Comparison Principles"]
+
+    home = _json_ld(client.get("/").get_data(as_text=True))
+    assert home["url"] == "https://cu-rates.org/"
+    assert [item["name"] for item in home["breadcrumb"]["itemListElement"]] == ["Home"]
+
+    article = client.get("/learn/mortgage-basics")
+    article_html = article.get_data(as_text=True)
+    assert "noindex" in article.headers.get("X-Robots-Tag", "")
+    assert 'rel="canonical" href="https://cu-rates.org/learn/mortgage-basics"' in article_html
+    article_ld = _json_ld(article_html)
+    names = [item["name"] for item in article_ld["breadcrumb"]["itemListElement"]]
+    assert names == ["Home", "Learn", "Mortgage Basics and Core Principles"]
+    assert _json_keys(article_ld).isdisjoint(forbidden)
+    sitemap = client.get("/sitemap.xml").get_data(as_text=True)
+    assert "/learn/mortgage-basics" not in sitemap
+
+
+def test_canonical_origin_is_validated_and_used_by_robots_and_sitemap() -> None:
+    """robots.txt, sitemap.xml, and canonical links follow a validated origin."""
+    preview = create_app({"TESTING": True, "CANONICAL_ORIGIN": "https://preview.example"})
+    preview_client = preview.test_client()
+    robots = preview_client.get("/robots.txt").get_data(as_text=True)
+    assert "Sitemap: https://preview.example/sitemap.xml" in robots
+    home = preview_client.get("/").get_data(as_text=True)
+    assert 'rel="canonical" href="https://preview.example/"' in home
+    sitemap = preview_client.get("/sitemap.xml").get_data(as_text=True)
+    assert "https://preview.example/methodology" in sitemap
+    assert "https://cu-rates.org" not in sitemap
+    for slug in ARTICLES:
+        assert f"/learn/{slug}" not in sitemap
+
+    for bad in (
+        "http://cu-rates.org",
+        "https://cu-rates.org/extra",
+        "https://user:pass@cu-rates.org",
+        "https://cu-rates.org/?q=1",
+        "https://cu-rates.org#fragment",
+        "cu-rates.org",
+        "",
+        "https://cu-rates.org.evil.example/phish",
+    ):
+        with pytest.raises(ValueError):
+            validate_canonical_origin(bad)
+
+
+def test_privacy_describes_consent_as_planned(client: FlaskClient) -> None:
+    """Privacy copy does not claim the consent choice is already implemented."""
+    text = client.get("/privacy").get_data(as_text=True).lower()
+    assert "not implemented yet" in text
+    assert "planned" in text
+    assert "implements google consent mode" not in text
+    assert "explicit consent is provided" not in text
+
+
+def test_aria_current_matches_the_open_page(client: FlaskClient) -> None:
+    """The main navigation marks only the page that is actually open."""
+    expectations = {
+        "/": "Home",
+        "/methodology": "Methodology",
+        "/privacy": "Privacy",
+    }
+    for path, label in expectations.items():
+        document = parse_page(client.get(path).get_data(as_text=True))
+        current = [text for attrs, text in document.links if attrs.get("aria-current") == "page"]
+        assert current == [label]
