@@ -1,0 +1,42 @@
+# CU-Rates.org V2 — Caddy Reverse Proxy Configuration (Site Fragment)
+# Behind Cloudflare Tunnel with no inbound router port (MASTER.md D-09).
+# Cloudflared terminates edge TLS and routes plain HTTP to loopback port 8080.
+# No secrets are stored in this file.
+# Note: This is a site-only fragment (no global options block) to prevent
+# conflicts with the host's existing global options in /etc/caddy/Caddyfile.
+
+# Canonical domain configuration
+http://cu-rates.org:8080 {
+    # Listen only on loopback interface behind Cloudflare Tunnel (no external router port)
+    bind 127.0.0.1
+
+    # Reverse proxy to Gunicorn WSGI server on 127.0.0.1:8000
+    reverse_proxy 127.0.0.1:8000 {
+        header_up Host {host}
+        # CF-Connecting-IP provided by Cloudflare is forwarded as an opaque header only.
+        # The application must NOT trust CF-Connecting-IP or forwarded headers for security decisions.
+        header_up CF-Connecting-IP {header.CF-Connecting-IP}
+        header_up X-Forwarded-Proto https
+    }
+
+    # Response headers: do NOT duplicate application security headers here
+    # (browser security headers are managed in src/cu_rates/web/app.py to prevent drift).
+    header {
+        -Server
+    }
+
+    # Access logging:
+    # Discard HTTP access logging at Caddy layer (structured query-free access logging is handled upstream by Gunicorn).
+    # Note: Site-level log blocks govern only HTTP access logs, NOT Caddy runtime or error logs (http.log.error).
+    # Redaction of query strings and headers on upstream errors must be configured in the global options block
+    # of the host's main /etc/caddy/Caddyfile (see deploy/README.md).
+    log {
+        output discard
+    }
+}
+
+# Redirect www to apex canonical origin (MASTER.md §8: https://cu-rates.org)
+http://www.cu-rates.org:8080 {
+    bind 127.0.0.1
+    redir https://cu-rates.org{uri} permanent
+}
