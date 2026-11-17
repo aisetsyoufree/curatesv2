@@ -496,6 +496,13 @@ def test_unsafe_cases_cover_every_blocking_reason() -> None:
         R.PROFILE_UNAPPROVED,
         R.LAYOUT_UNREVIEWED,
         R.REOBSERVATION_CLAIM_CHANGED,
+        R.INSUFFICIENT_EVIDENCE_PATHS,
+        R.DUPLICATE_EVIDENCE_CAPTURE,
+        R.EVIDENCE_PATH_NON_AUTHORITATIVE,
+        R.EVIDENCE_PATH_PRODUCT_MISMATCH,
+        R.EVIDENCE_PATH_SCENARIO_MISMATCH,
+        R.EVIDENCE_PATH_TIME_OUTSIDE_WINDOW,
+        R.EVIDENCE_PATH_VALUE_MISMATCH,
     }  # covered by dedicated tests below and in test_publication_gate.py
 
 

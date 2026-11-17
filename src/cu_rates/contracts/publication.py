@@ -101,6 +101,14 @@ DEGRADE_AFTER = timedelta(hours=72)
 WITHDRAW_AFTER = timedelta(hours=96)
 ABANDONED_EFFECTIVE_AGE = timedelta(days=90)
 ABANDONED_NO_CHANGE = timedelta(days=60)
+
+# D-18: Two separately captured authoritative evidence paths must corroborate every
+# published value. Captures within this window of each other may corroborate.
+DUAL_EVIDENCE_TIME_WINDOW = timedelta(hours=96)
+# Source-of-record classes: every evidence kind the system models is authoritative.
+# Model output or LLM/web-search agreement is NEVER evidence and has no EvidenceKind.
+AUTHORITATIVE_SOURCE_CLASSES: frozenset[str] = frozenset(kind.value for kind in EvidenceKind)
+_AUTHORITATIVE_EVIDENCE_KINDS: frozenset[EvidenceKind] = frozenset(EvidenceKind)
 APR_RULE_ID = "rule.apr-ge-note-rate"
 _APR_RULE_PATHS = frozenset({"apr", "note_rate"})
 _PUBLISHABLE_STATUSES = frozenset({OfferStatus.APPROVED, OfferStatus.PUBLISHED})
@@ -153,6 +161,14 @@ class ReasonCode(StrEnum):
     VALIDATION_FAILED = "validation_failed"
     VALIDATION_UNBOUND = "validation_unbound"
     CLOCK_SKEW = "clock_skew"
+    # Dual-evidence (D-18): two separately captured authoritative paths required.
+    INSUFFICIENT_EVIDENCE_PATHS = "insufficient_evidence_paths"
+    DUPLICATE_EVIDENCE_CAPTURE = "duplicate_evidence_capture"
+    EVIDENCE_PATH_NON_AUTHORITATIVE = "evidence_path_non_authoritative"
+    EVIDENCE_PATH_PRODUCT_MISMATCH = "evidence_path_product_mismatch"
+    EVIDENCE_PATH_SCENARIO_MISMATCH = "evidence_path_scenario_mismatch"
+    EVIDENCE_PATH_TIME_OUTSIDE_WINDOW = "evidence_path_time_outside_window"
+    EVIDENCE_PATH_VALUE_MISMATCH = "evidence_path_value_mismatch"
     # Review: a human must approve.
     FIRST_PUBLICATION = "first_publication"
     PRIOR_NOT_REVIEWED = "prior_not_reviewed"
@@ -237,6 +253,13 @@ QUARANTINE_REASONS = frozenset(
         R.VALIDATION_FAILED,
         R.VALIDATION_UNBOUND,
         R.CLOCK_SKEW,
+        R.INSUFFICIENT_EVIDENCE_PATHS,
+        R.DUPLICATE_EVIDENCE_CAPTURE,
+        R.EVIDENCE_PATH_NON_AUTHORITATIVE,
+        R.EVIDENCE_PATH_PRODUCT_MISMATCH,
+        R.EVIDENCE_PATH_SCENARIO_MISMATCH,
+        R.EVIDENCE_PATH_TIME_OUTSIDE_WINDOW,
+        R.EVIDENCE_PATH_VALUE_MISMATCH,
     }
 )
 REVIEW_REASONS = frozenset(
@@ -414,6 +437,23 @@ class VerifiedScenarioCondition(ContractModel):
     condition: OfferCondition
 
 
+class EvidencePath(ContractModel):
+    """An authoritative evidence path supporting a published financial value.
+
+    D-18 requires at least two distinct, corroborating, authoritative evidence paths
+    matching product, scenario, and observation time window for every published value.
+    """
+
+    path: FieldPath
+    value: Decimal
+    artifact_id: Sha256Hex
+    capture_id: Identifier
+    observed_at: UtcDatetime
+    product_id: Identifier
+    scenario_id: CanonicalScenarioId | None = None
+    source_class: Text
+
+
 class PublicationContext(ContractModel):
     institution: Institution
     product: ProductIdentity
@@ -429,6 +469,7 @@ class PublicationContext(ContractModel):
     source_fingerprints: tuple[SourceFingerprint, ...] = ()
     verified_scenario_statements: tuple[VerifiedScenarioStatement, ...] = ()
     verified_scenario_conditions: tuple[VerifiedScenarioCondition, ...] = ()
+    evidence_paths: tuple[EvidencePath, ...] = ()
     validations: tuple[ValidationResult, ...] = ()
     prior: PriorPublication | None = None
     product_review: ReviewDecision | None = None
@@ -813,6 +854,120 @@ def _evidence_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[Re
     return reasons
 
 
+def _dual_evidence_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[ReasonCode]:
+    """D-18: at least TWO separately captured authoritative evidence paths must corroborate.
+
+    Each publishable rate/APR/points/fee value must be supported by evidence from at
+    least two distinct captures that:
+      (a) have distinct content hashes / capture ids / observation times (not the same
+          capture cited twice or a copy),
+      (b) are authoritative (source classes allowed by MASTER.md §5; model output or
+          LLM/web-search agreement is never evidence),
+      (c) match on product, scenario, and observation time window, with exact numeric
+          equality after normalization.
+    """
+    reasons: set[ReasonCode] = set()
+
+    # Collect every publishable rate/APR/points value on the offer.
+    values: list[tuple[str, str]] = []
+    for path, sourced in offer.rate_items():
+        values.append((path, canonical_decimal(sourced.value)))
+    if offer.points is not None:
+        values.append(("points", canonical_decimal(offer.points.value)))
+
+    if not values:
+        return reasons
+
+    for val_path, target_val in values:
+        matching = [ep for ep in ctx.evidence_paths if ep.path == val_path]
+        if len(matching) < 2:
+            reasons.add(R.INSUFFICIENT_EVIDENCE_PATHS)
+            continue
+
+        corroborated = False
+        for i in range(len(matching)):
+            for j in range(i + 1, len(matching)):
+                p1, p2 = matching[i], matching[j]
+                # (a) Distinct captures: different artifact hash, different capture id,
+                # different observation time.
+                if (
+                    p1.artifact_id == p2.artifact_id
+                    or p1.capture_id == p2.capture_id
+                    or p1.observed_at == p2.observed_at
+                ):
+                    continue
+                # (b) Authoritative source classes
+                if (
+                    p1.source_class.lower() not in AUTHORITATIVE_SOURCE_CLASSES
+                    or p2.source_class.lower() not in AUTHORITATIVE_SOURCE_CLASSES
+                ):
+                    continue
+                # (c) Matching product
+                if p1.product_id != offer.product_id or p2.product_id != offer.product_id:
+                    continue
+                # Matching scenario
+                if p1.scenario_id != offer.scenario_id or p2.scenario_id != offer.scenario_id:
+                    continue
+                # Observation time window
+                if (
+                    abs((p1.observed_at - p2.observed_at).total_seconds())
+                    > DUAL_EVIDENCE_TIME_WINDOW.total_seconds()
+                ):
+                    continue
+                # Exact equality of numeric value after normalization
+                if (
+                    canonical_decimal(p1.value) != canonical_decimal(p2.value)
+                    or canonical_decimal(p1.value) != target_val
+                ):
+                    continue
+
+                corroborated = True
+                break
+            if corroborated:
+                break
+
+        if not corroborated:
+            has_non_authoritative = any(
+                p.source_class.lower() not in AUTHORITATIVE_SOURCE_CLASSES for p in matching
+            )
+            has_product_mismatch = any(p.product_id != offer.product_id for p in matching)
+            has_scenario_mismatch = any(p.scenario_id != offer.scenario_id for p in matching)
+            has_value_mismatch = any(canonical_decimal(p.value) != target_val for p in matching)
+            has_time_outside = False
+            has_duplicate = False
+            for i in range(len(matching)):
+                for j in range(i + 1, len(matching)):
+                    p1, p2 = matching[i], matching[j]
+                    if (
+                        abs((p1.observed_at - p2.observed_at).total_seconds())
+                        > DUAL_EVIDENCE_TIME_WINDOW.total_seconds()
+                    ):
+                        has_time_outside = True
+                    if (
+                        p1.artifact_id == p2.artifact_id
+                        or p1.capture_id == p2.capture_id
+                        or p1.observed_at == p2.observed_at
+                    ):
+                        has_duplicate = True
+
+            if has_non_authoritative:
+                reasons.add(R.EVIDENCE_PATH_NON_AUTHORITATIVE)
+            if has_product_mismatch:
+                reasons.add(R.EVIDENCE_PATH_PRODUCT_MISMATCH)
+            if has_scenario_mismatch:
+                reasons.add(R.EVIDENCE_PATH_SCENARIO_MISMATCH)
+            if has_value_mismatch:
+                reasons.add(R.EVIDENCE_PATH_VALUE_MISMATCH)
+            if has_time_outside:
+                reasons.add(R.EVIDENCE_PATH_TIME_OUTSIDE_WINDOW)
+            if has_duplicate:
+                reasons.add(R.DUPLICATE_EVIDENCE_CAPTURE)
+            if not reasons:
+                reasons.add(R.INSUFFICIENT_EVIDENCE_PATHS)
+
+    return reasons
+
+
 def _validation_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[ReasonCode]:
     """Every required rule must have a passing result bound to this exact offer content."""
     reasons: set[ReasonCode] = set()
@@ -880,6 +1035,7 @@ def _identity_and_evidence_reasons(
         reasons.add(R.RATE_NOT_PUBLIC)
     reasons |= _source_reasons(offer, ctx)
     reasons |= _evidence_reasons(offer, ctx)
+    reasons |= _dual_evidence_reasons(offer, ctx)
     if offer.material_paths() - {e.path for e in offer.field_provenance}:
         reasons.add(R.FIELD_EVIDENCE_MISSING)
     reasons |= _validation_reasons(offer, ctx)

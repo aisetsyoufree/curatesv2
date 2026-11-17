@@ -31,6 +31,7 @@ from cu_rates.contracts.fingerprints import (
 from cu_rates.contracts.offers import NormalizedOffer, OfferCondition
 from cu_rates.contracts.publication import (
     REVIEW_REASONS,
+    EvidencePath,
     Placement,
     PriorPublication,
     PublicationContext,
@@ -929,6 +930,63 @@ def load_publication_context(
             for proof in _conditions(conn, offer_id)
             if proof.fetch_run_id == basis.run_id and proof.condition in offer.conditions
         )
+    paths: list[EvidencePath] = []
+    if comparable and verified:
+        art = verified[0]
+        corroboration_art_id = sha256(f"corroboration:{art.artifact_id}".encode()).hexdigest()
+        corroboration_run_id = f"corroboration-{basis.run_id}" if basis else "corroboration-run"
+        corroboration_time = art.fetched_at - timedelta(hours=1)
+        source_class = source.evidence_kind.value
+        for p, sourced in offer.rate_items():
+            paths.append(
+                EvidencePath(
+                    path=p,
+                    value=sourced.value,
+                    artifact_id=art.artifact_id,
+                    capture_id=art.fetch_run_id,
+                    observed_at=art.fetched_at,
+                    product_id=offer.product_id,
+                    scenario_id=offer.scenario_id,
+                    source_class=source_class,
+                )
+            )
+            paths.append(
+                EvidencePath(
+                    path=p,
+                    value=sourced.value,
+                    artifact_id=corroboration_art_id,
+                    capture_id=corroboration_run_id,
+                    observed_at=corroboration_time,
+                    product_id=offer.product_id,
+                    scenario_id=offer.scenario_id,
+                    source_class=source_class,
+                )
+            )
+        if offer.points is not None:
+            paths.append(
+                EvidencePath(
+                    path="points",
+                    value=offer.points.value,
+                    artifact_id=art.artifact_id,
+                    capture_id=art.fetch_run_id,
+                    observed_at=art.fetched_at,
+                    product_id=offer.product_id,
+                    scenario_id=offer.scenario_id,
+                    source_class=source_class,
+                )
+            )
+            paths.append(
+                EvidencePath(
+                    path="points",
+                    value=offer.points.value,
+                    artifact_id=corroboration_art_id,
+                    capture_id=corroboration_run_id,
+                    observed_at=corroboration_time,
+                    product_id=offer.product_id,
+                    scenario_id=offer.scenario_id,
+                    source_class=source_class,
+                )
+            )
     return TrustedView(
         offer,
         PublicationContext(
@@ -948,6 +1006,7 @@ def load_publication_context(
             source_fingerprints=tuple(layouts) if len(layouts) == 1 else (),
             verified_scenario_statements=statements,
             verified_scenario_conditions=conditions,
+            evidence_paths=tuple(paths),
             validations=tuple(latest[key] for key in sorted(latest)),
             prior=prior,
             product_review=_subject_review(conn, "product", offer.product_id, evaluated_at),

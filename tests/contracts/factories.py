@@ -71,7 +71,11 @@ from cu_rates.contracts import (
     snapshot_manifest_sha256,
 )
 from cu_rates.contracts.fingerprints import offer_evidence_sha256
-from cu_rates.contracts.publication import VerifiedScenarioCondition, VerifiedScenarioStatement
+from cu_rates.contracts.publication import (
+    EvidencePath,
+    VerifiedScenarioCondition,
+    VerifiedScenarioStatement,
+)
 from cu_rates.contracts.scenarios import matching_statement
 from cu_rates.contracts.sources import profile_sha256
 
@@ -91,6 +95,104 @@ SV = CONTRACT_VERSION
 VALIDATOR = ParserVersion(name="synthetic-validator", version="1.0.0")
 IMAGE_ARTIFACT_ID = "abcdef0123456789" * 4
 LAYOUT_SHA = "ab" * 32
+# D-18: a corroborating second capture from a different fetch run.
+ARTIFACT_ID_2 = "bb" * 32
+
+
+def evidence_path(
+    path: str = "note_rate",
+    value: str | Decimal = "6.125",
+    artifact_id: str = ARTIFACT_ID,
+    capture_id: str = "fetch-001",
+    observed_at: datetime = T0,
+    product_id: str = PRODUCT_ID,
+    scenario_id: CanonicalScenarioId | None = CanonicalScenarioId.PURCHASE_30Y_FIXED,
+    source_class: str = "html",
+    **overrides: Any,
+) -> EvidencePath:
+    kwargs: dict[str, Any] = {
+        "path": path,
+        "value": Decimal(str(value)),
+        "artifact_id": artifact_id,
+        "capture_id": capture_id,
+        "observed_at": observed_at,
+        "product_id": product_id,
+        "scenario_id": scenario_id,
+        "source_class": source_class,
+    }
+    kwargs.update(overrides)
+    return EvidencePath(**kwargs)
+
+
+def corroborating_path(
+    path: str = "note_rate",
+    value: str | Decimal = "6.125",
+    artifact_id: str = ARTIFACT_ID_2,
+    capture_id: str = "fetch-002",
+    observed_at: datetime = T0 - timedelta(hours=1),
+    product_id: str = PRODUCT_ID,
+    scenario_id: CanonicalScenarioId | None = CanonicalScenarioId.PURCHASE_30Y_FIXED,
+    source_class: str = "html",
+    **overrides: Any,
+) -> EvidencePath:
+    return evidence_path(
+        path=path,
+        value=value,
+        artifact_id=artifact_id,
+        capture_id=capture_id,
+        observed_at=observed_at,
+        product_id=product_id,
+        scenario_id=scenario_id,
+        source_class=source_class,
+        **overrides,
+    )
+
+
+def evidence_paths_for(offer: NormalizedOffer) -> tuple[EvidencePath, ...]:
+    paths: list[EvidencePath] = []
+    for path, sourced in offer.rate_items():
+        val = sourced.value
+        paths.append(
+            evidence_path(
+                path=path,
+                value=val,
+                product_id=offer.product_id,
+                scenario_id=offer.scenario_id,
+                artifact_id=sourced.provenance.artifact_id,
+                observed_at=offer.observed_at,
+            )
+        )
+        paths.append(
+            corroborating_path(
+                path=path,
+                value=val,
+                product_id=offer.product_id,
+                scenario_id=offer.scenario_id,
+                observed_at=offer.observed_at - timedelta(hours=1),
+            )
+        )
+    if offer.points is not None:
+        val = offer.points.value
+        paths.append(
+            evidence_path(
+                path="points",
+                value=val,
+                product_id=offer.product_id,
+                scenario_id=offer.scenario_id,
+                artifact_id=offer.points.provenance.artifact_id,
+                observed_at=offer.observed_at,
+            )
+        )
+        paths.append(
+            corroborating_path(
+                path="points",
+                value=val,
+                product_id=offer.product_id,
+                scenario_id=offer.scenario_id,
+                observed_at=offer.observed_at - timedelta(hours=1),
+            )
+        )
+    return tuple(paths)
 
 
 def extraction(rule_id: str | None = None, parser: ParserVersion = PARSER) -> ExtractionProvenance:
@@ -586,6 +688,7 @@ def context(
         "source_fingerprints": (source_fingerprint(),),
         "validations": validations_for(current),
         "prior": prior(baseline),
+        "evidence_paths": evidence_paths_for(current),
         "evaluated_at": EVALUATED_AT,
     }
     kwargs.update(overrides)
