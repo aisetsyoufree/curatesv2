@@ -6,10 +6,10 @@
 >
 > **REQUIRED OWNER APPROVALS BEFORE LIVE EXECUTION:**
 > 1. **Product Owner Approval:** Formal review and approval of the deployment plan and target environment.
-> 2. **Host Review:** Review of the existing services currently running on the Raspberry Pi 5 to confirm isolated port allocations (127.0.0.1:8080 for Caddy reverse proxy, 127.0.0.1:8000 for Gunicorn), dedicated service user (`cu-rates`), and NVMe filesystem capacity.
+> 2. **Host Review:** Review of the existing services currently running on the Raspberry Pi 5 to confirm isolated port allocations (127.0.0.1:8080 for Caddy reverse proxy, 127.0.0.1:18200 for Gunicorn), dedicated service user (`cu-rates`), and NVMe filesystem capacity.
 > 3. **Counsel / Policy Clearance:** Verification of data collection and terms boundaries per `MASTER.md` §5 before any collection enablement.
 > 4. **Worker Transport Restriction (Decision D-15):** The worker service and timer MUST remain **INSTALLED DISABLED**. Live collection is prohibited until the gateway pinned dialer (issue #68) is implemented, reviewed, and approved.
-> 5. **Cloudflare Tunnel Routing:** Verification of the `cloudflared` tunnel ingress configuration routing `cu-rates.org` to the local Caddy reverse proxy on loopback port 8080 (`http://127.0.0.1:8080`) without inbound router ports (`MASTER.md` D-09). Caddy in turn proxies traffic to Gunicorn on `127.0.0.1:8000`.
+> 5. **Cloudflare Tunnel Routing:** Verification of the `cloudflared` tunnel ingress configuration routing `cu-rates.org` to the local Caddy reverse proxy on loopback port 8080 (`http://127.0.0.1:8080`) without inbound router ports (`MASTER.md` D-09). Caddy in turn proxies traffic to Gunicorn on `127.0.0.1:18200`.
 
 ---
 
@@ -25,7 +25,8 @@
   - `caddy` (version 2.7+ HTTP reverse proxy)
   - `cloudflared` (Cloudflare Tunnel daemon, edge-authenticated)
   - `git`
-- **Host Co-existence:** Other services already run on this Pi 5. CU-Rates runs under an isolated unprivileged user (`cu-rates`) and binds strictly to loopback (`127.0.0.1:8080` for Caddy and `127.0.0.1:8000` for Gunicorn), ensuring zero port collisions and zero interference with host services.
+- **Port choice:** Gunicorn uses `127.0.0.1:18200` because port 8000 is already used by another service on the target Pi (checked 2026-11-17); Caddy uses `127.0.0.1:8080`. Re-check `ss -ltn` for both ports before installing on a different host.
+- **Host Co-existence:** Other services already run on this Pi 5. CU-Rates runs under an isolated unprivileged user (`cu-rates`) and binds strictly to loopback (`127.0.0.1:8080` for Caddy and `127.0.0.1:18200` for Gunicorn), ensuring zero port collisions and zero interference with host services.
 
 ---
 
@@ -186,7 +187,7 @@ sudo chmod 0600 /etc/cu-rates/cu-rates.env
    curl -sS -H 'Host: cu-rates.org' 'http://127.0.0.1:8080/?probe=SECRET_QUERY_VALUE'
 
    # 3. Check Caddy journal logs from the last minute:
-   #    - Positive check: shows a proxy error event (e.g. dial tcp 127.0.0.1:8000: connect: connection refused)
+   #    - Positive check: shows a proxy error event (e.g. dial tcp 127.0.0.1:18200: connect: connection refused)
    #    - Negative check: does NOT contain SECRET_QUERY_VALUE
    sudo journalctl -u caddy --since '1 minute ago'
 
@@ -248,7 +249,7 @@ Upgrades preserve operational state and snapshot data.
 
 5. **Verify Health:**
    ```bash
-   curl -s -i http://127.0.0.1:8000/ | head -n 20
+   curl -s -i http://127.0.0.1:18200/ | head -n 20
    ```
 
 ---
@@ -330,7 +331,7 @@ sudo systemctl restart cu-rates-web.service
 sudo systemctl status cu-rates-web.service
 
 # 3. Verify loopback HTTP response
-curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8000/
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:18200/
 # Expected output: 200
 
 # 4. Check systemd journal logs
@@ -360,8 +361,8 @@ To verify that services survive a host reboot correctly:
    # Expected: active
 
    # Confirm port binding is strictly loopback
-   ss -tulpn | grep 8000
-   # Expected: 127.0.0.1:8000
+   ss -tulpn | grep 18200
+   # Expected: 127.0.0.1:18200
 
    # Confirm worker service was NOT triggered on boot
    systemctl is-active cu-rates-worker.service

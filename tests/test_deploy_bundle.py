@@ -132,10 +132,10 @@ def test_loopback_only_binding() -> None:
     assert "--bind 127.0.0.1:" in exec_start
     assert "0.0.0.0" not in exec_start
 
-    # Assert Caddyfile binds to 127.0.0.1 and proxies to 127.0.0.1:8000
+    # Assert Caddyfile binds to 127.0.0.1 and proxies to 127.0.0.1:18200
     caddyfile = (DEPLOY_DIR / "caddy" / "Caddyfile").read_text(encoding="utf-8")
     assert "bind 127.0.0.1" in caddyfile
-    assert "reverse_proxy 127.0.0.1:8000" in caddyfile
+    assert "reverse_proxy 127.0.0.1:18200" in caddyfile
     assert "0.0.0.0" not in caddyfile
 
 
@@ -729,7 +729,7 @@ def test_caddyfile_configuration() -> None:
     # Plain HTTP on loopback port 8080
     assert "http://cu-rates.org:8080" in caddyfile
     assert "bind 127.0.0.1" in caddyfile
-    assert "reverse_proxy 127.0.0.1:8000" in caddyfile
+    assert "reverse_proxy 127.0.0.1:18200" in caddyfile
     assert "443" not in caddyfile
 
     # Forwarded client IP header (CF-Connecting-IP)
@@ -1110,3 +1110,15 @@ def test_readme_discloses_cu_rates_root_scope_and_hardcoded_unit_paths() -> None
         "`CU_RATES_ROOT` is supported by `deploy/install.sh` solely for installer testing" in readme
     )
     assert "does NOT rewrite or template the hardcoded unit paths" in readme
+
+
+def test_gunicorn_port_is_consistent_and_avoids_the_known_busy_port() -> None:
+    """Unit, Caddy and runbook agree on one loopback port that is not 8000 (taken on the Pi)."""
+    unit = (DEPLOY_DIR / "systemd" / "cu-rates-web.service").read_text()
+    caddy = (DEPLOY_DIR / "caddy" / "Caddyfile").read_text()
+    readme = (DEPLOY_DIR / "README.md").read_text()
+    assert "--bind 127.0.0.1:18200" in unit
+    assert "reverse_proxy 127.0.0.1:18200" in caddy
+    assert "127.0.0.1:18200" in readme
+    for text in (unit, caddy, readme):
+        assert "127.0.0.1:8000" not in text
