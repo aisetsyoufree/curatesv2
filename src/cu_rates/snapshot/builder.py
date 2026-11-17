@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from collections.abc import Iterable
 from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import JsonValue, TypeAdapter, ValidationError
+from sqlalchemy.engine import Connection
+from sqlalchemy.exc import SQLAlchemyError
 
+from cu_rates.artifact_store import ArtifactStore, ArtifactStoreError
 from cu_rates.contracts.audit import PublishedSnapshot, ReviewDecision, snapshot_manifest_sha256
 from cu_rates.contracts.base import ContractModel, Identifier
 from cu_rates.contracts.enums import OfferStatus, ReviewSubject
@@ -28,6 +30,8 @@ from cu_rates.contracts.publication import (
     publication_evidence_sha256,
 )
 from cu_rates.contracts.sources import ExtractedCandidate
+from cu_rates.pipeline.slice import verified_offer_candidates
+from cu_rates.pipeline.trusted import load_publication_context
 from cu_rates.validation import RULE_IDS, ValidationContext, validate_offer
 
 from ._database import (
@@ -64,18 +68,45 @@ _ID = TypeAdapter(Identifier)
 
 
 class SnapshotCandidate(ContractModel):
-    """Trusted worker inputs, never web input or caller-asserted decisions.
-
-    Use stored, byte/locator-verified publication inputs (e.g. T014's trusted view)
-    and supply all extracted claims scoped to this row, including the effective date.
-    T045 is run in this process; generic pipeline validation results cannot replace it.
-    T045 currently accepts direct captures, not a refreshed 304 observation time.
-    """
+    """Internal projection input; the publisher constructs it from persisted evidence."""
 
     offer: NormalizedOffer
     context: PublicationContext
     candidates: tuple[ExtractedCandidate, ...]
     current_review: ReviewDecision | None = None
+
+
+def _load_candidate(
+    conn: Connection, store: ArtifactStore, offer_id: str, manifest: PublishedSnapshot
+) -> SnapshotCandidate:
+    view = load_publication_context(conn, offer_id, manifest.published_at, store=store)
+    # The trusted loader re-verifies every separately persisted capture against its
+    # stored bytes and locators. Never accept a caller's offer, context, or review.
+    primary = next(
+        (
+            artifact
+            for artifact in view.context.known_artifacts
+            if artifact.fetched_at == view.offer.observed_at
+            and artifact.artifact_id in {ref.artifact_id for ref in view.offer.iter_provenance()}
+        ),
+        None,
+    )
+    if not view.context.known_artifacts or (
+        primary is None and view.offer.status is OfferStatus.QUARANTINED
+    ):
+        raise SnapshotError(f"stored evidence bytes missing or unverifiable: {offer_id}")
+    if primary is None:
+        # T045 does not accept a refreshed 304 observation in place of a direct capture.
+        raise SnapshotError(f"T045 refused offer without a direct stored capture: {offer_id}")
+    candidates, _ = verified_offer_candidates(
+        view.context.source, view.offer, store.read(primary), primary
+    )
+    return SnapshotCandidate(
+        offer=view.offer,
+        context=view.context,
+        candidates=candidates,
+        current_review=view.current_review,
+    )
 
 
 def _public_url(url: str) -> str:
@@ -197,7 +228,8 @@ def _admit(row: SnapshotCandidate, manifest: PublishedSnapshot) -> PublicOffer:
         == publication_evidence_sha256(offer, corroborated_paths(offer, ctx))
     )
     if not (decision.publishable_now or reviewed) or decision.placement is Placement.NONE:
-        raise SnapshotError(f"publication gate refused offer: {offer.offer_id}")
+        reasons = ", ".join(reason.value for reason in decision.reasons)
+        raise SnapshotError(f"publication gate refused offer: {offer.offer_id}: {reasons}")
 
     proof = validate_offer(
         offer.model_copy(update={"status": OfferStatus.CANDIDATE, "published_at": None}),
@@ -271,12 +303,24 @@ class SnapshotPublisher:
         require_directory(versions)
         return versions
 
-    def build(self, manifest: PublishedSnapshot, rows: Iterable[SnapshotCandidate]) -> SnapshotInfo:
-        """Reject the entire release if any declared row is ineligible or absent."""
+    def build(
+        self, manifest: PublishedSnapshot, *, conn: Connection, store: ArtifactStore
+    ) -> SnapshotInfo:
+        """Reload all declared offers from worker storage; refuse any unverifiable release.
+
+        The caller owns the connection's read transaction. No in-memory captures,
+        contexts, extracted claims, or review decisions are accepted by this API.
+        """
         try:
             manifest = PublishedSnapshot.model_validate(manifest.model_dump())
             offers = tuple(
-                sorted((_admit(row, manifest) for row in rows), key=lambda o: o.offer_id)
+                sorted(
+                    (
+                        _admit(_load_candidate(conn, store, entry.offer_id, manifest), manifest)
+                        for entry in manifest.entries
+                    ),
+                    key=lambda o: o.offer_id,
+                )
             )
             entries = tuple(snapshot_entry(offer) for offer in offers)
             if (
@@ -323,8 +367,15 @@ class SnapshotPublisher:
                     sync_directory(versions)
                 self._activate(version)
             return info
-        except (OSError, sqlite3.Error, ValueError, ValidationError) as exc:
-            raise SnapshotError("snapshot build could not be completed") from exc
+        except (
+            ArtifactStoreError,
+            OSError,
+            sqlite3.Error,
+            SQLAlchemyError,
+            ValueError,
+            ValidationError,
+        ) as exc:
+            raise SnapshotError("snapshot build could not verify persisted evidence") from exc
 
     def rollback(self, snapshot_id: str) -> SnapshotInfo:
         """Verify a retained version before pointing to it; never rewrite its database."""

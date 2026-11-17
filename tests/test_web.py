@@ -15,7 +15,6 @@ import pytest
 from flask import Flask
 from flask.testing import FlaskClient
 
-from cu_rates.contracts.audit import PublishedSnapshot, SnapshotEntry, snapshot_manifest_sha256
 from cu_rates.contracts.enums import (
     CanonicalScenarioId,
     ConditionKind,
@@ -28,7 +27,6 @@ from cu_rates.contracts.enums import (
     ScenarioDimension,
     WithdrawalScope,
 )
-from cu_rates.contracts.fingerprints import offer_fingerprints
 from cu_rates.contracts.offers import (
     FixedEquityDetails,
     HelocDetails,
@@ -36,10 +34,16 @@ from cu_rates.contracts.offers import (
     PurchaseMortgageDetails,
     RefinanceMortgageDetails,
 )
-from cu_rates.contracts.publication import Placement
+from cu_rates.contracts.publication import (
+    DEGRADE_AFTER,
+    WITHDRAW_AFTER,
+    Placement,
+    evaluate_publication,
+)
 from cu_rates.contracts.scenarios import DimensionMatch
-from cu_rates.snapshot import Denylist
-from cu_rates.snapshot.builder import SnapshotCandidate, SnapshotPublisher
+from cu_rates.snapshot import Denylist, SnapshotReader
+from cu_rates.snapshot._models import SnapshotInfo, SnapshotView
+from cu_rates.snapshot.builder import SnapshotCandidate, _public_projection
 from cu_rates.web import create_app
 from cu_rates.web.app import validate_canonical_origin
 from cu_rates.web.views import ARTICLES
@@ -702,36 +706,50 @@ def _make_candidate(
     return SnapshotCandidate(offer=offer, context=ctx, candidates=(date,))
 
 
-def _build_test_snapshot(
+def _mock_public_reader(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     candidates: list[SnapshotCandidate],
     now: datetime = make.EVALUATED_AT,
-) -> tuple[SnapshotPublisher, Denylist]:
-    publisher = SnapshotPublisher(tmp_path / "fixture_snapshots")
+) -> tuple[SimpleNamespace, Denylist]:
+    """Presentation examples only: mock reads in memory, never admit or publish assertions.
+
+    Builder/storage integration uses persisted pipeline fixtures in test_public_snapshot.
+    These examples exercise UI combinations the current slice parser cannot collect.
+    """
+    root = tmp_path / "mock-reader"
+    root.mkdir()
     denylist = Denylist(tmp_path / "independent" / "withdrawals.json")
     denylist.initialize()
-
-    entries = []
-    for item in candidates:
-        fp = offer_fingerprints(item.offer)
-        entries.append(
-            SnapshotEntry(
-                offer_id=item.offer.offer_id,
-                structural_sha256=fp.structural,
-                value_sha256=fp.value,
-            )
-        )
-    ordered = tuple(sorted(entries, key=lambda entry: entry.offer_id))
-    manifest = PublishedSnapshot(
+    info = SnapshotInfo(
         schema_version=make.SV,
         snapshot_id="test-fixture-snap",
         published_at=now,
-        published_by="test-runner",
-        entries=ordered,
-        manifest_sha256=snapshot_manifest_sha256(ordered),
+        published_by="mock-reader",
+        manifest_sha256="0" * 64,
+        supersedes=None,
     )
-    publisher.build(manifest, candidates)
-    return publisher, denylist
+    offers = tuple(
+        _public_projection(item, evaluate_publication(item.offer, item.context).placement, False)
+        for item in candidates
+    )
+
+    def read(self: SnapshotReader, *, at: datetime | None = None) -> SnapshotView:
+        moment = now if at is None else at
+        active = denylist.active_targets(moment)
+        visible = tuple(
+            offer.model_copy(update={"placement": Placement.BROWSE_ONLY})
+            if moment - offer.observed_at > DEGRADE_AFTER and offer.placement is Placement.RANKED
+            else offer
+            for offer in offers
+            if moment < offer.valid_until
+            and moment - offer.observed_at <= WITHDRAW_AFTER
+            and ("offer", offer.offer_id) not in active
+        )
+        return SnapshotView(info=info, offers=visible)
+
+    monkeypatch.setattr(SnapshotReader, "read", read)
+    return SimpleNamespace(root=root), denylist
 
 
 def test_compare_page_empty_state_and_noindex(client: FlaskClient) -> None:
@@ -821,8 +839,9 @@ def test_compare_query_parameter_allow_list(client: FlaskClient) -> None:
 
 def test_compare_fixture_snapshot_rendering_and_incomparable_separation(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Render rate comparison from a temporary fixture snapshot with full guarantees."""
+    """Render comparison UI from explicitly mocked public reader examples."""
     now = make.EVALUATED_AT
 
     # 1. Comparable Alpha CU
@@ -905,8 +924,9 @@ def test_compare_fixture_snapshot_rendering_and_incomparable_separation(
         now=now,
     )
 
-    publisher, denylist = _build_test_snapshot(
+    publisher, denylist = _mock_public_reader(
         tmp_path,
+        monkeypatch,
         [alpha, beta, gamma_no_apr, delta_autopay, zeta_rel, epsilon_withdrawn],
         now=now,
     )
@@ -1047,7 +1067,10 @@ def test_compare_fixture_snapshot_rendering_and_incomparable_separation(
     assert forbidden_ranking_problems(html) == []
 
 
-def test_compare_freshness_degradation_and_expiry(tmp_path: Path) -> None:
+def test_compare_freshness_degradation_and_expiry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Offers degrade to browse-only after 72h and withdraw after 96h independent guard."""
     now = make.EVALUATED_AT
     item = _make_candidate(
@@ -1058,7 +1081,7 @@ def test_compare_freshness_degradation_and_expiry(tmp_path: Path) -> None:
         validity=timedelta(hours=96),  # Valid for 96h (WITHDRAW_AFTER max validity)
         now=now,
     )
-    publisher, denylist = _build_test_snapshot(tmp_path, [item], now=now)
+    publisher, denylist = _mock_public_reader(tmp_path, monkeypatch, [item], now=now)
 
     # 1. Fresh read (< 72h): appears in main comparable grid
     fresh_app = create_app(
@@ -1697,8 +1720,9 @@ def test_heloc_post_intro_proven_figures_and_labeling(tmp_path: Path) -> None:
 
 def test_compare_fixture_scenario_isolation_disclosures_zero_values_and_sorting(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Fixture-backed test built via real snapshot builder verifying:
+    """Mocked public reader examples verify:
     - Purchase and refinance isolation (scenario-specific rows).
     - Coverage disclosure text with counts.
     - Conditions column content.
@@ -1776,8 +1800,11 @@ def test_compare_fixture_scenario_isolation_disclosures_zero_values_and_sorting(
         now=now,
     )
 
-    publisher, denylist = _build_test_snapshot(
-        tmp_path, [purch_alpha, purch_beta, purch_zero, refi_gamma, purch_delta_cond], now=now
+    publisher, denylist = _mock_public_reader(
+        tmp_path,
+        monkeypatch,
+        [purch_alpha, purch_beta, purch_zero, refi_gamma, purch_delta_cond],
+        now=now,
     )
 
     app = create_app(
@@ -1931,7 +1958,10 @@ def test_compare_fixture_scenario_isolation_disclosures_zero_values_and_sorting(
     assert table_apr_desc.index("Beta Purchase CU") < table_apr_desc.index("Zero Purchase CU")
 
 
-def test_compare_empty_filtered_results_have_noindex(tmp_path: Path) -> None:
+def test_compare_empty_filtered_results_have_noindex(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Empty filtered results receive noindex header (Finding 9)."""
     now = make.EVALUATED_AT
     # Snapshot contains only purchase mortgages
@@ -1942,7 +1972,7 @@ def test_compare_empty_filtered_results_have_noindex(tmp_path: Path) -> None:
         apr_str="6.250",
         now=now,
     )
-    publisher, denylist = _build_test_snapshot(tmp_path, [item], now=now)
+    publisher, denylist = _mock_public_reader(tmp_path, monkeypatch, [item], now=now)
 
     app = create_app(
         {
@@ -2046,11 +2076,14 @@ def test_compare_query_param_count_guard(
     assert resp.status_code == 400
 
 
-def test_compare_zero_guard_filtered_scenario_noindex(tmp_path: Path) -> None:
+def test_compare_zero_guard_filtered_scenario_noindex(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Finding 7: Filtered scenario returning 0 offers activates the zero-guard noindex."""
     now = make.EVALUATED_AT
     item = _make_candidate("offer-purch-only", "Purchase CU", now=now)
-    publisher, denylist = _build_test_snapshot(tmp_path, [item], now=now)
+    publisher, denylist = _mock_public_reader(tmp_path, monkeypatch, [item], now=now)
     app = create_app(
         {
             "TESTING": True,
@@ -2135,7 +2168,10 @@ def test_compare_loan_type_no_inferred_purchase_purpose() -> None:
     assert "Second Lien" in loan_type
 
 
-def test_compare_structure_separation_not_mixed_or_swapped(tmp_path: Path) -> None:
+def test_compare_structure_separation_not_mixed_or_swapped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Finding 7: Distinct HELOC structures are in separate tables and never mixed or swapped."""
     from tests.test_validation import material_evidence
 
@@ -2240,7 +2276,7 @@ def test_compare_structure_separation_not_mixed_or_swapped(tmp_path: Path) -> No
         candidates=(date_5y,),
     )
 
-    publisher, denylist = _build_test_snapshot(tmp_path, [cand_10y, cand_5y], now=now)
+    publisher, denylist = _mock_public_reader(tmp_path, monkeypatch, [cand_10y, cand_5y], now=now)
     app = create_app(
         {
             "TESTING": True,
@@ -2269,7 +2305,10 @@ def test_compare_structure_separation_not_mixed_or_swapped(tmp_path: Path) -> No
     assert "FiveYear Draw CU" not in section_10y
 
 
-def test_compare_default_sort_is_alphabetical_not_apr(tmp_path: Path) -> None:
+def test_compare_default_sort_is_alphabetical_not_apr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Finding 7: Default compare sort is strictly institution alphabetical, not APR."""
     now = make.EVALUATED_AT
     # Alpha has higher APR (7.000%)
@@ -2289,7 +2328,7 @@ def test_compare_default_sort_is_alphabetical_not_apr(tmp_path: Path) -> None:
         now=now,
     )
 
-    publisher, denylist = _build_test_snapshot(tmp_path, [alpha, zeta], now=now)
+    publisher, denylist = _mock_public_reader(tmp_path, monkeypatch, [alpha, zeta], now=now)
     app = create_app(
         {
             "TESTING": True,
@@ -2324,7 +2363,10 @@ def test_compare_active_sort_labels_accurate(client: FlaskClient) -> None:
         assert f"Active sort: <strong>{label}</strong>" in resp.get_data(as_text=True)
 
 
-def test_sitemap_excludes_detail_only_snapshots(tmp_path: Path) -> None:
+def test_sitemap_excludes_detail_only_snapshots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Finding 5: Snapshots with only detail-only (no APR) offers stay out of sitemap.xml."""
     now = make.EVALUATED_AT
     detail_only = _make_candidate(
@@ -2334,7 +2376,7 @@ def test_sitemap_excludes_detail_only_snapshots(tmp_path: Path) -> None:
         apr_str=None,  # No APR -> Detail only under D-05
         now=now,
     )
-    publisher, denylist = _build_test_snapshot(tmp_path, [detail_only], now=now)
+    publisher, denylist = _mock_public_reader(tmp_path, monkeypatch, [detail_only], now=now)
     app = create_app(
         {
             "TESTING": True,
@@ -2506,3 +2548,37 @@ def test_rate_and_apr_sorts_are_numeric_and_uncorrelated_with_names() -> None:
     assert names("apr") == ["beta", "gamma", "alpha"]
     assert names("apr_desc") == ["alpha", "gamma", "beta"]
     assert names("institution") == ["alpha", "beta", "gamma"]
+
+
+def test_compare_reads_a_snapshot_admitted_from_persisted_pipeline_evidence(tmp_path: Path) -> None:
+    """End-to-end reader integration uses actual stored fixture captures and reviews."""
+    from cu_rates.db import open_operational_database
+    from cu_rates.snapshot.builder import SnapshotPublisher
+    from tests.pub2_fixtures import reviewed_fixture
+
+    pilot = reviewed_fixture(tmp_path / "worker")
+    assert pilot.reviewed_snapshot is not None
+    manifest = pilot.reviewed_snapshot.model_copy(
+        update={"snapshot_id": "web-verified", "supersedes": None}
+    )
+    publisher = SnapshotPublisher(tmp_path / "snapshots")
+    engine = open_operational_database(pilot.database)
+    with engine.connect() as conn:
+        publisher.build(manifest, conn=conn, store=pilot.store)
+    engine.dispose()
+    pilot.database.rename(pilot.database.with_name("unavailable.sqlite"))
+    denylist = Denylist(tmp_path / "independent" / "withdrawals.json")
+    denylist.initialize()
+    app = create_app(
+        {
+            "TESTING": True,
+            "SNAPSHOT_ROOT": str(publisher.root),
+            "DENYLIST_PATH": str(denylist.path),
+            "SNAPSHOT_CLOCK": manifest.published_at,
+        }
+    )
+    response = app.test_client().get("/compare")
+    assert response.status_code == 200
+    html = response.get_data(as_text=True)
+    assert "Example North Charter" in html
+    assert "6.375%" in html and "6.441%" in html

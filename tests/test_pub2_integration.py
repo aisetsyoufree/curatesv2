@@ -17,10 +17,12 @@ from cu_rates.db.schema import slice_snapshot_baselines
 from cu_rates.pipeline.slice import run_fixture
 from cu_rates.pipeline.trusted import load_publication_context, publish
 from cu_rates.snapshot import SnapshotError
-from cu_rates.snapshot.builder import SnapshotCandidate, _admit, _public_projection
+from cu_rates.snapshot.builder import SnapshotCandidate, SnapshotPublisher, _public_projection
 
 from .pub2_fixtures import reviewed_fixture
-from .test_public_snapshot import release, row
+from .test_public_snapshot import StoredFixture, release
+from .test_public_snapshot import persisted_seed as persisted_seed
+from .test_public_snapshot import stored as stored
 
 
 def test_one_real_capture_alone_never_publishes(tmp_path: Path) -> None:
@@ -111,23 +113,17 @@ def test_two_stored_captures_export_and_audit_both_chains(tmp_path: Path) -> Non
         assert view.current_review.reviewed_evidence_sha256 == audit["publication_evidence_sha256"]
 
 
-def test_review_of_one_capture_cannot_approve_the_pair() -> None:
+def test_review_of_one_capture_cannot_approve_the_pair(
+    tmp_path: Path, stored: StoredFixture
+) -> None:
     from cu_rates.contracts.fingerprints import offer_evidence_sha256
 
-    from .contracts import factories as f
-
-    item = row()
-    offer = item.offer
-    ctx = item.context.model_copy(update={"prior": None})
-    legacy = f.review(offer).model_copy(
-        update={
-            "reviewed_evidence_sha256": offer_evidence_sha256(offer),
-            "decided_at": ctx.evaluated_at,
-        }
-    )
-    item = item.model_copy(update={"context": ctx, "current_review": legacy})
+    item = stored.row("purchase-15-year")
+    stored.approve(item.offer.offer_id, evidence_hash=offer_evidence_sha256(item.offer))
+    item = stored.row("purchase-15-year")
+    publisher = SnapshotPublisher(tmp_path / "legacy-review")
     with pytest.raises(SnapshotError, match="publication gate refused"):
-        _admit(item, release("legacy-review", item, review_ids=(legacy.review_id,)))
+        publisher.build(release("legacy-review", item), conn=stored.conn, store=stored.run.store)
 
 
 def test_repeated_bytes_in_two_runs_do_not_make_independent_evidence(tmp_path: Path) -> None:
