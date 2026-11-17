@@ -129,11 +129,13 @@ class _Run:
     registered sockets, and a socket registered after the deadline is closed immediately.
     """
 
+    _OPEN, _ABORTED, _CLOSED = "open", "aborted", "closed"
+
     def __init__(self, total: float) -> None:
         self._deadline = time.monotonic() + total
         self._lock = threading.Lock()
         self._sockets: list[socket.socket] = []
-        self._tripped = False
+        self._state = self._OPEN  # guarded by _lock; never returns to open
         self.pool: httpcore.ConnectionPool | None = None
         self._timer = threading.Timer(total, self._expire)
         self._timer.daemon = True
@@ -146,7 +148,7 @@ class _Run:
 
     @property
     def expired(self) -> bool:
-        return self._tripped or self.remaining() <= 0
+        return self._state != self._OPEN or self.remaining() <= 0
 
     def bound(self, timeout: float | None) -> float:
         """Clamp a per-operation timeout to the time left; raise once none is left."""
@@ -156,30 +158,46 @@ class _Run:
         return left if timeout is None else min(timeout, left)
 
     def register(self, sock: socket.socket) -> None:
+        """Track a socket, or close it and raise if the run is no longer open."""
         with self._lock:
-            if self.expired:
-                sock.close()
-                raise httpcore.ConnectTimeout("total time limit exceeded")
-            self._sockets.append(sock)
+            if self._state == self._OPEN and self.remaining() > 0:
+                self._sockets.append(sock)
+                return
+        _sever(sock)
+        raise httpcore.ConnectTimeout("total time limit exceeded")
+
+    def _seal(self, state: str) -> list[socket.socket]:
+        """Atomically move out of open (once) and take ownership of every tracked socket."""
+        with self._lock:
+            if self._state == self._OPEN or state == self._CLOSED:
+                self._state = state
+            sockets, self._sockets = self._sockets, []
+        return sockets
+
+    def forget(self, sock: socket.socket) -> None:
+        with self._lock, contextlib.suppress(ValueError):
+            self._sockets.remove(sock)
 
     def _expire(self) -> None:
-        with self._lock:
-            self._tripped = True
-            sockets = list(self._sockets)
-        for sock in sockets:
-            with contextlib.suppress(OSError):
-                sock.shutdown(socket.SHUT_RDWR)
+        for sock in self._seal(self._ABORTED):
+            _sever(sock)
 
     def abort(self) -> None:
-        """Stop the watchdog and close every socket and the pool."""
-        self._timer.cancel()
-        with self._lock:
-            sockets, self._sockets = self._sockets, []
+        """Seal the run, then stop the watchdog, sever every socket, and close the pool."""
+        sockets = self._seal(self._CLOSED)
+        self._timer.cancel()  # only after the state is final: later registrations all fail
         for sock in sockets:
-            with contextlib.suppress(OSError):
-                sock.close()
+            _sever(sock)
         if self.pool is not None:
             self.pool.close()
+
+
+def _sever(sock: socket.socket) -> None:
+    """Wake any blocked reader (shutdown), then release the descriptor."""
+    with contextlib.suppress(OSError):
+        sock.shutdown(socket.SHUT_RDWR)
+    with contextlib.suppress(OSError):
+        sock.close()
 
 
 class _PinnedStream(httpcore.NetworkStream):
@@ -206,7 +224,14 @@ class _PinnedStream(httpcore.NetworkStream):
             raise httpcore.WriteError(str(exc)) from exc
 
     def close(self) -> None:
-        self._sock.close()
+        self._backend.run.forget(self._sock)
+        _sever(self._sock)
+
+    def _drop(self, secured: socket.socket | None) -> None:
+        for sock in (secured, self._sock):
+            if sock is not None:
+                self._backend.run.forget(sock)
+                _sever(sock)
 
     def start_tls(
         self,
@@ -235,11 +260,14 @@ class _PinnedStream(httpcore.NetworkStream):
         except httpcore.ConnectTimeout:
             raise
         except TimeoutError as exc:
-            (secured or self._sock).close()
+            self._drop(secured)
             raise httpcore.ConnectTimeout(str(exc)) from exc
         except OSError as exc:
-            (secured or self._sock).close()
+            self._drop(secured)
             raise httpcore.ConnectError(str(exc)) from exc
+        except BaseException:
+            self._drop(secured)
+            raise
         return self._backend.accept(_PinnedStream(secured, self._backend))
 
     def get_extra_info(self, info: str) -> Any:
@@ -309,13 +337,15 @@ class _PinnedBackend(httpcore.NetworkBackend):
                 sock.connect((str(address), port))
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             except TimeoutError as exc:
-                sock.close()
+                self.run.forget(sock)
+                _sever(sock)
                 failure = httpcore.ConnectTimeout(str(exc))
                 if self.run.expired:
                     break
                 continue
             except OSError as exc:
-                sock.close()
+                self.run.forget(sock)
+                _sever(sock)
                 failure = httpcore.ConnectError(str(exc))
                 continue
             return self.accept(_PinnedStream(sock, self))
@@ -360,6 +390,17 @@ class _GuardedBody(httpx.SyncByteStream):
         self._max_bytes, self._encoded = max_bytes, encoded
 
     def __iter__(self) -> Iterator[bytes]:
+        try:
+            yield from self._guarded()
+        except GeneratorExit:
+            raise
+        except BaseException:
+            # Every terminal error releases the socket now, not when the caller cleans up.
+            with contextlib.suppress(Exception):
+                self.close()
+            raise
+
+    def _guarded(self) -> Iterator[bytes]:
         received = 0
         if self._encoded:
             # The limit counts the bytes we hand on, so a decoder could inflate past it.
@@ -511,11 +552,16 @@ class PinnedTransport(httpx.BaseTransport):
         try:
             response = pool.handle_request(core_request)
         except Exception as exc:
+            mapped = _map_error(exc, run)  # before sealing, so a sealed run is not "expired"
             self._finish(run)
-            mapped = _map_error(exc, run)
             if mapped is exc:
                 raise
             raise mapped from exc
+        if run.expired:
+            with contextlib.suppress(Exception):
+                response.close()
+            self._finish(run)
+            raise httpx.ReadTimeout("total time limit exceeded")
         body = _GuardedBody(
             response,
             lambda: self._finish(run),

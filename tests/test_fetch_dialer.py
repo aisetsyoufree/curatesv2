@@ -1,5 +1,6 @@
 """Pinned dialer tests. The only server is a loopback TLS server with a test-only CA."""
 
+import contextlib
 import gzip
 import ipaddress
 import socket
@@ -352,6 +353,125 @@ def test_socket_registered_after_the_deadline_is_closed_immediately() -> None:
     run.abort()
 
 
+def test_registration_after_abort_closes_the_socket_and_raises() -> None:
+    run = fetch_dialer._Run(60)
+    run.abort()
+    late = socket.socket()
+    with pytest.raises(httpcore.ConnectTimeout):
+        run.register(late)
+    assert late.fileno() == -1 and not run._sockets
+
+
+def test_registration_after_the_watchdog_fires_is_refused_even_once_aborted() -> None:
+    run = fetch_dialer._Run(60)
+    run._expire()
+    run.abort()  # cancels the watchdog; the state must already be final
+    late = socket.socket()
+    with pytest.raises(httpcore.ConnectTimeout):
+        run.register(late)
+    assert late.fileno() == -1
+
+
+def register_racing_abort() -> tuple[fetch_dialer._Run, list[socket.socket]]:
+    run = fetch_dialer._Run(60)
+    socks = [socket.socket() for _ in range(4)]
+    go = threading.Barrier(len(socks) + 1)
+
+    def register(sock: socket.socket) -> None:
+        go.wait()
+        with contextlib.suppress(httpcore.ConnectTimeout):
+            run.register(sock)
+
+    threads = [threading.Thread(target=register, args=(s,)) for s in socks]
+    for thread in threads:
+        thread.start()
+    go.wait()
+    run.abort()
+    for thread in threads:
+        thread.join()
+    return run, socks
+
+
+def test_registering_concurrently_with_abort_never_leaves_a_live_socket() -> None:
+    for _ in range(200):
+        run, socks = register_racing_abort()
+        # Whether registration won or lost the race, nothing may outlive the abort.
+        assert all(s.fileno() == -1 for s in socks) and not run._sockets
+
+
+def test_closing_the_transport_wakes_a_blocked_tls_read(lab: Lab) -> None:
+    def stall(conn: ssl.SSLSocket, path: str) -> None:
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n")
+        time.sleep(5)
+
+    server = lab.serve(stall)
+    transport = lab.transport(server, read_timeout=20, total_timeout=30)
+    response = transport.handle_request(httpx.Request("GET", url_for(server)))
+    finished = threading.Event()
+
+    def reader() -> None:
+        with contextlib.suppress(httpx.HTTPError):
+            for _ in response.stream:  # type: ignore[union-attr]
+                pass
+        finished.set()
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+    time.sleep(0.3)  # let the reader block inside recv
+    transport.close()
+    assert finished.wait(timeout=1.5)
+
+
+def terminal_run(transport: PinnedTransport) -> fetch_dialer._Run:
+    (run,) = transport._runs
+    return run
+
+
+def test_encoding_rejection_releases_the_socket_without_caller_cleanup(lab: Lab) -> None:
+    server = lab.serve(lambda conn, path: reply(conn, extra="Content-Encoding: gzip\r\n"))
+    transport = lab.transport(server)
+    response = transport.handle_request(httpx.Request("GET", url_for(server)))
+    run = terminal_run(transport)
+    assert run._sockets
+    with pytest.raises(fetch_dialer.UnsupportedEncoding):
+        for _ in response.stream:  # type: ignore[union-attr]
+            pass
+    assert run._state == run._CLOSED and not run._sockets and not transport._runs
+
+
+def test_deadline_expiry_releases_the_socket_without_caller_cleanup(lab: Lab) -> None:
+    def drip(conn: ssl.SSLSocket, path: str) -> None:
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n")
+        for _ in range(30):
+            conn.sendall(b"x")
+            time.sleep(0.1)
+
+    server = lab.serve(drip)
+    transport = lab.transport(server, read_timeout=5, total_timeout=0.5)
+    response = transport.handle_request(httpx.Request("GET", url_for(server)))
+    run = terminal_run(transport)
+    with pytest.raises(httpx.HTTPError):
+        for _ in response.stream:  # type: ignore[union-attr]
+            pass
+    assert run._state == run._CLOSED and not run._sockets and not transport._runs
+
+
+def test_black_holed_tcp_connect_hits_the_connect_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    def black_hole(self: socket.socket, address: Any) -> None:
+        # A SYN that is never answered: the kernel gives up only when the socket timeout does.
+        time.sleep(min(self.gettimeout() or 30, 30))
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(socket.socket, "connect", black_hole, raising=False)
+    transport = PinnedTransport(
+        [ipaddress.ip_address("8.8.8.8")], connect_timeout=0.2, total_timeout=20, max_attempts=1
+    )
+    started = time.monotonic()
+    with pytest.raises(httpx.ConnectTimeout):
+        get(transport, f"https://{HOST}/")
+    assert time.monotonic() - started < 3
+
+
 def test_closing_the_transport_severs_a_streaming_response(lab: Lab) -> None:
     def drip(conn: ssl.SSLSocket, path: str) -> None:
         conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n")
@@ -423,7 +543,9 @@ def test_non_https_non_443_and_literal_hosts_are_refused(
     def forbidden(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("a connection was attempted")
 
-    monkeypatch.setattr(httpcore.SyncBackend, "connect_tcp", forbidden)
+    # Socket level, so any URL-guard regression cannot dial out whatever backend is used.
+    monkeypatch.setattr(socket.socket, "connect", forbidden)
+    monkeypatch.setattr(socket, "create_connection", forbidden)
     with pytest.raises(httpx.UnsupportedProtocol):
         PinnedTransport([ipaddress.ip_address("8.8.8.8")]).handle_request(httpx.Request("GET", url))
 

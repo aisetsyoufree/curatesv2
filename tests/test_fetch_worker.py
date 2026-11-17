@@ -650,6 +650,20 @@ def test_empty_body_past_the_profile_deadline_is_stopped(pilot: Pilot) -> None:
     assert result.reason == "response-time-limit" and result.artifact is None
 
 
+def test_late_304_past_the_profile_deadline_is_not_reobserved(pilot: Pilot) -> None:
+    pilot.fetch(lambda req: robots() if req.url.path == "/robots.txt" else page(ETag='"v1"'))
+    pilot.clock.sleep(60)
+
+    def late(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/robots.txt":
+            return robots()
+        pilot.clock.sleep(pilot.profile.timeout_seconds + 5)
+        return httpx.Response(304, headers={"ETag": '"v1"'})
+
+    result = pilot.fetch(late)
+    assert result.reason == "response-time-limit" and result.reobserved is None
+
+
 def test_resolver_rebinding_never_reaches_the_dialer(
     pilot: Pilot, monkeypatch: pytest.MonkeyPatch
 ) -> None:

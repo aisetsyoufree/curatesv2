@@ -409,6 +409,10 @@ class FetchWorker:
             return header_only
         # These responses have no body to inspect; in particular a 304 is not a new capture.
         if code < 200 or code in (204, 205, 304):
+            # Header-only successes still answer to the profile deadline.
+            # Header-only successes still answer to the profile deadline.
+            if self._monotonic() - tick > timeout:
+                raise _Stopped("response-time-limit")
             return header_only
         if headers.get("content-encoding", "identity").lower() != "identity":
             if code != 200:
