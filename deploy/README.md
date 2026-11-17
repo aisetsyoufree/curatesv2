@@ -124,7 +124,14 @@ sudo nano /etc/cu-rates/cu-rates.env
 # Ensure mode 0600 is retained:
 sudo chmod 0600 /etc/cu-rates/cu-rates.env
 ```
-> **Note on Environment Variables:** The Flask application in `src/cu_rates/web/` does NOT read environment variables today (`create_app` takes an explicit configuration dictionary). Therefore, application variables in `/etc/cu-rates/cu-rates.env` (such as `CANONICAL_ORIGIN`, `ENABLE_ANALYTICS`, `CU_RATES_SNAPSHOT_DIR`) currently have no effect until environment-to-config wiring is implemented in task T055. Only `GUNICORN_CMD_ARGS` is read by Gunicorn directly.
+> **Environment Variables (T055):** Gunicorn's `cu_rates.web:create_app()` entry point now reads `CANONICAL_ORIGIN`, `ENABLE_ANALYTICS`, `GA_MEASUREMENT_ID`, `ADS_ENABLED`, `SNAPSHOT_ROOT`, and `DENYLIST_PATH`. `create_app(config_dict)` remains isolated from the environment for tests and embedders. Gunicorn reads `GUNICORN_CMD_ARGS` directly. The legacy `CU_RATES_SNAPSHOT_DIR` and `CU_RATES_DENYLIST_PATH` names are not read; replace them with the names above.
+
+Unset values default to canonical origin `https://cu-rates.org`, analytics and ad slots off, no measurement ID, and no configured snapshot paths (the reader defaults to local `data/snapshots` and `data/independent/withdrawals.json`). Invalid settings abort startup. Booleans accept only `0` or `1`. `GA_MEASUREMENT_ID` must be absent/empty or match `G-[A-Z0-9]{10}` exactly. Canonical origins must be bare HTTPS DNS origins (optional valid port, optional trailing slash), without credentials, paths, queries, or fragments. Paths must be absolute without whitespace, control characters, or `..`; configured files are still verified by `SnapshotReader` on every read. Empty origin/path/boolean values are rejected. No environment setting enables live collection.
+
+Analytics requires both `ENABLE_ANALYTICS=1` and a valid ID. All initial requests are same-origin; only an explicit saved opt-in permits loading Google Analytics. A secure, HttpOnly, SameSite=Strict preference cookie is written only after a choice and lasts 180 days. Native forms work without JavaScript; HTTPS POSTs must supply the canonical `Origin` (foreign/missing Origin is rejected). Withdrawal redirects to a page that does not load the tag and clears this site's GA cookies. Responses with consent state are private/no-store and vary on Cookie; the proxy/CDN must honor these headers. The same-origin script sets Consent Mode v2 defaults denied before any tag call. Advertising consent remains denied. CSP adds only `www.googletagmanager.com` for scripts and `www.google-analytics.com` / `region1.google-analytics.com` for connections when analytics is enabled and configured. No wildcard, inline execution, or advertising host is allowed. Google calls are not made by automated tests.
+
+`ADS_ENABLED=1` exposes only a labeled, empty readiness placeholder with reserved dimensions in the designated footer region, after all content, assumptions, coverage and educational disclosures. Only comparison pages with displayed offers and reviewed educational articles qualify. Error, draft, thin and empty pages cannot render it. There are no creatives, scripts, publisher IDs, `ads.txt`, paid placements, or ad inputs to sorting. Templates must never include slots inside or between offer tables or above disclosures. Keep it `0` at launch; serving real ads requires a later product decision.
+
 
 ### Step 7: Configure Caddy Reverse Proxy & Cloudflare Tunnel
 
@@ -265,11 +272,10 @@ sudo -u cu-rates UV_PROJECT_ENVIRONMENT=/var/lib/cu-rates/venv UV_CACHE_DIR=/var
 sudo systemctl restart cu-rates-web.service
 ```
 
-### Snapshot Rollback (Not yet effective)
-> **STATUS: NOT WIRED / NOT YET EFFECTIVE**  
-> Public snapshot rollback via atomic pointer swaps (`MASTER.md` §6) is **not yet wired** in the web application (`src/cu_rates/web` never opens `current.json`). Wiring dynamic snapshot switching requires the web app to integrate `SnapshotReader` in a later task. Until wired, updating `current.json` has no effect on served traffic without manual app reconfiguration and restart.
+### Snapshot Rollback
+The web application (`src/cu_rates/web`) uses `SnapshotReader` when `SNAPSHOT_ROOT` and `DENYLIST_PATH` are configured. It verifies `current.json` and enforces expiry and denylisting on every comparison read. Missing or invalid inputs show no offers. Pointer swaps take effect on the next read without restart.
 
-Target procedure once wired:
+Procedure:
 1. To roll back to a retained snapshot version, invoke `SnapshotPublisher.rollback()` (from `src/cu_rates/snapshot/builder.py`):
    ```python
    from pathlib import Path
@@ -281,9 +287,8 @@ Target procedure once wired:
    `SnapshotPublisher.rollback()` verifies the retained snapshot database and version descriptor in `/var/lib/cu-rates/snapshots/versions/<snapshot_id>` before atomically activating it by writing `/var/lib/cu-rates/snapshots/current.json`.
 2. The web application dynamically re-reads the snapshot version from `current.json` on request without requiring a service restart.
 
-### Emergency Withdrawal Denylist (Not yet effective)
-> **STATUS: NOT WIRED / NOT YET EFFECTIVE**  
-> Emergency withdrawal denylisting (`MASTER.md` §5, §6) is **not yet wired** in the web application (`src/cu_rates/web` never opens `denylist.json`). Dropping denied rows dynamically requires the web app to integrate `SnapshotReader` denylist filtering in a later task. Until wired, editing `denylist.json` has no effect on served traffic.
+### Emergency Withdrawal Denylist
+The web application enforces the configured `DENYLIST_PATH` through `SnapshotReader` on each read. An uninitialized, missing, or invalid `denylist.json` fails closed and suppresses offers.
 
 > **Prerequisite:** Withdrawal requires an initialized ledger. If `/var/lib/cu-rates/snapshots/denylist.json` was not already initialized during initial setup, run `Denylist.initialize()` once before appending entries (otherwise uninitialized reads fail closed):
 > ```python
@@ -294,7 +299,7 @@ Target procedure once wired:
 > denylist.initialize()
 > ```
 
-Target procedure once wired:
+Procedure:
 1. Append an emergency withdrawal record using `Denylist.withdraw()` (from `src/cu_rates/snapshot/denylist.py`) with all required audit fields:
    ```python
    from datetime import datetime, timezone
