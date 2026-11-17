@@ -1,5 +1,7 @@
 # CU-Rates.org V2
 
+[![check](https://github.com/aisetsyoufree/curatesv2/actions/workflows/check.yml/badge.svg)](https://github.com/aisetsyoufree/curatesv2/actions/workflows/check.yml)
+
 Educational, evidence-backed Massachusetts credit-union home-lending directory and
 comparison project.
 
@@ -44,3 +46,34 @@ uv run ruff check .
 uv run mypy src tests
 uv run pytest
 ```
+
+Formatting is checked separately in CI and before every merge:
+
+```sh
+uv run ruff format --check .
+```
+
+## Project layout
+
+| Path | Contents |
+|---|---|
+| `src/cu_rates/contracts/` | Versioned domain contracts, taxonomy, fingerprints, and the publication gate |
+| `src/cu_rates/artifact_store.py` | Immutable, content-addressed raw evidence store |
+| `src/cu_rates/fetch_worker.py`, `fetch_robots.py` | Policy-gated collector (live transport disabled) |
+| `src/cu_rates/normalize/`, `validation/` | Deterministic normalization and validation/quarantine |
+| `src/cu_rates/db/`, `alembic/` | Operational SQLite schema and frozen migrations |
+| `src/cu_rates/roster/` | Source-versioned institution roster import |
+| `src/cu_rates/pipeline/` | Offline vertical slice (slice-only extractor) |
+| `src/cu_rates/snapshot/` | Atomic public snapshot builder and reader, when merged |
+| `src/cu_rates/web/` | Server-rendered website foundation and draft educational articles |
+| `tests/` | Offline tests and synthetic fixtures (no live requests) |
+| `scripts/check` | The quality gate |
+
+## Governance
+
+- [`MASTER.md`](MASTER.md) is the canonical specification; [`AGENTS.md`](AGENTS.md) and
+  [`CONTRIBUTING.md`](CONTRIBUTING.md) describe how work is done.
+- Task status lives only in the GitHub Project and Issues; pull requests and commits hold
+  the code and review history.
+- Security issues: see [`SECURITY.md`](SECURITY.md). Licensing: see [`LICENSE`](LICENSE) and
+  `MASTER.md` decision D-06.
