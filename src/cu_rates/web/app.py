@@ -1,44 +1,13 @@
 """Application factory for the CU-Rates.org website."""
 
-import re
 from typing import Any
-from urllib.parse import urlsplit
 
-from flask import Flask, Response, render_template
+from flask import Flask, Response, render_template, request
 
+from cu_rates.web.config import config_from_environment, validated_config
+from cu_rates.web.config import validate_canonical_origin as validate_canonical_origin
+from cu_rates.web.consent import CONSENT_COOKIE, analytics_ready
 from cu_rates.web.views import seo_for_request, web_bp
-
-_ORIGIN_HOST = re.compile(r"[a-z0-9.-]+")
-
-
-def validate_canonical_origin(value: object) -> str:
-    """Return a bare https origin, or raise ValueError if the setting is unusable."""
-    if not isinstance(value, str) or not value or any(char.isspace() for char in value):
-        raise ValueError("CANONICAL_ORIGIN must be an https origin")
-    parts = urlsplit(value)
-    if parts.scheme != "https" or not parts.hostname:
-        raise ValueError("CANONICAL_ORIGIN must be an https origin")
-    if parts.username or parts.password or parts.query or parts.fragment:
-        raise ValueError("CANONICAL_ORIGIN must not include credentials, a query, or a fragment")
-    if parts.path not in {"", "/"}:
-        raise ValueError("CANONICAL_ORIGIN must not include a path")
-    host = parts.hostname
-    if (
-        _ORIGIN_HOST.fullmatch(host) is None
-        or "." not in host
-        or ".." in host
-        or host.startswith((".", "-"))
-        or host.endswith((".", "-"))
-    ):
-        raise ValueError("CANONICAL_ORIGIN host is not a bare DNS name")
-    try:
-        port = parts.port
-    except ValueError as exc:
-        raise ValueError("CANONICAL_ORIGIN port is invalid") from exc
-    if port == 443:
-        port = None
-    netloc = host if port is None else f"{host}:{port}"
-    return f"https://{netloc}"
 
 
 def create_app(config: dict[str, Any] | None = None) -> Flask:
@@ -49,23 +18,19 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
         static_folder="static",
     )
 
-    app.config.setdefault("TESTING", False)
-    app.config.setdefault("ENABLE_ANALYTICS", False)
-    app.config.setdefault("GA_MEASUREMENT_ID", None)
-    app.config.setdefault("CANONICAL_ORIGIN", "https://cu-rates.org")
-    app.config.setdefault("SNAPSHOT_ROOT", None)
-    app.config.setdefault("DENYLIST_PATH", None)
-    app.config.setdefault("SNAPSHOT_CLOCK", None)
-
-    if config:
-        app.config.update(config)
-    app.config["CANONICAL_ORIGIN"] = validate_canonical_origin(app.config.get("CANONICAL_ORIGIN"))
+    # Gunicorn calls create_app(); tests and embedders retain isolated explicit config.
+    values = config_from_environment() if config is None else validated_config(config)
+    app.config.update(values)
 
     app.register_blueprint(web_bp)
 
     @app.context_processor
     def inject_seo() -> dict[str, object]:
-        return {"seo": seo_for_request()}
+        return {
+            "seo": seo_for_request(),
+            "analytics_ready": analytics_ready(),
+            "analytics_consent": request.cookies.get(CONSENT_COOKIE, "unset"),
+        }
 
     @app.errorhandler(404)
     def page_not_found(error: object) -> tuple[str, int, dict[str, str]]:
@@ -73,13 +38,20 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
 
     @app.after_request
     def set_security_headers(response: Response) -> Response:
+        script_hosts = " https://www.googletagmanager.com" if analytics_ready() else ""
+        connect_hosts = (
+            " https://www.google-analytics.com https://region1.google-analytics.com"
+            if analytics_ready()
+            else ""
+        )
         csp = (
             "default-src 'self'; "
-            "script-src 'self'; "
+            f"script-src 'self'{script_hosts}; "
             "style-src 'self'; "
             "img-src 'self'; "
             "font-src 'self'; "
-            "connect-src 'self'; "
+            f"connect-src 'self'{connect_hosts}; "
+            "object-src 'none'; "
             "frame-ancestors 'none'; "
             "base-uri 'self'; "
             "form-action 'self'"
@@ -98,6 +70,9 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
         )
         if response.mimetype == "text/html":
             response.headers["Cache-Control"] = "no-cache, must-revalidate"
+            if analytics_ready() or request.endpoint == "web.analytics_consent":
+                response.headers["Cache-Control"] = "private, no-store"
+                response.vary.add("Cookie")
         return response
 
     return app

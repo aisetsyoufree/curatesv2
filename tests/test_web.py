@@ -310,14 +310,15 @@ def test_optional_analytics_consent_integration_point() -> None:
         {
             "TESTING": True,
             "ENABLE_ANALYTICS": True,
-            "GA_MEASUREMENT_ID": "G-MEASURETEST",
+            "GA_MEASUREMENT_ID": "G-MEASURETES",
         }
     )
     test_client = analytics_app.test_client()
     resp = test_client.get("/")
     html = resp.get_data(as_text=True)
     assert executable_inline_scripts(html) == 0
-    assert "G-MEASURETEST" not in html
+    assert 'data-measurement-id="G-MEASURETES"' in html
+    assert 'data-consent="denied"' in html
     assert "googletagmanager" not in html
     assert "google-analytics" not in html
     sources = [
@@ -337,9 +338,12 @@ def test_optional_analytics_consent_integration_point() -> None:
             "ad_personalization": "denied",
         }
     ]
-    assert consent_update_calls(script) == 0
-    assert script_request_urls(script) == []
-    assert csp_problems(resp.headers.get("Content-Security-Policy", "")) == []
+    # These calls are gated by a saved opt-in; runtime gating is covered in T055 tests.
+    assert consent_update_calls(script) == 1
+    assert script_request_urls(script) == ["https://www.googletagmanager.com/gtag/js?id="]
+    csp = resp.headers["Content-Security-Policy"]
+    assert "script-src 'self' https://www.googletagmanager.com" in csp
+    assert "'unsafe-inline'" not in csp
 
 
 def test_robots_txt_and_sitemap_xml(client: FlaskClient) -> None:
@@ -594,13 +598,14 @@ def test_canonical_origin_is_validated_and_used_by_robots_and_sitemap() -> None:
             validate_canonical_origin(bad)
 
 
-def test_privacy_describes_consent_as_planned(client: FlaskClient) -> None:
-    """Privacy copy does not claim the consent choice is already implemented."""
+def test_privacy_describes_implemented_optional_consent(client: FlaskClient) -> None:
+    """Privacy describes the actual opt-in, withdrawal and storage behavior."""
     text = client.get("/privacy").get_data(as_text=True).lower()
-    assert "not implemented yet" in text
-    assert "planned" in text
-    assert "implements google consent mode" not in text
-    assert "explicit consent is provided" not in text
+    assert "not implemented yet" not in text
+    assert "allow analytics" in text
+    assert "withdraw analytics" in text
+    assert "180 days" in text
+    assert "advertising consent stays denied" in text
 
 
 def test_aria_current_matches_the_open_page(client: FlaskClient) -> None:

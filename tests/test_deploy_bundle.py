@@ -990,20 +990,29 @@ def test_env_example_content_and_annotations() -> None:
     """Verify deploy/env.example explains Flask env status and marks each variable."""
     env_content = (DEPLOY_DIR / "env.example").read_text(encoding="utf-8")
 
-    # Plain statement explaining create_app takes config dict and does not read env today
-    assert (
-        "create_app takes a config dict" in env_content
-        or "does NOT read environment variables" in env_content
-    )
+    assert "create_app() reads" in env_content
+    assert "create_app(config_dict)" in env_content
+    assert "Invalid values abort startup" in env_content
     assert "T055" in env_content
-
-    # Every active variable must be annotated
     assert "read by: gunicorn only" in env_content
-    assert "not yet read by the app (T055)" in env_content
-    assert "GUNICORN_CMD_ARGS=" in env_content
+    assert "read by: create_app()" in env_content
+    for name in (
+        "CANONICAL_ORIGIN",
+        "ENABLE_ANALYTICS",
+        "GA_MEASUREMENT_ID",
+        "ADS_ENABLED",
+        "SNAPSHOT_ROOT",
+        "DENYLIST_PATH",
+        "GUNICORN_CMD_ARGS",
+    ):
+        assert f"{name}=" in env_content
     assert "CANONICAL_ORIGIN=https://cu-rates.org" in env_content
-    assert "CU_RATES_SNAPSHOT_DIR=" in env_content
-    assert "CU_RATES_LIVE_COLLECTION_ENABLED=0" in env_content
+    assert "ENABLE_ANALYTICS=0" in env_content
+    assert "ADS_ENABLED=0" in env_content
+    assert "CU_RATES_SNAPSHOT_DIR=" not in env_content
+    assert "CU_RATES_DENYLIST_PATH=" not in env_content
+    assert "NO EFFECT" not in env_content
+    assert "does NOT read environment" not in env_content
 
     # Unused variables removed
     removed_vars = [
@@ -1046,13 +1055,17 @@ def test_deploy_readme_runbook_completeness() -> None:
         assert section in readme, f"README.md missing section: {section}"
 
 
-def test_rollback_and_denylist_disclosed_as_not_yet_effective() -> None:
-    """Verify README discloses rollback and denylist controls are not yet wired."""
+def test_rollback_and_denylist_disclosed_as_configured_read_time_controls() -> None:
+    """README describes the configured SnapshotReader and its fail-closed inputs."""
     readme = (DEPLOY_DIR / "README.md").read_text(encoding="utf-8")
 
-    # Snapshot rollback section must disclose that it is not yet effective / wired
-    assert "Snapshot Rollback (Not yet effective)" in readme
-    assert "not yet wired" in readme
+    assert "Snapshot Rollback" in readme
+    assert "not yet wired" not in readme
+    assert "now reads" in readme
+    assert "SNAPSHOT_ROOT" in readme
+    assert "DENYLIST_PATH" in readme
+    assert "Invalid settings abort startup" in readme
+    assert "private/no-store" in readme
     assert "SnapshotReader" in readme
     assert "src/cu_rates/web" in readme
 
@@ -1064,8 +1077,8 @@ def test_rollback_and_denylist_disclosed_as_not_yet_effective() -> None:
     assert "SnapshotPublisher.rollback" in readme
     assert "publisher.rollback" in readme
 
-    # Emergency withdrawal denylist section must disclose that it is not yet effective / wired
-    assert "Emergency Withdrawal Denylist (Not yet effective)" in readme
+    assert "Emergency Withdrawal Denylist" in readme
+    assert "invalid `denylist.json` fails closed" in readme
     assert "denylist.json" in readme
 
     # Must document Denylist.withdraw() with required audit fields
