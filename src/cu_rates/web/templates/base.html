@@ -21,8 +21,8 @@
   <script type="application/ld+json">{{ seo.json_ld | tojson }}</script>
   {% endif %}
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-  {% if config.ENABLE_ANALYTICS and config.GA_MEASUREMENT_ID %}
-  <script src="{{ url_for('static', filename='consent.js') }}"></script>
+  {% if analytics_ready %}
+  <script src="{{ url_for('static', filename='consent.js') }}" defer data-measurement-id="{{ config.GA_MEASUREMENT_ID }}" data-consent="{{ 'granted' if analytics_consent == 'granted' else 'denied' }}"></script>
   {% endif %}
 </head>
 <body>
@@ -68,6 +68,19 @@
         <p><strong>Educational Information Only:</strong> CU-Rates.org is an educational and informational directory, not a lender, broker, or quote service. All content is strictly educational information and not personalized financial advice. We do not provide loan quotes or loan approvals. All information is published strictly for educational discovery, research, and transparency.</p>
       </div>
 
+      {% if analytics_ready %}
+      <section class="consent-choice" aria-labelledby="analytics-choice">
+        <h2 id="analytics-choice" tabindex="-1">Analytics choice</h2>
+        <p id="analytics-help">Optional Google Analytics measures page visits using cookies. Nothing is sent to Google before you allow it. Your choice is saved for 180 days. You can change it here at any time.</p>
+        <p role="status">{% if analytics_consent == 'granted' %}Analytics allowed.{% elif analytics_consent == 'denied' %}Analytics declined.{% else %}No choice saved. Analytics is off.{% endif %}</p>
+        <form method="post" action="{{ url_for('web.analytics_consent') }}" aria-labelledby="analytics-choice" aria-describedby="analytics-help">
+          <button class="control-button" type="submit" name="choice" value="granted">Allow analytics</button>
+          <button class="control-button" type="submit" name="choice" value="denied">Decline or withdraw analytics</button>
+        </form>
+        <noscript><p>Analytics cannot run without JavaScript. These controls still save your choice, and all core content remains available.</p></noscript>
+      </section>
+      {% endif %}
+
       <nav aria-label="Footer navigation">
         <ul class="footer-links">
           <li><a href="{{ url_for('web.home') }}">Home</a></li>
@@ -77,6 +90,10 @@
           <li><a href="{{ url_for('web.privacy') }}">Privacy Policy</a></li>
         </ul>
       </nav>
+
+      {% if config.ADS_ENABLED and not noindex and not is_draft and request.endpoint in ['web.compare', 'web.learn_article'] %}
+      {% include '_ad_slot.html' %}
+      {% endif %}
 
       <p class="footer-copy">&copy; 2026 CU-Rates.org. Educational project for Massachusetts residential lending transparency. MIT License / CC BY 4.0.</p>
     </div>

@@ -3,7 +3,15 @@
 from datetime import UTC, datetime
 from typing import Any, TypedDict
 
-from flask import Blueprint, Response, abort, current_app, render_template, request
+from flask import (
+    Blueprint,
+    Response,
+    abort,
+    current_app,
+    render_template,
+    request,
+    url_for,
+)
 
 from cu_rates.contracts.enums import ProductFamily
 from cu_rates.web.comparison import (
@@ -18,6 +26,7 @@ from cu_rates.web.comparison import (
     read_snapshot_offers,
     sort_offers,
 )
+from cu_rates.web.consent import CONSENT_COOKIE, analytics_ready
 
 web_bp = Blueprint("web", __name__)
 
@@ -132,8 +141,7 @@ _PAGE_META: dict[str, tuple[str, str, tuple[tuple[str, str], ...]]] = {
     ),
     "web.privacy": (
         "Privacy Policy and Consent Notice",
-        "How CU-Rates.org handles privacy and server logs, and the planned status of "
-        "analytics consent.",
+        "How CU-Rates.org handles privacy, server logs, and optional analytics consent.",
         (("Home", "/"), ("Privacy Policy and Consent Notice", "/privacy")),
     ),
     "web.learn_index": (
@@ -243,6 +251,45 @@ def methodology() -> str:
 def privacy() -> str:
     """Render privacy policy and consent page."""
     return render_template("privacy.html")
+
+
+@web_bp.post("/privacy/consent")
+def analytics_consent() -> Response:
+    """Record a deliberate same-origin choice without sessions or pre-choice cookies."""
+    if not analytics_ready():
+        abort(404)
+    # HTTPS form POSTs supply Origin. Missing/foreign origins cannot opt a visitor in.
+    if request.headers.get("Origin") != current_app.config["CANONICAL_ORIGIN"]:
+        abort(400)
+    if set(request.form) != {"choice"} or len(request.form.getlist("choice")) != 1:
+        abort(400)
+    choice = request.form["choice"]
+    if choice not in {"granted", "denied"}:
+        abort(400)
+    response = current_app.response_class(status=303)
+    response.headers["Location"] = url_for("web.privacy", _anchor="analytics-choice")
+    response.set_cookie(
+        CONSENT_COOKIE,
+        choice,
+        max_age=60 * 60 * 24 * 180,
+        secure=True,
+        httponly=True,
+        samesite="Strict",
+    )
+    if choice == "denied":
+        # Clear GA cookies scoped to this host and its parent domains. No tag is loaded
+        # on the destination page; do not send a cookieless consent-update ping.
+        host = request.host.split(":", 1)[0]
+        labels = host.split(".")
+        domains: list[str | None] = [None]
+        domains.extend(".".join(labels[index:]) for index in range(len(labels) - 1))
+        for name in request.cookies:
+            if name == "_ga" or name.startswith("_ga_"):
+                for domain in domains:
+                    response.delete_cookie(name, domain=domain, secure=True, samesite="Strict")
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["X-Robots-Tag"] = "noindex, follow"
+    return response
 
 
 MAX_COMPARE_QUERY_BYTES = 2048
