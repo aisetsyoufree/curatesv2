@@ -1,6 +1,7 @@
 """Pinned dialer tests. The only server is a loopback TLS server with a test-only CA."""
 
 import contextlib
+import gc
 import gzip
 import ipaddress
 import socket
@@ -452,16 +453,17 @@ def test_start_tls_never_closes_an_unrelated_descriptor_when_an_abort_lands_mid_
             aborter = threading.Thread(target=run.abort)
             aborter.start()
             aborter.join(timeout=0.3)  # an unsafe wrap lets the abort finish; a safe one blocks
+            blocked = aborter.is_alive()
             filler: list[socket.socket] = []
             bystander = socket.socket()
-            if not aborter.is_alive():
+            if not blocked:
                 # The raw descriptor was freed under the wrapper: make a bystander reuse it.
                 while bystander.fileno() != raw_fd and len(filler) < 4096:
                     filler.append(bystander)
                     bystander = socket.socket()
             for extra in filler:
                 extra.close()
-            state.update(bystander=bystander, aborter=aborter)
+            state.update(bystander=bystander, aborter=aborter, blocked=blocked)
         return real_detach(self)
 
     monkeypatch.setattr(socket.socket, "detach", detach, raising=False)
@@ -470,6 +472,10 @@ def test_start_tls_never_closes_an_unrelated_descriptor_when_an_abort_lands_mid_
     state["aborter"].join()
     bystander = state["bystander"]
     try:
+        # Drop retained wrappers (exception tracebacks) so a stale wrapper is finalised now.
+        gc.collect()
+        # The abort must be serialised behind the in-progress wrap, not race it.
+        assert state["blocked"], "abort completed while the TLS wrap was still in progress"
         bystander.getsockname()  # EBADF if the wrapper closed the reused descriptor number
     finally:
         bystander.close()
