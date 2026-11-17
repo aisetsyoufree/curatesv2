@@ -491,8 +491,20 @@ def test_caddyfile_configuration() -> None:
     """Verify Caddy reverse proxy configuration behind Cloudflare Tunnel."""
     caddyfile = (DEPLOY_DIR / "caddy" / "Caddyfile").read_text(encoding="utf-8")
 
-    # Plain HTTP on loopback port 8080 with auto_https off
-    assert "auto_https off" in caddyfile
+    # Site-only fragment: no global options block to avoid conflicts
+    # with the host's existing main Caddyfile.
+    non_comment_lines = [
+        line.strip()
+        for line in caddyfile.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    assert non_comment_lines, "Caddyfile must not be empty"
+    assert not non_comment_lines[0].startswith("{"), (
+        "Caddyfile must be a site-only fragment without a global options block"
+    )
+    assert "auto_https" not in caddyfile, "Fragment must not contain global auto_https directive"
+
+    # Plain HTTP on loopback port 8080
     assert "http://cu-rates.org:8080" in caddyfile
     assert "bind 127.0.0.1" in caddyfile
     assert "reverse_proxy 127.0.0.1:8000" in caddyfile
@@ -506,9 +518,12 @@ def test_caddyfile_configuration() -> None:
     # Must contain comment stating app must not trust forwarded header for security decisions
     assert "must not trust" in caddyfile.lower() or "not trust" in caddyfile.lower()
 
-    # Access logs must be discarded at Caddy layer to avoid logging URI query strings
+    # Access logs discarded and error/runtime logs filtered to redact URIs/query strings and headers
     assert "output discard" in caddyfile
     assert "cu-rates-access.log" not in caddyfile
+    assert "format filter" in caddyfile
+    assert "request>uri delete" in caddyfile
+    assert "request>headers delete" in caddyfile
 
     # Must NOT duplicate app security headers from src/cu_rates/web/app.py
     duplicated_headers = [
@@ -524,6 +539,15 @@ def test_caddyfile_configuration() -> None:
 
     # Keeps header removal that app does not set
     assert "-Server" in caddyfile
+
+
+def test_caddy_readme_documents_import_and_validate_steps() -> None:
+    """Verify README documents explicit Caddy import directive and validation step."""
+    readme = (DEPLOY_DIR / "README.md").read_text(encoding="utf-8")
+    assert "import /etc/caddy/conf.d/*.caddyfile" in readme or "import" in readme
+    assert "caddy validate" in readme
+    assert "systemctl reload caddy" in readme
+    assert "conf.d" in readme
 
 
 def test_tunnel_port_consistency() -> None:
@@ -652,10 +676,32 @@ def test_rollback_and_denylist_disclosed_as_not_yet_effective() -> None:
     assert "SnapshotReader" in readme
     assert "src/cu_rates/web" in readme
 
+    # Must reference current.json (the implemented pointer file), never pointer.json
+    assert "current.json" in readme
+    assert "pointer.json" not in readme
+
+    # Must document SnapshotPublisher.rollback()
+    assert "SnapshotPublisher.rollback" in readme
+    assert "publisher.rollback" in readme
+
     # Emergency withdrawal denylist section must disclose that it is not yet effective / wired
     assert "Emergency Withdrawal Denylist (Not yet effective)" in readme
-    assert "pointer.json" in readme
     assert "denylist.json" in readme
+
+    # Must document Denylist.withdraw() with required audit fields
+    assert "Denylist.withdraw" in readme
+    assert "denylist.withdraw" in readme
+    assert "WithdrawalEntry" in readme
+    required_audit_fields = [
+        "withdrawal_id",
+        "scope",
+        "target_id",
+        "actor",
+        "withdrawn_at",
+        "reason",
+    ]
+    for field in required_audit_fields:
+        assert field in readme, f"README must document required audit field '{field}'"
 
 
 def test_units_omit_tmp_from_readwritepaths_with_privatetmp() -> None:

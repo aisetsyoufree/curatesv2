@@ -1,12 +1,9 @@
-# CU-Rates.org V2 — Caddy Reverse Proxy Configuration
+# CU-Rates.org V2 — Caddy Reverse Proxy Configuration (Site Fragment)
 # Behind Cloudflare Tunnel with no inbound router port (MASTER.md D-09).
 # Cloudflared terminates edge TLS and routes plain HTTP to loopback port 8080.
 # No secrets are stored in this file.
-
-{
-    # Cloudflare Tunnel terminates TLS at edge; serve plain HTTP on loopback
-    auto_https off
-}
+# Note: This is a site-only fragment (no global options block) to prevent
+# conflicts with the host's existing global options in /etc/caddy/Caddyfile.
 
 # Canonical domain configuration
 http://cu-rates.org:8080 {
@@ -28,10 +25,19 @@ http://cu-rates.org:8080 {
         -Server
     }
 
-    # Access logging: disabled at Caddy proxy layer to avoid logging raw URI query strings;
-    # structured query-free access logging is handled upstream by Gunicorn in cu-rates-web.service.
+    # Access and error logging:
+    # Discard access logging at Caddy layer (structured query-free logging is handled upstream by Gunicorn).
+    # Configure log filter so request URIs (including query strings) and headers are redacted/deleted,
+    # ensuring upstream proxy failures or error logs never record sensitive query strings or headers.
     log {
         output discard
+        format filter {
+            wrap console
+            fields {
+                request>uri delete
+                request>headers delete
+            }
+        }
     }
 }
 

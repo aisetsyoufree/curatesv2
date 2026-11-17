@@ -39,7 +39,7 @@ All persistent data, code, virtual environments, and evidence artifacts reside u
 ├── venv/                 # uv-managed Python 3.12 virtual environment (deploy group)
 ├── .cache/               # uv package cache directory (mode 0755)
 ├── snapshots/            # Public snapshot directory (read-only for web process)
-│   ├── pointer.json      # Atomic JSON pointer to current active snapshot version
+│   ├── current.json      # Atomic JSON pointer to current active snapshot version
 │   ├── denylist.json     # Emergency withdrawal denylist
 │   └── versions/         # Verified, immutable public SQLite databases
 ├── data/                 # Operational SQLite database (WAL mode; worker only, mode 0750)
@@ -114,11 +114,30 @@ sudo chmod 0600 /etc/cu-rates/cu-rates.env
 
 ### Step 6: Configure Caddy Reverse Proxy & Cloudflare Tunnel
 1. Integrate `deploy/caddy/Caddyfile` into Caddy's configuration:
+`deploy/caddy/Caddyfile` is a **site-only fragment** (no global options block) to prevent syntax conflicts with existing global configuration in `/etc/caddy/Caddyfile`.
+
+Copy the fragment into Caddy's configuration directory:
 ```bash
+sudo mkdir -p /etc/caddy/conf.d
 sudo cp deploy/caddy/Caddyfile /etc/caddy/conf.d/cu-rates.caddyfile
+```
+
+Add the explicit `import` directive to `/etc/caddy/Caddyfile` (if not already present):
+```caddy
+import /etc/caddy/conf.d/*.caddyfile
+```
+
+Validate the Caddy configuration with `caddy validate` before reloading:
+```bash
+caddy validate --config /etc/caddy/Caddyfile
+```
+
+Reload Caddy to apply configuration:
+```bash
 sudo systemctl reload caddy
 ```
-Caddy listens on loopback plain HTTP port 8080 (`http://127.0.0.1:8080`) with `auto_https off` and proxies upstream to Gunicorn on `127.0.0.1:8000`. Caddy access logging is discarded (`output discard`) to prevent query strings from being logged; Gunicorn handles query-free access logging.
+
+Caddy listens on loopback plain HTTP port 8080 (`http://127.0.0.1:8080`) and proxies upstream to Gunicorn on `127.0.0.1:8000`. Caddy access logging is discarded (`output discard`), and error/runtime logging is filtered (`request>uri delete`, `request>headers delete`) to prevent query strings or sensitive headers from being logged on upstream failures; structured query-free access logging is handled upstream by Gunicorn in `cu-rates-web.service`.
 
 2. In Cloudflare Tunnel (`cloudflared` configuration), configure ingress to route `cu-rates.org` to Caddy at `http://127.0.0.1:8080`:
 ```yaml
@@ -191,18 +210,45 @@ sudo systemctl restart cu-rates-web.service
 
 ### Snapshot Rollback (Not yet effective)
 > **STATUS: NOT WIRED / NOT YET EFFECTIVE**  
-> Public snapshot rollback via atomic pointer swaps (`MASTER.md` §6) is **not yet wired** in the web application (`src/cu_rates/web` never opens `pointer.json`). Wiring dynamic snapshot switching requires the web app to integrate `SnapshotReader` in a later task. Until wired, updating `pointer.json` has no effect on served traffic without manual app reconfiguration and restart.
+> Public snapshot rollback via atomic pointer swaps (`MASTER.md` §6) is **not yet wired** in the web application (`src/cu_rates/web` never opens `current.json`). Wiring dynamic snapshot switching requires the web app to integrate `SnapshotReader` in a later task. Until wired, updating `current.json` has no effect on served traffic without manual app reconfiguration and restart.
 
 Target procedure once wired:
-1. To roll back to a previous snapshot, update `/var/lib/cu-rates/snapshots/pointer.json` with the previous `snapshot_id` and hash.
-2. The web application dynamically re-reads the snapshot version on request without requiring a service restart.
+1. To roll back to a retained snapshot version, invoke `SnapshotPublisher.rollback()` (from `src/cu_rates/snapshot/builder.py`):
+   ```python
+   from pathlib import Path
+   from cu_rates.snapshot.builder import SnapshotPublisher
+
+   publisher = SnapshotPublisher(Path("/var/lib/cu-rates/snapshots"))
+   info = publisher.rollback("<target-snapshot-id>")
+   ```
+   `SnapshotPublisher.rollback()` verifies the retained snapshot database and version descriptor in `/var/lib/cu-rates/snapshots/versions/<snapshot_id>` before atomically activating it by writing `/var/lib/cu-rates/snapshots/current.json`.
+2. The web application dynamically re-reads the snapshot version from `current.json` on request without requiring a service restart.
 
 ### Emergency Withdrawal Denylist (Not yet effective)
 > **STATUS: NOT WIRED / NOT YET EFFECTIVE**  
 > Emergency withdrawal denylisting (`MASTER.md` §5, §6) is **not yet wired** in the web application (`src/cu_rates/web` never opens `denylist.json`). Dropping denied rows dynamically requires the web app to integrate `SnapshotReader` denylist filtering in a later task. Until wired, editing `denylist.json` has no effect on served traffic.
 
 Target procedure once wired:
-1. Append the target ID to `/var/lib/cu-rates/snapshots/denylist.json` (`MASTER.md` §5, §6).
+1. Append an emergency withdrawal record using `Denylist.withdraw()` (from `src/cu_rates/snapshot/denylist.py`) with all required audit fields:
+   ```python
+   from datetime import datetime, timezone
+   from pathlib import Path
+   from cu_rates.contracts.audit import WithdrawalEntry
+   from cu_rates.contracts.enums import WithdrawalScope
+   from cu_rates.snapshot import Denylist
+
+   denylist = Denylist(Path("/var/lib/cu-rates/snapshots/denylist.json"))
+   entry = WithdrawalEntry(
+       withdrawal_id="wd-20261117-001",
+       scope=WithdrawalScope.OFFER,  # "offer", "product", "institution", "source", or "snapshot"
+       target_id="off-example-123",
+       actor="operator@cu-rates.org",
+       withdrawn_at=datetime.now(timezone.utc),
+       reason="Emergency suppression due to erroneous rate claim",
+   )
+   denylist.withdraw(entry)
+   ```
+   `Denylist.withdraw()` acquires the writer lock, validates required audit fields (`withdrawal_id`, `scope`, `target_id`, `actor`, `withdrawn_at`, `reason`), and atomically writes the updated ledger to `/var/lib/cu-rates/snapshots/denylist.json`.
 2. The web layer filters denied entities on the next incoming request with zero delay.
 
 ---
