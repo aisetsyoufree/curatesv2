@@ -821,19 +821,10 @@ def _scan_module(
                                 has_as_uri = True
 
                     is_file_uri = has_as_uri or any("file:" in s for s in conn_target_strings)
-                    has_query_mode_ro = False
-                    for s in conn_target_strings:
-                        if "#" in s:
-                            q_part, _f_part = s.split("#", 1)
-                            if "mode=ro" in q_part:
-                                has_query_mode_ro = True
-                        else:
-                            if "mode=ro" in s:
-                                has_query_mode_ro = True
+                    has_query_mode_ro = any(_uri_is_read_only(s) for s in conn_target_strings)
 
                     valid_uri_ro = has_uri_true and is_file_uri and has_query_mode_ro
 
-                    has_query_only = False
                     conn_vars: list[str] = []
                     curr: ast.AST | None = node
                     while curr is not None:
@@ -853,12 +844,17 @@ def _scan_module(
                             break
                         curr = p
 
-                    if any(v in query_only_conn_vars for v in conn_vars):
-                        has_query_only = True
-
-                    if not (valid_uri_ro or has_query_only):
+                    if not valid_uri_ro:
                         references.append(f"sqlite writable connection '{called}'")
     return imports, references
+
+
+def _uri_is_read_only(uri: str) -> bool:
+    """True only when the URI's real query string says mode=ro (not a fragment or filename)."""
+    from urllib.parse import parse_qs, urlsplit
+
+    parts = urlsplit(uri)
+    return parse_qs(parts.query).get("mode") == ["ro"]
 
 
 def database_findings(sources: Mapping[str, str], roots: Sequence[str]) -> list[str]:

@@ -1842,6 +1842,32 @@ def test_compare_fixture_scenario_isolation_disclosures_zero_values_and_sorting(
     assert "<td>0.000</td>" in zero_row
     assert "Not published" not in zero_row
 
+    # Every row carries its own published cells and its own source link.
+    def _row(section: str, institution: str) -> str:
+        start = section.index(f'<span class="inst-name">{institution}</span>')
+        return section[start : section.index("</tr>", start)]
+
+    expected_rows = {
+        "Alpha Purchase CU": ("6.500%", "6.600%"),
+        "Beta Purchase CU": ("6.100%", "6.200%"),
+        "Zero Purchase CU": ("0.000%", "0.000%"),
+        "Delta Purchase CU": ("6.000%", "6.100%"),
+    }
+    for institution, (rate_cell, apr_cell) in expected_rows.items():
+        row = _row(purch_sec, institution)
+        assert f"<td>{rate_cell}</td>" in row
+        assert f"<td>{apr_cell}</td>" in row
+        assert "<td>30 years (360 mos)</td>" in row
+        assert "<td>Fixed-Rate Mortgage (Purchase)</td>" in row
+        assert "Published credit score: 780" in row  # conditions cell
+        assert "(3h ago)" in row  # freshness cell
+        assert 'href="https://example.invalid/rates"' in row  # source link
+    assert "Autopay discount condition" in _row(purch_sec, "Delta Purchase CU")
+    refi_row = _row(refi_sec, "Gamma Refinance CU")
+    assert "<td>5.875%</td>" in refi_row and "<td>5.990%</td>" in refi_row
+    assert "(3h ago)" in refi_row
+    assert 'href="https://example.invalid/rates"' in refi_row
+
     # Rate and APR sorting reordering rows vs neutral default institution order
     table_purch_default = purch_sec[purch_sec.index("<tbody>") : purch_sec.index("</tbody>")]
     assert table_purch_default.index("Alpha Purchase CU") < table_purch_default.index(
@@ -2447,3 +2473,31 @@ def test_tier_qualifications_disclose_the_exact_published_bounds() -> None:
     assert "Tier qualification (LTV: 60 to 80)" in text
     assert "Tier qualification (CREDIT_SCORE >= 740)" in text
     assert "Tier qualification (LOAN_AMOUNT <= 726200)" in text
+
+
+def _rate_stub(institution: str, rate: str, apr: str) -> Any:
+    return SimpleNamespace(
+        sort_institution=institution,
+        sort_rate=Decimal(rate),
+        sort_apr=Decimal(apr),
+        sort_freshness=make.T0,
+    )
+
+
+def test_rate_and_apr_sorts_are_numeric_and_uncorrelated_with_names() -> None:
+    """Numeric sorts reorder rows even when names would order them differently."""
+    from cu_rates.web.comparison import sort_offers
+
+    alpha = _rate_stub("alpha", "6.000", "6.900")
+    beta = _rate_stub("beta", "7.000", "6.100")
+    gamma = _rate_stub("gamma", "5.000", "6.500")
+    offers = [alpha, beta, gamma]
+
+    def names(key: str) -> list[str]:
+        return [o.sort_institution for o in sort_offers(offers, key)]
+
+    assert names("rate") == ["gamma", "alpha", "beta"]
+    assert names("rate_desc") == ["beta", "alpha", "gamma"]
+    assert names("apr") == ["beta", "gamma", "alpha"]
+    assert names("apr_desc") == ["alpha", "gamma", "beta"]
+    assert names("institution") == ["alpha", "beta", "gamma"]

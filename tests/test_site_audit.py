@@ -353,7 +353,8 @@ def test_sqlite_writable_connection_negative_controls() -> None:
     findings = database_findings(import_connect_src, ["cu_rates.web"])
     assert any("sqlite writable connection 'connect'" in f for f in findings)
 
-    # 7. Positive control: Explicit PRAGMA query_only=ON on connection allows non-URI connection
+    # 7. A PRAGMA query_only on a plain connection is NOT proof of read-only access
+    #    (the pragma can sit in unreachable code), so the audit still rejects it.
     pragma_ro_src = {
         "cu_rates.web": "import cu_rates.snapshot.reader",
         "cu_rates.snapshot.reader": (
@@ -364,7 +365,29 @@ def test_sqlite_writable_connection_negative_controls() -> None:
         ),
     }
     findings = database_findings(pragma_ro_src, ["cu_rates.web"])
-    assert findings == []
+    assert any("sqlite writable connection 'sqlite3.connect'" in f for f in findings)
+
+    # 8. URI query parsing: a fragment or a filename containing mode=ro is not read-only
+    for bad in ("file:pub.sqlite#mode=ro", "file:x?notmode=ro", "file:mode=ro.sqlite"):
+        bad_src = {
+            "cu_rates.web": "import cu_rates.snapshot.reader",
+            "cu_rates.snapshot.reader": (
+                "import sqlite3\n"
+                f"conn = sqlite3.connect({bad!r}, uri=True)\n"
+                "conn.execute('SELECT 1')"
+            ),
+        }
+        findings = database_findings(bad_src, ["cu_rates.web"])
+        assert any("sqlite writable connection" in f for f in findings), bad
+    good_src = {
+        "cu_rates.web": "import cu_rates.snapshot.reader",
+        "cu_rates.snapshot.reader": (
+            "import sqlite3\n"
+            "conn = sqlite3.connect('file:pub.sqlite?mode=ro', uri=True)\n"
+            "conn.execute('SELECT 1')"
+        ),
+    }
+    assert database_findings(good_src, ["cu_rates.web"]) == []
 
 
 def test_sqlite_sql_and_pragma_negative_controls() -> None:
