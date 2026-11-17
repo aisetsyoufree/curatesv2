@@ -1,5 +1,6 @@
 """Public snapshot integration checks (fictional rates and sources only)."""
 
+import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -17,7 +18,7 @@ from cu_rates.contracts.enums import (
     ReviewVerdict,
     WithdrawalScope,
 )
-from cu_rates.contracts.fingerprints import offer_fingerprints
+from cu_rates.contracts.fingerprints import OfferFingerprints, offer_fingerprints
 from cu_rates.contracts.publication import Placement, evaluate_publication
 from cu_rates.db import open_operational_database
 from cu_rates.pipeline.extract import extract_fixture
@@ -25,7 +26,12 @@ from cu_rates.pipeline.slice import GIT_SHA
 from cu_rates.pipeline.trusted import load_publication_context
 from cu_rates.snapshot import Denylist, PublicOffer, SnapshotError, SnapshotReader, builder
 from cu_rates.snapshot._database import database_digest
-from cu_rates.snapshot._models import SnapshotInfo, Version
+from cu_rates.snapshot._models import (
+    PublicEvidencePath,
+    SnapshotInfo,
+    Version,
+    public_evidence_sha256,
+)
 from cu_rates.snapshot.builder import SnapshotCandidate, SnapshotPublisher
 
 from .contracts import factories as make
@@ -483,3 +489,162 @@ def test_read_degrades_ranking_before_hard_expiry(tmp_path: Path) -> None:
         reader.read(at=make.T0 + timedelta(hours=73)).offers[0].placement is Placement.BROWSE_ONLY
     )
     assert reader.read(at=make.T0 + timedelta(hours=90)).offers == ()
+
+
+@pytest.mark.parametrize("operation", ["read", "rollback"])
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "legacy",
+        "protocol-1",
+        "snapshot-legacy",
+        "snapshot-protocol-1",
+        "missing-digest",
+        "bad-digest",
+        "single-note_rate",
+        "single-apr",
+        "single-points",
+        "missing-apr",
+        "missing-reference",
+        "duplicate-capture",
+        "duplicate-time",
+        "duplicate-artifact",
+        "wrong-value",
+        "wrong-product",
+        "wrong-scenario",
+        "wrong-source",
+        "non-authoritative",
+        "wrong-content-hash",
+        "future-capture",
+        "outside-window",
+        "stale-at-release",
+    ],
+)
+def test_protocol2_reader_and_rollback_refuse_ineligible_sealed_rows(
+    tmp_path: Path, defect: str, operation: str
+) -> None:
+    publisher, reader, _ = setup_storage(tmp_path)
+    item = row()
+    publisher.build(release("retained", item), [item])
+    publisher.build(release("good", item, supersedes="retained"), [item])
+    pointer = publisher.root / "current.json"
+    good_pointer = pointer.read_bytes()
+    directory = publisher.root / "versions" / "retained"
+    database = directory / "published.sqlite"
+    # Corrupt only the admission evidence of a gate-admitted snapshot. Re-seal
+    # its outer digest so rejection must come from protocol/corroboration checks.
+    database.chmod(0o644)
+    with closing(sqlite3.connect(database)) as conn, conn:
+        (serialized,) = conn.execute("SELECT payload FROM public_offers").fetchone()
+        payload = json.loads(serialized)
+        details = payload["details"]
+        if defect == "legacy":
+            for key in (
+                "publication_version",
+                "publication_evidence",
+                "publication_evidence_sha256",
+            ):
+                details.pop(key, None)
+        elif defect == "protocol-1":
+            details["publication_version"] = "1.0"
+        elif defect.startswith("snapshot-"):
+            (metadata,) = conn.execute("SELECT payload FROM snapshot_info").fetchone()
+            info = json.loads(metadata)
+            if defect == "snapshot-legacy":
+                info.pop("publication_version")
+            else:
+                info["publication_version"] = "1.0"
+            conn.execute("UPDATE snapshot_info SET payload=?", (json.dumps(info),))
+        elif defect == "missing-digest":
+            details.pop("publication_evidence_sha256")
+        elif defect == "bad-digest":
+            details["publication_evidence_sha256"] = "0" * 64
+        else:
+            paths = details["publication_evidence"]
+            if defect.startswith("single-"):
+                field = defect.removeprefix("single-")
+                # Other fields retain both references: corroboration is per value.
+                paths[:] = [
+                    p for p in paths if p["path"] != field or p["artifact_id"] == make.ARTIFACT_ID
+                ]
+            elif defect == "missing-apr":
+                paths[:] = [p for p in paths if p["path"] != "apr"]
+            elif defect == "missing-reference":
+                payload["evidence"] = [p for p in payload["evidence"] if p["path"] != "apr"]
+            else:
+                first, second = [p for p in paths if p["path"] == "note_rate"]
+                if defect == "duplicate-capture":
+                    second["capture_id"] = first["capture_id"]
+                elif defect == "duplicate-time":
+                    second["observed_at"] = first["observed_at"]
+                elif defect == "duplicate-artifact":
+                    second["artifact_id"] = first["artifact_id"]
+                    second["content_sha256"] = first["content_sha256"]
+                elif defect == "wrong-value":
+                    second["value"] = "9.125"
+                elif defect == "wrong-product":
+                    second["product_id"] = "another-product"
+                elif defect == "wrong-scenario":
+                    second["scenario_id"] = CanonicalScenarioId.RATE_TERM_REFI_30Y_FIXED.value
+                elif defect == "wrong-source":
+                    second["source_id"] = "another-source"
+                elif defect == "non-authoritative":
+                    second["source_class"] = "web_search"
+                elif defect == "wrong-content-hash":
+                    second["content_sha256"] = "0" * 64
+                elif defect == "future-capture":
+                    second["observed_at"] = (
+                        item.offer.observed_at + timedelta(seconds=1)
+                    ).isoformat()
+                elif defect == "outside-window":
+                    second["observed_at"] = (
+                        item.offer.observed_at - timedelta(hours=97)
+                    ).isoformat()
+                else:
+                    assert defect == "stale-at-release"
+                    second["observed_at"] = (
+                        item.offer.observed_at - timedelta(hours=95, minutes=30)
+                    ).isoformat()
+            # Rebind the public receipt too: an invalid pair must fail even when
+            # its receipt digest and the sealed file digest are both consistent.
+            details["publication_evidence_sha256"] = public_evidence_sha256(
+                payload["offer_id"],
+                OfferFingerprints.model_validate(payload["fingerprints"]),
+                tuple(PublicEvidencePath.model_validate(p) for p in paths),
+            )
+        conn.execute("UPDATE public_offers SET payload=?", (json.dumps(payload),))
+    database.chmod(0o444)
+    version = Version(version=1, snapshot_id="retained", database_sha256=database_digest(database))
+    descriptor = directory / "version.json"
+    descriptor.chmod(0o644)
+    descriptor.write_text(version.model_dump_json())
+    descriptor.chmod(0o444)
+    if operation == "read":
+        pointer.write_text(version.model_dump_json())
+        with pytest.raises(SnapshotError):
+            reader.read(at=_BIRTH)
+        pointer.write_bytes(good_pointer)
+    else:
+        with pytest.raises(SnapshotError):
+            publisher.rollback("retained")
+    assert pointer.read_bytes() == good_pointer
+    assert reader.read(at=_BIRTH).info.snapshot_id == "good"
+
+
+def test_protocol2_admission_survives_public_read_and_rollback(tmp_path: Path) -> None:
+    publisher, reader, _ = setup_storage(tmp_path)
+    item = row()
+    publisher.build(release("first", item), [item])
+    publisher.build(release("second", item, supersedes="first"), [item])
+    assert publisher.rollback("first").snapshot_id == "first"
+    (visible,) = reader.read(at=_BIRTH).offers
+    assert visible.details["publication_version"] == "2.0"
+    assert visible.details["publication_evidence_sha256"]
+    evidence = visible.details["publication_evidence"]
+    assert isinstance(evidence, list)
+    assert visible.points is not None
+    for path in (*(r.path for r in visible.rates), "points"):
+        pair = [p for p in evidence if isinstance(p, dict) and p["path"] == path]
+        assert len(pair) == 2
+        for key in ("artifact_id", "content_sha256", "capture_id", "observed_at"):
+            assert pair[0][key] != pair[1][key]

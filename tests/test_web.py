@@ -1494,6 +1494,7 @@ def test_compare_all_four_canonical_scenarios_and_heloc_grouping(
     from cu_rates.snapshot.builder import _public_projection
 
     info = SnapshotInfo(
+        publication_version="2.0",
         schema_version=make.SV,
         snapshot_id="mock-multi-snap",
         published_at=now,
