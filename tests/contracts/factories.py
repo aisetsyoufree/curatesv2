@@ -119,6 +119,10 @@ def evidence_path(
         "product_id": product_id,
         "scenario_id": scenario_id,
         "source_class": source_class,
+        "content_sha256": artifact_id,
+        "source_id": SOURCE_ID,
+        "provenance": provenance(f"{value}%", artifact_id=artifact_id),
+        "scenario_statements": fixture_statements(purchase_offer(), artifact_id, capture_id),
     }
     kwargs.update(overrides)
     return EvidencePath(**kwargs)
@@ -148,51 +152,60 @@ def corroborating_path(
     )
 
 
+def fixture_statements(
+    offer: NormalizedOffer, artifact_id: str, run_id: str
+) -> tuple[VerifiedScenarioStatement, ...]:
+    return tuple(
+        VerifiedScenarioStatement(
+            offer_id=offer.offer_id,
+            dimension=match.dimension,
+            fetch_run_id=run_id,
+            stated=match.stated,
+            provenance=match.provenance.model_copy(update={"artifact_id": artifact_id}),
+        )
+        for match in offer.scenario_matches
+        if match.stated is not None and match.provenance is not None
+    )
+
+
+def fixture_captures() -> tuple[tuple[RawArtifact, FetchRun], ...]:
+    """Two explicit fixture observations, using the same records as DB/pipeline tests."""
+    return (
+        (raw_artifact(), fetch_run()),
+        (
+            raw_artifact(
+                artifact_id=ARTIFACT_ID_2,
+                fetch_run_id="fetch-002",
+                fetched_at=T0 - timedelta(hours=1),
+            ),
+            fetch_run(
+                ARTIFACT_ID_2,
+                run_id="fetch-002",
+                started_at=T0 - timedelta(hours=1, minutes=1),
+                finished_at=T0 - timedelta(minutes=59),
+            ),
+        ),
+    )
+
+
 def evidence_paths_for(offer: NormalizedOffer) -> tuple[EvidencePath, ...]:
-    paths: list[EvidencePath] = []
-    for path, sourced in offer.rate_items():
-        val = sourced.value
-        paths.append(
-            evidence_path(
-                path=path,
-                value=val,
-                product_id=offer.product_id,
-                scenario_id=offer.scenario_id,
-                artifact_id=sourced.provenance.artifact_id,
-                observed_at=offer.observed_at,
-            )
+    from cu_rates.contracts.publication import financial_items
+
+    return tuple(
+        evidence_path(
+            path=path,
+            value=value,
+            product_id=offer.product_id,
+            scenario_id=offer.scenario_id,
+            artifact_id=artifact.artifact_id,
+            capture_id=artifact.fetch_run_id,
+            observed_at=artifact.fetched_at,
+            provenance=ref.model_copy(update={"artifact_id": artifact.artifact_id}),
+            scenario_statements=fixture_statements(offer, artifact.artifact_id, run.run_id),
         )
-        paths.append(
-            corroborating_path(
-                path=path,
-                value=val,
-                product_id=offer.product_id,
-                scenario_id=offer.scenario_id,
-                observed_at=offer.observed_at - timedelta(hours=1),
-            )
-        )
-    if offer.points is not None:
-        val = offer.points.value
-        paths.append(
-            evidence_path(
-                path="points",
-                value=val,
-                product_id=offer.product_id,
-                scenario_id=offer.scenario_id,
-                artifact_id=offer.points.provenance.artifact_id,
-                observed_at=offer.observed_at,
-            )
-        )
-        paths.append(
-            corroborating_path(
-                path="points",
-                value=val,
-                product_id=offer.product_id,
-                scenario_id=offer.scenario_id,
-                observed_at=offer.observed_at - timedelta(hours=1),
-            )
-        )
-    return tuple(paths)
+        for artifact, run in fixture_captures()
+        for path, value, ref in financial_items(offer)
+    )
 
 
 def extraction(rule_id: str | None = None, parser: ParserVersion = PARSER) -> ExtractionProvenance:
@@ -682,8 +695,8 @@ def context(
         "source_approval": source_approval(),
         "validation_policy": validation_policy(),
         "approved_parsers": (PARSER,),
-        "known_artifacts": (raw_artifact(),),
-        "fetch_runs": (fetch_run(),),
+        "known_artifacts": tuple(a for a, _ in fixture_captures()),
+        "fetch_runs": tuple(r for _, r in fixture_captures()),
         "approved_profile": fetch_profile(),
         "source_fingerprints": (source_fingerprint(),),
         "validations": validations_for(current),
@@ -692,6 +705,28 @@ def context(
         "evaluated_at": EVALUATED_AT,
     }
     kwargs.update(overrides)
+    # Most contract tests override the primary record to exercise a separate rule.
+    # Keep the explicitly modeled second fixture capture unless paths are supplied
+    # explicitly (single-capture tests use that lane or remove records on the model).
+    if "evidence_paths" not in overrides:
+        artifacts = tuple(kwargs["known_artifacts"])
+        fetches = tuple(kwargs["fetch_runs"])
+        if artifacts and not any(a.artifact_id == ARTIFACT_ID_2 for a in artifacts):
+            second, second_run = fixture_captures()[1]
+            artifacts += (second,)
+            kwargs["known_artifacts"] = artifacts
+        if fetches and not any(r.run_id == "fetch-002" for r in fetches):
+            second_run = fixture_captures()[1][1].model_copy(
+                update={
+                    "profile_sha256": fetches[0].profile_sha256,
+                    "profile_id": fetches[0].profile_id,
+                }
+            )
+            kwargs["fetch_runs"] = (*fetches, second_run)
+        kwargs["evidence_paths"] = tuple(
+            p.model_copy(update={"source_class": kwargs["source"].evidence_kind.value})
+            for p in evidence_paths_for(current)
+        )
     if "source_fingerprints" not in overrides:
         kwargs["source_fingerprints"] = tuple(
             source_fingerprint(
@@ -717,6 +752,11 @@ def context(
             if match.stated is not None
             and match.provenance is not None
             and match.provenance.artifact_id in runs
+        )
+    if "verified_scenario_statements" not in overrides:
+        extra = fixture_statements(current, ARTIFACT_ID_2, "fetch-002")
+        kwargs["verified_scenario_statements"] = tuple(
+            dict.fromkeys((*kwargs["verified_scenario_statements"], *extra))
         )
     if "verified_scenario_conditions" not in overrides and current.scenario_id is not None:
         kwargs["verified_scenario_conditions"] = tuple(

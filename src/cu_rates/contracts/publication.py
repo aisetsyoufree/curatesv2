@@ -8,12 +8,14 @@ records (``ReviewDecision``, ``WithdrawalEntry``), not booleans. No model output
 authority here.
 """
 
+import hashlib
+import json
 import re
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from ipaddress import IPv6Address
-from typing import Annotated, Self
+from typing import Annotated, Literal, Self
 from urllib.parse import urlsplit
 
 from pydantic import Field, model_validator
@@ -24,6 +26,7 @@ from cu_rates.contracts.base import (
     FieldPath,
     Identifier,
     Sha256Hex,
+    SignedPercent,
     SortedUnique,
     Text,
     UtcDatetime,
@@ -445,16 +448,29 @@ class EvidencePath(ContractModel):
     """
 
     path: FieldPath
-    value: Decimal
+    value: SignedPercent
     artifact_id: Sha256Hex
     capture_id: Identifier
     observed_at: UtcDatetime
     product_id: Identifier
     scenario_id: CanonicalScenarioId | None = None
     source_class: Text
+    content_sha256: Sha256Hex
+    source_id: Identifier
+    provenance: Provenance
+    scenario_statements: tuple[VerifiedScenarioStatement, ...] = ()
+    derived_from: tuple[Sha256Hex, ...] = ()
+
+
+# Publication protocol 2.0 is separate from the frozen entity schema/taxonomy 1.0.
+# Old readers forbid the new version marker/fields and reject these messages. New
+# readers accept old writer inputs (absent marker/paths) but always enforce D-18;
+# missing evidence is quarantined. Never strip the marker for an old reader.
+PUBLICATION_VERSION = "2.0"
 
 
 class PublicationContext(ContractModel):
+    publication_version: Literal["2.0"] = "2.0"
     institution: Institution
     product: ProductIdentity
     relationship: InstitutionSourceRelationship
@@ -494,7 +510,8 @@ class PublicationContext(ContractModel):
                 for item in self.source_fingerprints
             ],
             "verified scenario statement": [
-                (item.offer_id, item.dimension) for item in self.verified_scenario_statements
+                (item.offer_id, item.dimension, item.fetch_run_id)
+                for item in self.verified_scenario_statements
             ],
             "verified scenario condition": [
                 (item.offer_id, item.scenario_id, item.condition.condition_id)
@@ -517,6 +534,7 @@ class PublicationDecision(ContractModel):
     Suppressed and quarantined offers always have placement NONE.
     """
 
+    publication_version: Literal["2.0"] = "2.0"
     outcome: PublicationOutcome
     placement: Placement
     reasons: Annotated[tuple[ReasonCode, ...], Field(max_length=len(ReasonCode))]
@@ -854,117 +872,148 @@ def _evidence_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[Re
     return reasons
 
 
-def _dual_evidence_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[ReasonCode]:
-    """D-18: at least TWO separately captured authoritative evidence paths must corroborate.
-
-    Each publishable rate/APR/points/fee value must be supported by evidence from at
-    least two distinct captures that:
-      (a) have distinct content hashes / capture ids / observation times (not the same
-          capture cited twice or a copy),
-      (b) are authoritative (source classes allowed by MASTER.md §5; model output or
-          LLM/web-search agreement is never evidence),
-      (c) match on product, scenario, and observation time window, with exact numeric
-          equality after normalization.
-    """
-    reasons: set[ReasonCode] = set()
-
-    # Collect every publishable rate/APR/points value on the offer.
-    values: list[tuple[str, str]] = []
-    for path, sourced in offer.rate_items():
-        values.append((path, canonical_decimal(sourced.value)))
+def financial_items(offer: NormalizedOffer) -> tuple[tuple[str, Decimal, Provenance], ...]:
+    """Every modeled published financial claim (there is no fee scalar in schema 1.0)."""
+    items = [(path, item.value, item.provenance) for path, item in offer.rate_items()]
     if offer.points is not None:
-        values.append(("points", canonical_decimal(offer.points.value)))
+        items.append(("points", offer.points.value, offer.points.provenance))
+    return tuple(items)
 
-    if not values:
-        return reasons
 
-    for val_path, target_val in values:
-        matching = [ep for ep in ctx.evidence_paths if ep.path == val_path]
-        if len(matching) < 2:
-            reasons.add(R.INSUFFICIENT_EVIDENCE_PATHS)
-            continue
+def scenario_signature(
+    statements: tuple[VerifiedScenarioStatement, ...],
+) -> tuple[tuple[str, str], ...] | None:
+    """A present signature of source-stated assumptions, independent of capture identity."""
+    if not statements or len({p.dimension for p in statements}) != len(statements):
+        return None
+    return tuple(sorted((p.dimension.value, p.stated.model_dump_json()) for p in statements))
 
-        corroborated = False
-        for i in range(len(matching)):
-            for j in range(i + 1, len(matching)):
-                p1, p2 = matching[i], matching[j]
-                # (a) Distinct captures: different artifact hash, different capture id,
-                # different observation time.
-                if (
-                    p1.artifact_id == p2.artifact_id
-                    or p1.capture_id == p2.capture_id
-                    or p1.observed_at == p2.observed_at
-                ):
-                    continue
-                # (b) Authoritative source classes
-                if (
-                    p1.source_class.lower() not in AUTHORITATIVE_SOURCE_CLASSES
-                    or p2.source_class.lower() not in AUTHORITATIVE_SOURCE_CLASSES
-                ):
-                    continue
-                # (c) Matching product
-                if p1.product_id != offer.product_id or p2.product_id != offer.product_id:
-                    continue
-                # Matching scenario
-                if p1.scenario_id != offer.scenario_id or p2.scenario_id != offer.scenario_id:
-                    continue
-                # Observation time window
-                if (
-                    abs((p1.observed_at - p2.observed_at).total_seconds())
-                    > DUAL_EVIDENCE_TIME_WINDOW.total_seconds()
-                ):
-                    continue
-                # Exact equality of numeric value after normalization
-                if (
-                    canonical_decimal(p1.value) != canonical_decimal(p2.value)
-                    or canonical_decimal(p1.value) != target_val
-                ):
-                    continue
 
-                corroborated = True
-                break
-            if corroborated:
-                break
+def publication_evidence_sha256(offer: NormalizedOffer, paths: tuple[EvidencePath, ...]) -> str:
+    """Review digest v2 binds the complete pair, including runs, times and locators."""
+    payload = {
+        "offer": offer_evidence_sha256(offer),
+        "paths": sorted(p.model_dump_json() for p in paths),
+    }
+    return hashlib.sha256(
+        ("publication-evidence-v2:" + json.dumps(payload, sort_keys=True)).encode()
+    ).hexdigest()
 
-        if not corroborated:
-            has_non_authoritative = any(
-                p.source_class.lower() not in AUTHORITATIVE_SOURCE_CLASSES for p in matching
+
+def _path_reasons(
+    p: EvidencePath, offer: NormalizedOffer, ctx: PublicationContext
+) -> set[ReasonCode]:
+    reasons: set[ReasonCode] = set()
+    artifact = next((a for a in ctx.known_artifacts if a.artifact_id == p.artifact_id), None)
+    if (
+        artifact is None
+        or p.source_id != offer.source_id
+        or p.source_id != ctx.source.source_id
+        or p.source_class != ctx.source.evidence_kind.value
+        or p.source_class not in AUTHORITATIVE_SOURCE_CLASSES
+        or p.content_sha256 != artifact.artifact_id
+        or p.capture_id != artifact.fetch_run_id
+        or p.observed_at != artifact.fetched_at
+        or p.provenance.artifact_id != artifact.artifact_id
+        or not locator_fits_media_type(p.provenance.locator, artifact.media_type)
+        or p.provenance.locator.kind not in _SOURCE_LOCATORS[ctx.source.evidence_kind]
+        or p.provenance.extraction.parser not in ctx.approved_parsers
+        or _artifact_reasons(artifact, offer, ctx, primary=True)
+    ):
+        reasons.add(R.EVIDENCE_PATH_NON_AUTHORITATIVE)
+    if not _field_excerpt_matches(offer, p.path, format(p.value, "f"), p.provenance.source_text):
+        reasons.add(R.EVIDENCE_PATH_VALUE_MISMATCH)
+    if p.product_id != offer.product_id:
+        reasons.add(R.EVIDENCE_PATH_PRODUCT_MISMATCH)
+    if (
+        p.scenario_id is None
+        or offer.scenario_id is None
+        or p.scenario_id != offer.scenario_id
+        or scenario_signature(p.scenario_statements) is None
+        or scenario_signature(p.scenario_statements)
+        != tuple(
+            sorted(
+                (m.dimension.value, m.stated.model_dump_json())
+                for m in offer.scenario_matches
+                if m.stated is not None and m.provenance is not None
             )
-            has_product_mismatch = any(p.product_id != offer.product_id for p in matching)
-            has_scenario_mismatch = any(p.scenario_id != offer.scenario_id for p in matching)
-            has_value_mismatch = any(canonical_decimal(p.value) != target_val for p in matching)
-            has_time_outside = False
-            has_duplicate = False
-            for i in range(len(matching)):
-                for j in range(i + 1, len(matching)):
-                    p1, p2 = matching[i], matching[j]
-                    if (
-                        abs((p1.observed_at - p2.observed_at).total_seconds())
-                        > DUAL_EVIDENCE_TIME_WINDOW.total_seconds()
-                    ):
-                        has_time_outside = True
-                    if (
-                        p1.artifact_id == p2.artifact_id
-                        or p1.capture_id == p2.capture_id
-                        or p1.observed_at == p2.observed_at
-                    ):
-                        has_duplicate = True
+        )
+        or any(
+            proof not in ctx.verified_scenario_statements
+            or proof.offer_id != offer.offer_id
+            or proof.fetch_run_id != p.capture_id
+            or proof.provenance.artifact_id != p.artifact_id
+            or not statement_matches_excerpt(
+                proof.dimension, proof.stated, proof.provenance.source_text
+            )
+            for proof in p.scenario_statements
+        )
+    ):
+        reasons.add(R.EVIDENCE_PATH_SCENARIO_MISMATCH)
+    # Both captures must be real past observations within the offer's trailing
+    # observation window AND the existing 96-hour publication freshness bound.
+    if (
+        not offer.observed_at - DUAL_EVIDENCE_TIME_WINDOW <= p.observed_at <= offer.observed_at
+        or not ctx.evaluated_at - WITHDRAW_AFTER <= p.observed_at <= ctx.evaluated_at
+    ):
+        reasons.add(R.EVIDENCE_PATH_TIME_OUTSIDE_WINDOW)
+    return reasons
 
-            if has_non_authoritative:
-                reasons.add(R.EVIDENCE_PATH_NON_AUTHORITATIVE)
-            if has_product_mismatch:
-                reasons.add(R.EVIDENCE_PATH_PRODUCT_MISMATCH)
-            if has_scenario_mismatch:
-                reasons.add(R.EVIDENCE_PATH_SCENARIO_MISMATCH)
-            if has_value_mismatch:
-                reasons.add(R.EVIDENCE_PATH_VALUE_MISMATCH)
-            if has_time_outside:
-                reasons.add(R.EVIDENCE_PATH_TIME_OUTSIDE_WINDOW)
-            if has_duplicate:
-                reasons.add(R.DUPLICATE_EVIDENCE_CAPTURE)
-            if not reasons:
-                reasons.add(R.INSUFFICIENT_EVIDENCE_PATHS)
 
+def _pair_reasons(p1: EvidencePath, p2: EvidencePath) -> set[ReasonCode]:
+    reasons: set[ReasonCode] = set()
+    # Separate guards deliberately: each identity is independently necessary.
+    if p1.artifact_id == p2.artifact_id:
+        reasons.add(R.DUPLICATE_EVIDENCE_CAPTURE)
+    if p1.content_sha256 == p2.content_sha256:
+        reasons.add(R.DUPLICATE_EVIDENCE_CAPTURE)
+    if p1.capture_id == p2.capture_id:
+        reasons.add(R.DUPLICATE_EVIDENCE_CAPTURE)
+    if p1.observed_at == p2.observed_at:
+        reasons.add(R.DUPLICATE_EVIDENCE_CAPTURE)
+    if p1.derived_from or p2.derived_from:
+        reasons.add(R.DUPLICATE_EVIDENCE_CAPTURE)
+    if scenario_signature(p1.scenario_statements) != scenario_signature(p2.scenario_statements):
+        reasons.add(R.EVIDENCE_PATH_SCENARIO_MISMATCH)
+    if abs(p1.observed_at - p2.observed_at) > DUAL_EVIDENCE_TIME_WINDOW:
+        reasons.add(R.EVIDENCE_PATH_TIME_OUTSIDE_WINDOW)
+    return reasons
+
+
+def corroborated_paths(offer: NormalizedOffer, ctx: PublicationContext) -> tuple[EvidencePath, ...]:
+    """The deterministic valid pair per field; exports/reviews use exactly these paths."""
+    selected: list[EvidencePath] = []
+    for path, value, _ in financial_items(offer):
+        paths = [
+            p
+            for p in ctx.evidence_paths
+            if p.path == path and p.value == value and not _path_reasons(p, offer, ctx)
+        ]
+        for i, first in enumerate(paths):
+            second = next((p for p in paths[i + 1 :] if not _pair_reasons(first, p)), None)
+            if second is not None:
+                selected.extend((first, second))
+                break
+    return tuple(selected)
+
+
+def _dual_evidence_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[ReasonCode]:
+    reasons: set[ReasonCode] = set()
+    selected = {p.path for p in corroborated_paths(offer, ctx)}
+    for path, value, _ in financial_items(offer):
+        if path in selected:
+            continue
+        paths = [p for p in ctx.evidence_paths if p.path == path]
+        field_reasons: set[ReasonCode] = set()
+        if len(paths) < 2:
+            field_reasons.add(R.INSUFFICIENT_EVIDENCE_PATHS)
+        for i, p in enumerate(paths):
+            field_reasons |= _path_reasons(p, offer, ctx)
+            if p.value != value:
+                field_reasons.add(R.EVIDENCE_PATH_VALUE_MISMATCH)
+            for other in paths[i + 1 :]:
+                field_reasons |= _pair_reasons(p, other)
+        reasons |= field_reasons or {R.INSUFFICIENT_EVIDENCE_PATHS}
     return reasons
 
 
@@ -1151,13 +1200,16 @@ def _proven_refresh(offer: NormalizedOffer, ctx: PublicationContext) -> bool:
     return proven
 
 
-def _claims_extend(offer: NormalizedOffer, prior: PriorPublication) -> bool:
+def _claims_extend(
+    offer: NormalizedOffer, prior: PriorPublication, ctx: PublicationContext
+) -> bool:
     """A 304 extends only the same claims with the exact evidence the human reviewed."""
     review = prior.review
     return (
         review is not None
         and review.approved
-        and review.reviewed_evidence_sha256 == offer_evidence_sha256(offer)
+        and review.reviewed_evidence_sha256
+        == publication_evidence_sha256(offer, corroborated_paths(offer, ctx))
         and offer_fingerprints(offer) == prior.snapshot.fingerprints
     )
 
@@ -1283,7 +1335,7 @@ def _change_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[Reas
         reasons.add(R.RATE_MOVEMENT_EXCEEDS_LIMIT)
     if proof.unbounded:
         reasons.add(R.RATE_MOVEMENT_UNBOUNDED)
-    if _proven_refresh(offer, ctx) and not _claims_extend(offer, prior):
+    if _proven_refresh(offer, ctx) and not _claims_extend(offer, prior, ctx):
         reasons.add(R.REOBSERVATION_CLAIM_CHANGED)
     last_change = prior.last_value_change_at
     if last_change > ctx.evaluated_at:
@@ -1376,9 +1428,10 @@ def _verified_scenario_matches(
     assert offer.scenario_id is not None
     stored = {artifact.artifact_id: artifact for artifact in ctx.known_artifacts}
     verified = {
-        proof.dimension: proof
+        (proof.dimension, proof.fetch_run_id): proof
         for proof in ctx.verified_scenario_statements
         if proof.offer_id == offer.offer_id
+        and any(m.provenance == proof.provenance for m in offer.scenario_matches)
     }
     rate_runs = {
         capture.fetch_run_id
@@ -1394,7 +1447,9 @@ def _verified_scenario_matches(
             continue
         provenance = match.provenance
         capture = stored.get(provenance.artifact_id) if provenance is not None else None
-        proof = verified.get(match.dimension)
+        proof = (
+            verified.get((match.dimension, capture.fetch_run_id)) if capture is not None else None
+        )
         if (
             match.stated is None
             or provenance is None

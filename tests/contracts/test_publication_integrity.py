@@ -123,4 +123,4 @@ def test_distinct_context_records_are_accepted() -> None:
             validation("rule.other", offer),
         ),
     )
-    assert len(ctx.known_artifacts) == 2
+    assert len(ctx.known_artifacts) == 3

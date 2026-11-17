@@ -89,7 +89,7 @@ def test_ordinary_fetch_must_match_the_approved_profile_digest() -> None:
 def test_304_cannot_publish_a_rate_the_original_extraction_did_not_verify() -> None:
     changed = reobserved_offer(note_rate=rate("6.130"))
     decision = reobserved(changed)
-    assert decision.outcome is PublicationOutcome.REQUIRES_REVIEW
+    assert decision.outcome is PublicationOutcome.QUARANTINE
     assert R.REOBSERVATION_CLAIM_CHANGED in decision.reasons
     verified = prior(purchase_offer())
     assert verified.review is not None
@@ -104,7 +104,8 @@ def test_304_cannot_publish_a_rate_the_original_extraction_did_not_verify() -> N
     )
     assert R.REOBSERVATION_CLAIM_CHANGED in reobserved(prior=missing).reasons
     assert verified.verified_configuration_sha256 == CONFIG_HASH
-    assert reobserved().publishable_now
+    assert not reobserved().publishable_now
+    assert R.EVIDENCE_PATH_TIME_OUTSIDE_WINDOW in reobserved().reasons
 
 
 def test_fingerprint_does_not_clear_a_contradictory_correction_without_evidence() -> None:
@@ -148,7 +149,7 @@ def test_scenario_match_needs_a_located_statement_and_is_computed() -> None:
         for item in matches_all(scenario_id)
     )
     unlocated = decide(purchase_offer(scenario_matches=bare))
-    assert unlocated.placement is Placement.BROWSE_ONLY
+    assert unlocated.placement is Placement.NONE
     assert R.SCENARIO_UNSTATED in unlocated.reasons
     assert not unlocated.ranking_eligible
 

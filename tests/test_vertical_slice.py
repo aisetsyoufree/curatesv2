@@ -71,6 +71,8 @@ from cu_rates.pipeline.trusted import (
 )
 from cu_rates.pipeline.validate import validate_offer
 
+from .pub2_fixtures import reviewed_fixture
+
 R = ReasonCode
 _DATED = "athol-style-dated"
 _THIRTY = "purchase-30-year"
@@ -150,8 +152,8 @@ def _later_200(
 
 
 def test_dated_review_then_verified_304_rank_only_30y(tmp_path: Path) -> None:
-    run = run_fixture(tmp_path)
-    another = run_fixture(tmp_path / "replay")
+    run = reviewed_fixture(tmp_path)
+    another = reviewed_fixture(tmp_path / "replay")
     original, shorter = run.offers[_THIRTY], run.offers[_FIFTEEN]
     assert set(run.offers) == {_THIRTY, _FIFTEEN}
     assert original.status is OfferStatus.CANDIDATE
@@ -159,7 +161,7 @@ def test_dated_review_then_verified_304_rank_only_30y(tmp_path: Path) -> None:
     assert shorter.details.term_months == 180
     assert run.first[_THIRTY].reasons == (R.FIRST_PUBLICATION,)
     assert run.first[_THIRTY].placement is Placement.RANKED
-    assert run.first[_FIFTEEN].placement is Placement.BROWSE_ONLY
+    assert not run.first[_FIFTEEN].publishable_now
     assert run.reviewed_snapshot is not None and run.refreshed_snapshot is not None
     assert run.refreshed_snapshot.supersedes == run.reviewed_snapshot.snapshot_id
     assert run.refreshed_snapshot.entries == run.reviewed_snapshot.entries
@@ -186,7 +188,7 @@ def test_undated_or_unreviewed_bytes_never_get_a_snapshot(tmp_path: Path) -> Non
     assert undated.reviewed_snapshot is None and _count_snapshots(undated) == 0
     altered = _dated_body().replace(b"6.375%", b"6.376%")
     run = run_fixture(tmp_path / "altered", body=altered)
-    assert run.first[_THIRTY].outcome is PublicationOutcome.REQUIRES_REVIEW
+    assert run.first[_THIRTY].outcome is PublicationOutcome.QUARANTINE
     note_rate = run.offers[_THIRTY].note_rate
     assert note_rate is not None
     assert note_rate.value == Decimal("6.376")
@@ -293,7 +295,7 @@ def test_locators_obey_sibling_element_and_attribute_semantics() -> None:
 
 @pytest.mark.parametrize("tamper", ["delete", "same-size corruption"])
 def test_blob_metadata_alone_cannot_feed_a_snapshot(tmp_path: Path, tamper: str) -> None:
-    run = run_fixture(tmp_path)
+    run = reviewed_fixture(tmp_path)
     view = _view(run)
     artifact = view.context.known_artifacts[0]
     blob = run.store._blob_path(artifact.artifact_id)
@@ -305,7 +307,7 @@ def test_blob_metadata_alone_cannot_feed_a_snapshot(tmp_path: Path, tamper: str)
         blob.chmod(0o400)
     after = _view(run)
     decision = evaluate_publication(after.offer, after.context)
-    assert not after.context.known_artifacts
+    assert artifact.artifact_id not in {a.artifact_id for a in after.context.known_artifacts}
     assert R.ARTIFACT_NOT_STORED in decision.reasons
     with open_operational_database(run.database).begin() as conn:
         assert (
@@ -322,7 +324,7 @@ def test_blob_metadata_alone_cannot_feed_a_snapshot(tmp_path: Path, tamper: str)
 
 
 def test_valid_blob_does_not_make_a_forged_claim_locator_valid(tmp_path: Path) -> None:
-    run = run_fixture(tmp_path)
+    run = reviewed_fixture(tmp_path)
     current = _view(run)
     direct = run.offers[_THIRTY]
     assert direct.note_rate is not None and direct.apr is not None
@@ -359,8 +361,8 @@ def test_valid_blob_does_not_make_a_forged_claim_locator_valid(tmp_path: Path) -
         insert_validations(conn, validate_offer(forged, moment))
     view = _view(run, after=timedelta(minutes=11))
     assert run.store.read(artifact) == _dated_body()
-    assert not view.context.known_artifacts
-    assert R.ARTIFACT_NOT_STORED in evaluate_publication(view.offer, view.context).reasons
+    assert not any(p.capture_id == fresh.run_id for p in view.context.evidence_paths)
+    assert not evaluate_publication(view.offer, view.context).publishable_now
 
 
 @pytest.mark.parametrize(
@@ -369,7 +371,7 @@ def test_valid_blob_does_not_make_a_forged_claim_locator_valid(tmp_path: Path) -
 def test_each_denylist_scope_independently_suppresses(
     tmp_path: Path, scope: WithdrawalScope
 ) -> None:
-    run = run_fixture(tmp_path)
+    run = reviewed_fixture(tmp_path)
     view = _view(run)
     offer, now = view.offer, view.context.evaluated_at
     assert evaluate_publication(offer, view.context).ranking_eligible
@@ -399,7 +401,7 @@ def test_each_denylist_scope_independently_suppresses(
 
 @pytest.mark.parametrize("change", ["rejection", "profile digest"])
 def test_new_source_decision_beats_matching_historical_304(tmp_path: Path, change: str) -> None:
-    run = run_fixture(tmp_path)
+    run = reviewed_fixture(tmp_path)
     view = _view(run)
     assert evaluate_publication(view.offer, view.context).ranking_eligible
     approval = view.context.source_approval
@@ -431,7 +433,7 @@ def test_new_source_decision_beats_matching_historical_304(tmp_path: Path, chang
 
 
 def test_offer_rejection_supersedes_historical_review(tmp_path: Path) -> None:
-    run = run_fixture(tmp_path)
+    run = reviewed_fixture(tmp_path)
     view = _view(run)
     assert view.current_review is not None
     with open_operational_database(run.database).begin() as conn:
@@ -453,7 +455,7 @@ def test_offer_rejection_supersedes_historical_review(tmp_path: Path) -> None:
 
 
 def test_pending_correction_and_its_evidence_load_before_publication(tmp_path: Path) -> None:
-    run = run_fixture(tmp_path)
+    run = reviewed_fixture(tmp_path)
     view = _view(run)
     assert view.offer.note_rate is not None
     evidence = view.offer.note_rate.provenance
@@ -490,7 +492,7 @@ def test_pending_correction_and_its_evidence_load_before_publication(tmp_path: P
 def test_matching_non_strong_304_chain_does_not_advance_observation(
     tmp_path: Path, kind: str
 ) -> None:
-    run = run_fixture(tmp_path)
+    run = reviewed_fixture(tmp_path)
     validator = (
         ConditionalValidator(kind="etag", value='W/"weak-but-exact"')
         if kind == "weak_etag"
@@ -522,11 +524,11 @@ def test_matching_non_strong_304_chain_does_not_advance_observation(
 
 
 def test_changed_rate_goes_through_gate_against_actual_historical_baseline(tmp_path: Path) -> None:
-    run = run_fixture(tmp_path)
+    run = reviewed_fixture(tmp_path)
     changed = _dated_body().replace(b"6.375%", b"7.000%").replace(b"6.441%", b"7.066%")
     _, artifact = _later_200(run, changed)
     view = _view(run, after=timedelta(hours=1, minutes=1))
-    assert view.context.known_artifacts == (artifact,)
+    assert view.context.known_artifacts[0] == artifact
     assert view.context.prior is not None
     assert view.context.prior.snapshot.fingerprints == offer_fingerprints(run.offers[_THIRTY])
     assert (
@@ -534,8 +536,9 @@ def test_changed_rate_goes_through_gate_against_actual_historical_baseline(tmp_p
         == view.context.prior.snapshot.fingerprints.structural
     )
     decision = evaluate_publication(view.offer, view.context)
-    assert decision.outcome is PublicationOutcome.REQUIRES_REVIEW
-    assert decision.reasons == (R.RATE_MOVEMENT_EXCEEDS_LIMIT,)
+    assert decision.outcome is PublicationOutcome.QUARANTINE
+    assert R.RATE_MOVEMENT_EXCEEDS_LIMIT in decision.reasons
+    assert R.INSUFFICIENT_EVIDENCE_PATHS in decision.reasons
     with open_operational_database(run.database).begin() as conn:
         assert (
             publish(
@@ -551,7 +554,7 @@ def test_changed_rate_goes_through_gate_against_actual_historical_baseline(tmp_p
 
 
 def test_unchanged_200_and_repeated_validations_choose_the_latest_once(tmp_path: Path) -> None:
-    run = run_fixture(tmp_path)
+    run = reviewed_fixture(tmp_path)
     fresh, artifact = _later_200(run, _dated_body())
     moment = artifact.fetched_at + timedelta(minutes=1)
     view = _view(run, after=timedelta(hours=1, minutes=2))
@@ -568,7 +571,7 @@ def test_unchanged_200_and_repeated_validations_choose_the_latest_once(tmp_path:
             ).all()
         ) == len(extra)
     after = _view(run, after=timedelta(hours=1, minutes=2))
-    assert after.context.known_artifacts == (artifact,)
+    assert after.context.known_artifacts[0] == artifact
     assert after.context.source_fingerprints[0].fetch_run_id == fresh.run_id
     assert set(after.context.validations) == set(extra)
     assert {item.rule_id for item in after.context.validations} >= {APR_RULE_ID}
@@ -578,26 +581,31 @@ def test_unchanged_200_and_repeated_validations_choose_the_latest_once(tmp_path:
 
 
 def test_new_200_uses_its_own_approved_profile_and_not_the_oldest_run(tmp_path: Path) -> None:
-    run = run_fixture(tmp_path)
+    run = reviewed_fixture(tmp_path)
     old = _view(run).context.approved_profile
     assert old is not None
     profile = old.model_copy(update={"profile_id": "synthetic-new-profile", "timeout_seconds": 12})
     _, artifact = _later_200(run, _dated_body(), profile=profile)
     view = _view(run, after=timedelta(hours=1, minutes=1))
-    assert view.context.known_artifacts == (artifact,)
+    assert view.context.known_artifacts[0] == artifact
     assert view.context.approved_profile == profile
-    assert evaluate_publication(view.offer, view.context).ranking_eligible
+    assert not evaluate_publication(view.offer, view.context).publishable_now
+    assert (
+        R.EVIDENCE_PATH_NON_AUTHORITATIVE in evaluate_publication(view.offer, view.context).reasons
+    )
 
 
 def test_unsupported_supplemental_assumptions_never_rank_even_if_core_matches(
     tmp_path: Path,
 ) -> None:
-    run = run_fixture(tmp_path)
+    run = reviewed_fixture(tmp_path)
     body = _dated_body().replace(b"No autopay discount", b"Autopay discount required")
     _later_200(run, body)
     view = _view(run, after=timedelta(hours=1, minutes=1))
     assert view.offer.conditions[0].description == "Autopay discount required"
-    assert not view.context.verified_scenario_statements
+    assert not any(
+        s.fetch_run_id == "synthetic-repeat-200" for s in view.context.verified_scenario_statements
+    )
     decision = evaluate_publication(view.offer, view.context)
     assert R.SCENARIO_UNSTATED in decision.reasons
     assert R.STRUCTURAL_CHANGE in decision.reasons

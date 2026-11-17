@@ -15,7 +15,7 @@ from pydantic import JsonValue, TypeAdapter, ValidationError
 from cu_rates.contracts.audit import PublishedSnapshot, ReviewDecision, snapshot_manifest_sha256
 from cu_rates.contracts.base import ContractModel, Identifier
 from cu_rates.contracts.enums import OfferStatus, ReviewSubject
-from cu_rates.contracts.fingerprints import OfferSnapshot, offer_evidence_sha256, offer_fingerprints
+from cu_rates.contracts.fingerprints import OfferSnapshot, offer_fingerprints
 from cu_rates.contracts.offers import NormalizedOffer
 from cu_rates.contracts.publication import (
     REVIEW_REASONS,
@@ -23,7 +23,9 @@ from cu_rates.contracts.publication import (
     PublicationContext,
     PublicationOutcome,
     ReasonCode,
+    corroborated_paths,
     evaluate_publication,
+    publication_evidence_sha256,
 )
 from cu_rates.contracts.sources import ExtractedCandidate
 from cu_rates.validation import RULE_IDS, ValidationContext, validate_offer
@@ -105,6 +107,25 @@ def _public_projection(row: SnapshotCandidate, placement: Placement, reviewed: b
         PublicEvidence(path=path, artifact_id=ref.artifact_id, locator=ref.locator)
         for path, ref in offer.iter_labeled_provenance()
     }
+    paths = corroborated_paths(offer, ctx)
+    evidence.update(
+        PublicEvidence(path=p.path, artifact_id=p.artifact_id, locator=p.provenance.locator)
+        for p in paths
+    )
+    # Additive metadata in the existing public details map preserves format-1 readers.
+    # Excerpts and private extraction text remain excluded from public exports.
+    details["publication_evidence"] = [
+        {
+            "path": p.path,
+            "artifact_id": p.artifact_id,
+            "content_sha256": p.content_sha256,
+            "capture_id": p.capture_id,
+            "observed_at": p.observed_at.isoformat(),
+            "source_id": p.source_id,
+            "locator": p.provenance.locator.model_dump(mode="json"),
+        }
+        for p in paths
+    ]
     return PublicOffer(
         offer_id=offer.offer_id,
         product_id=offer.product_id,
@@ -172,7 +193,8 @@ def _admit(row: SnapshotCandidate, manifest: PublishedSnapshot) -> PublicOffer:
         and offer.observed_at <= review.decided_at
         and review.review_id in manifest.review_ids
         and review.reviewed_fingerprints == offer_fingerprints(offer)
-        and review.reviewed_evidence_sha256 == offer_evidence_sha256(offer)
+        and review.reviewed_evidence_sha256
+        == publication_evidence_sha256(offer, corroborated_paths(offer, ctx))
     )
     if not (decision.publishable_now or reviewed) or decision.placement is Placement.NONE:
         raise SnapshotError(f"publication gate refused offer: {offer.offer_id}")

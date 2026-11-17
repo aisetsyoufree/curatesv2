@@ -25,7 +25,6 @@ from cu_rates.contracts.evidence import HtmlLocator, ParserVersion, Provenance, 
 from cu_rates.contracts.fingerprints import (
     OfferFingerprints,
     OfferSnapshot,
-    offer_evidence_sha256,
     offer_fingerprints,
 )
 from cu_rates.contracts.offers import NormalizedOffer, OfferCondition
@@ -41,7 +40,10 @@ from cu_rates.contracts.publication import (
     ValidationResult,
     VerifiedScenarioCondition,
     VerifiedScenarioStatement,
+    corroborated_paths,
     evaluate_publication,
+    financial_items,
+    publication_evidence_sha256,
 )
 from cu_rates.contracts.registry import (
     Institution,
@@ -593,14 +595,16 @@ def publish(
             and review.approved
             and offer.observed_at <= review.decided_at <= evaluated_at
             and review.reviewed_fingerprints == fp
-            and review.reviewed_evidence_sha256 == offer_evidence_sha256(offer)
+            and review.reviewed_evidence_sha256
+            == publication_evidence_sha256(offer, corroborated_paths(offer, ctx))
         ):
             return None
     elif not decision.publishable_now:
         return None
     elif review is not None and (
         review.reviewed_fingerprints != fp
-        or review.reviewed_evidence_sha256 != offer_evidence_sha256(offer)
+        or review.reviewed_evidence_sha256
+        != publication_evidence_sha256(offer, corroborated_paths(offer, ctx))
     ):
         # A legitimate small rate change can auto-publish, but is not a new human review.
         review = None
@@ -626,7 +630,16 @@ def publish(
         {
             "snapshot_id": snapshot_id,
             "offer_id": offer_id,
-            "baseline_json": baseline.model_dump(mode="json"),
+            "baseline_json": {
+                **baseline.model_dump(mode="json"),
+                "publication_version": "2.0",
+                "publication_evidence": [
+                    p.model_dump(mode="json") for p in corroborated_paths(offer, ctx)
+                ],
+                "publication_evidence_sha256": publication_evidence_sha256(
+                    offer, corroborated_paths(offer, ctx)
+                ),
+            },
             "last_value_change_at": changed_at,
         },
     )
@@ -782,6 +795,7 @@ def load_publication_context(
         except (ArtifactStoreError, ValueError, OSError):
             pass
 
+    primary_verified = bool(verified)
     profile = None
     if basis is not None:
         row = conn.execute(
@@ -828,38 +842,6 @@ def load_publication_context(
         OfferStatus.SUPERSEDED,
     }:
         offer = offer.model_copy(update={"status": registered.status, "published_at": None})
-    if (
-        basis is not None
-        and verified
-        and profile is not None
-        and approval is not None
-        and prior is not None
-        and prior.review is not None
-        and prior.review.approved
-        and prior.review.reviewed_evidence_sha256 == offer_evidence_sha256(offer)
-        and prior.snapshot.fingerprints == offer_fingerprints(offer)
-        and offer.valid_until is not None
-    ):
-        span = offer.valid_until - offer.observed_at
-        if timedelta(0) < span <= _FRESHNESS:
-            for when in sorted({item.observed_at for item in reobservations}, reverse=True):
-                claims = [
-                    item
-                    for item in reobservations
-                    if item.observed_at == when and item.original_artifact_id in cited
-                ]
-                if (
-                    when > offer.observed_at
-                    and claims
-                    and all(
-                        _refresh_allowed(item, verified[0], basis, profile, approval)
-                        for item in claims
-                    )
-                ):
-                    offer = offer.model_copy(
-                        update={"observed_at": when, "valid_until": when + span}
-                    )
-                    break
     latest: dict[str, ValidationResult] = {}
     current = offer_fingerprints(offer)
     for row in conn.execute(
@@ -895,6 +877,8 @@ def load_publication_context(
             approved_at=policy_row.approved_at,
         )
     )
+    if not primary_verified:
+        offer = offer.model_copy(update={"status": OfferStatus.QUARANTINED, "published_at": None})
     if (
         offer.status is OfferStatus.CANDIDATE
         and policy is not None
@@ -930,64 +914,93 @@ def load_publication_context(
             for proof in _conditions(conn, offer_id)
             if proof.fetch_run_id == basis.run_id and proof.condition in offer.conditions
         )
+    # Read separate stored offer observations. No inferred captures: missing or
+    # unverifiable history remains absent and the publication gate fails closed.
     paths: list[EvidencePath] = []
-    if comparable and verified:
-        art = verified[0]
-        corroboration_art_id = sha256(f"corroboration:{art.artifact_id}".encode()).hexdigest()
-        corroboration_run_id = f"corroboration-{basis.run_id}" if basis else "corroboration-run"
-        corroboration_time = art.fetched_at - timedelta(hours=1)
-        source_class = source.evidence_kind.value
-        for p, sourced in offer.rate_items():
+    artifacts = {item.artifact_id: item for item in verified}
+    all_statements = list(statements)
+    captures = conn.execute(
+        select(slice_offer_captures).where(slice_offer_captures.c.offer_id == offer_id)
+    ).all()
+    for saved in captures:
+        observed_offer = NormalizedOffer.model_validate(saved.offer_json)
+        if (
+            observed_offer.offer_id != offer.offer_id
+            or observed_offer.product_id != offer.product_id
+            or observed_offer.source_id != offer.source_id
+            or observed_offer.institution_charter != offer.institution_charter
+        ):
+            continue
+        records = [
+            item
+            for item in observations
+            if item.fetch_run_id == saved.fetch_run_id
+            and item.source_url == source.url
+            and item.fetched_at == observed_offer.observed_at
+        ]
+        if len(records) != 1:
+            continue
+        item = records[0]
+        art = RawArtifact(
+            schema_version=item.schema_version,
+            artifact_id=item.artifact_id,
+            media_type=item.media_type,
+            source_url=item.source_url,
+            fetched_at=item.fetched_at,
+            http_status=item.http_status,
+            byte_length=blob_length(conn, item.artifact_id),
+            fetch_run_id=item.fetch_run_id,
+        )
+        try:
+            raw = store.read(art)
+            if store.get_observation(art.fetch_run_id, art.source_url) != art:
+                continue
+            from cu_rates.pipeline.slice import verify_offer_bytes
+
+            if not verify_offer_bytes(source, observed_offer, raw, art):
+                continue
+        except (ArtifactStoreError, ValueError, OSError):
+            continue
+        proofs = tuple(
+            proof
+            for proof in _statements(conn, offer_id)
+            if proof.fetch_run_id == art.fetch_run_id
+            and proof.provenance.artifact_id == art.artifact_id
+            and any(
+                match.dimension == proof.dimension
+                and match.stated == proof.stated
+                and match.provenance == proof.provenance
+                for match in observed_offer.scenario_matches
+            )
+        )
+        for proof in proofs:
+            if proof not in all_statements:
+                all_statements.append(proof)
+        # artifact_id is the stored content address, not a newly computed hash.
+        artifacts.setdefault(art.artifact_id, art)
+        wanted = {path: value for path, value, _ in financial_items(offer)}
+        for path, value, provenance in financial_items(observed_offer):
+            if wanted.get(path) != value:
+                continue
             paths.append(
                 EvidencePath(
-                    path=p,
-                    value=sourced.value,
+                    path=path,
+                    value=value,
                     artifact_id=art.artifact_id,
+                    content_sha256=art.artifact_id,
                     capture_id=art.fetch_run_id,
                     observed_at=art.fetched_at,
-                    product_id=offer.product_id,
-                    scenario_id=offer.scenario_id,
-                    source_class=source_class,
+                    product_id=observed_offer.product_id,
+                    scenario_id=observed_offer.scenario_id,
+                    source_id=source.source_id,
+                    source_class=source.evidence_kind.value,
+                    provenance=provenance,
+                    scenario_statements=proofs,
                 )
             )
-            paths.append(
-                EvidencePath(
-                    path=p,
-                    value=sourced.value,
-                    artifact_id=corroboration_art_id,
-                    capture_id=corroboration_run_id,
-                    observed_at=corroboration_time,
-                    product_id=offer.product_id,
-                    scenario_id=offer.scenario_id,
-                    source_class=source_class,
-                )
-            )
-        if offer.points is not None:
-            paths.append(
-                EvidencePath(
-                    path="points",
-                    value=offer.points.value,
-                    artifact_id=art.artifact_id,
-                    capture_id=art.fetch_run_id,
-                    observed_at=art.fetched_at,
-                    product_id=offer.product_id,
-                    scenario_id=offer.scenario_id,
-                    source_class=source_class,
-                )
-            )
-            paths.append(
-                EvidencePath(
-                    path="points",
-                    value=offer.points.value,
-                    artifact_id=corroboration_art_id,
-                    capture_id=corroboration_run_id,
-                    observed_at=corroboration_time,
-                    product_id=offer.product_id,
-                    scenario_id=offer.scenario_id,
-                    source_class=source_class,
-                )
-            )
-    return TrustedView(
+    verified = tuple(artifacts.values())
+    statements = tuple(all_statements)
+    view = TrustedView(
         offer,
         PublicationContext(
             institution=institution,
@@ -1016,6 +1029,41 @@ def load_publication_context(
         ),
         current_review,
     )
+
+    if (
+        basis is not None
+        and verified
+        and profile is not None
+        and approval is not None
+        and prior is not None
+        and prior.review is not None
+        and prior.review.approved
+        and prior.review.reviewed_evidence_sha256
+        == publication_evidence_sha256(offer, corroborated_paths(offer, view.context))
+        and prior.snapshot.fingerprints == offer_fingerprints(offer)
+        and offer.valid_until is not None
+    ):
+        span = offer.valid_until - offer.observed_at
+        if timedelta(0) < span <= _FRESHNESS:
+            for when in sorted({item.observed_at for item in reobservations}, reverse=True):
+                claims = [
+                    item
+                    for item in reobservations
+                    if item.observed_at == when and item.original_artifact_id in cited
+                ]
+                if (
+                    when > offer.observed_at
+                    and claims
+                    and all(
+                        _refresh_allowed(item, verified[0], basis, profile, approval)
+                        for item in claims
+                    )
+                ):
+                    offer = offer.model_copy(
+                        update={"observed_at": when, "valid_until": when + span}
+                    )
+                    break
+    return TrustedView(offer, view.context, current_review)
 
 
 def _refresh_allowed(
@@ -1309,12 +1357,21 @@ def _prior(conn: Connection, offer_id: str, evaluated_at: UtcDatetime) -> PriorP
     if historical is None:
         return None
     snapshot = _snapshot(conn, row.snapshot_id)
-    baseline = OfferSnapshot.model_validate(historical.baseline_json)
+    baseline = OfferSnapshot.model_validate(
+        {
+            key: value
+            for key, value in historical.baseline_json.items()
+            if key
+            not in {"publication_version", "publication_evidence", "publication_evidence_sha256"}
+        }
+    )
     reviewed = [
         found
         for review_id in snapshot.review_ids
         if (found := load_review_decision(conn, review_id)).subject_id == offer_id
         and found.reviewed_fingerprints == baseline.fingerprints
+        and found.reviewed_evidence_sha256
+        == historical.baseline_json.get("publication_evidence_sha256")
         and found.decided_at <= snapshot.published_at
     ]
     review = max(

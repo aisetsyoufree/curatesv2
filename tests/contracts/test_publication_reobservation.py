@@ -118,9 +118,9 @@ def blocked(
 
 def test_valid_304_keeps_an_unchanged_offer_fresh() -> None:
     decision = decide()
-    assert decision.outcome is PublicationOutcome.AUTO_PUBLISH
-    assert decision.placement is Placement.RANKED
-    assert decision.reasons == ()
+    assert decision.outcome is PublicationOutcome.QUARANTINE
+    assert decision.placement is Placement.NONE
+    assert R.EVIDENCE_PATH_TIME_OUTSIDE_WINDOW in decision.reasons
 
 
 def test_without_the_304_the_old_fetch_is_stale() -> None:
@@ -141,7 +141,8 @@ def test_a_304_does_not_rewrite_the_original_artifact_or_run() -> None:
     assert obs.http_status == 304
     assert obs.run_id != run.run_id
     assert run.artifact_ids == (ARTIFACT_ID,)
-    assert decide().publishable_now
+    assert not decide().publishable_now
+    assert R.EVIDENCE_PATH_TIME_OUTSIDE_WINDOW in decide().reasons
 
 
 def test_304_is_inert_when_the_offer_rests_on_a_normal_200() -> None:
@@ -274,7 +275,8 @@ def test_304_between_72_and_96_hours_is_degraded_not_withdrawn() -> None:
         ),
         validations=validations_for(offer, evaluated_at=degraded_at),
     )
-    assert decision.publishable_now and decision.degraded
+    assert not decision.publishable_now
+    assert R.EVIDENCE_PATH_TIME_OUTSIDE_WINDOW in decision.reasons
 
 
 def test_a_304_cannot_outlive_the_offers_own_expiry() -> None:
@@ -292,7 +294,7 @@ def test_304_observation_time_must_not_precede_its_start() -> None:
 
 def test_304_does_not_approve_a_first_publication() -> None:
     decision = decide(prior=None)
-    blocked(decision, PublicationOutcome.REQUIRES_REVIEW, R.FIRST_PUBLICATION)
+    blocked(decision, PublicationOutcome.QUARANTINE, R.FIRST_PUBLICATION)
 
 
 def test_304_does_not_override_a_denylist() -> None:
@@ -322,7 +324,7 @@ def test_304_does_not_cure_a_failed_validation() -> None:
 
 def test_304_does_not_approve_an_unreviewed_prior() -> None:
     decision = decide(prior=prior(purchase_offer(), reviewed=False))
-    blocked(decision, PublicationOutcome.REQUIRES_REVIEW, R.PRIOR_NOT_REVIEWED)
+    blocked(decision, PublicationOutcome.QUARANTINE, R.PRIOR_NOT_REVIEWED)
 
 
 def test_every_new_quarantine_reason_is_categorized() -> None:
@@ -383,7 +385,8 @@ def test_only_a_single_strong_etag_refreshes_evidence(value: str) -> None:
 
 
 def test_the_same_strong_etag_refreshes_evidence() -> None:
-    assert decide(**_shared('"abc-123_~"')).publishable_now
+    assert not decide(**_shared('"abc-123_~"')).publishable_now
+    assert R.EVIDENCE_PATH_TIME_OUTSIDE_WINDOW in decide(**_shared('"abc-123_~"')).reasons
 
 
 @pytest.mark.parametrize(
