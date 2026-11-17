@@ -358,8 +358,9 @@ def test_iter_provenance_covers_every_value() -> None:
     assert offer.tiers[0].note_rate is not None
     assert offer.tiers[0].note_rate.provenance in items
     assert offer.points.provenance in items
-    # evidence + note/apr/points + condition + tier + one field mapping per material path
-    assert len(items) == 1 + 3 + 1 + 1 + len(offer.field_provenance)
+    # Evidence + note/APR/points + condition + tier + mapped fields + scenario statements.
+    assert len(items) == 1 + 3 + 1 + 1 + len(offer.field_provenance) + len(offer.scenario_matches)
+    assert all(match.provenance in items for match in offer.scenario_matches)
     assert {e.path for e in offer.field_provenance} == offer.material_paths()
 
 

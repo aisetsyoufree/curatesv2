@@ -20,7 +20,6 @@ from cu_rates.contracts import (
     WithdrawalScope,
     evaluate_publication,
 )
-from cu_rates.contracts.enums import FetchMethod
 from cu_rates.contracts.publication import QUARANTINE_REASONS
 from cu_rates.contracts.sources import is_strong_etag, profile_sha256
 
@@ -31,6 +30,7 @@ from .factories import (
     SV,
     T0,
     context,
+    fetch_profile,
     fetch_run,
     prior,
     purchase_offer,
@@ -48,16 +48,7 @@ OTHER_ARTIFACT = "c" * 64
 
 
 def profile(**overrides: Any) -> FetchProfile:
-    kwargs: dict[str, Any] = {
-        "schema_version": SV,
-        "profile_id": "profile-1",
-        "source_id": SOURCE_ID,
-        "method": FetchMethod.HTTP_GET,
-        "min_interval_seconds": 60,
-        "timeout_seconds": 30,
-    }
-    kwargs.update(overrides)
-    return FetchProfile(**kwargs)
+    return fetch_profile(**overrides)
 
 
 def original_run(**overrides: Any) -> FetchRun:

@@ -431,14 +431,15 @@ UNSAFE_CASES: list[tuple[str, dict[str, Any], dict[str, Any], ReasonCode, Public
         {"note_rate": rate("6.63001")},
         {},
         R.RATE_MOVEMENT_EXCEEDS_LIMIT,
-        PublicationOutcome.REQUIRES_REVIEW,
+        # The jump also puts APR under the note rate, which the gate recomputes.
+        PublicationOutcome.QUARANTINE,
     ),
     (
         "apr-drop",
         {"apr": rate("5.700")},
         {},
         R.RATE_MOVEMENT_EXCEEDS_LIMIT,
-        PublicationOutcome.REQUIRES_REVIEW,
+        PublicationOutcome.QUARANTINE,
     ),
 ]
 
@@ -492,7 +493,10 @@ def test_unsafe_cases_cover_every_blocking_reason() -> None:
         R.REOBSERVATION_UNVERIFIED,
         R.VALIDATION_UNBOUND,
         R.CORRECTION_PENDING,
-    }  # covered by dedicated tests below and in test_publication_evidence.py
+        R.PROFILE_UNAPPROVED,
+        R.LAYOUT_UNREVIEWED,
+        R.REOBSERVATION_CLAIM_CHANGED,
+    }  # covered by dedicated tests below and in test_publication_gate.py
 
 
 # --- review-trigger boundaries -------------------------------------------------------------
@@ -517,6 +521,10 @@ def _moved(note: str, apr: str = "6.250") -> NormalizedOffer:
 def test_fifty_basis_point_boundary(note: str, apr: str, flagged: bool) -> None:
     decision = decide(_moved(note, apr), prior=prior_of(purchase_offer()))
     assert (R.RATE_MOVEMENT_EXCEEDS_LIMIT in decision.reasons) is flagged
+    if D(apr) < D(note):
+        assert decision.outcome is PublicationOutcome.QUARANTINE
+        assert R.VALIDATION_FAILED in decision.reasons
+        return
     expected = PublicationOutcome.REQUIRES_REVIEW if flagged else PublicationOutcome.AUTO_PUBLISH
     assert decision.outcome is expected
 
@@ -744,7 +752,11 @@ def test_tier_must_cover_scenario_and_agree_with_headline() -> None:
     assert boundary_lower.placement is Placement.RANKED  # inclusive bounds
 
     mismatched = decide(
-        purchase_offer(note_rate=rate("6.500"), tiers=(tier("t", 0, 80, TierDimension.LTV),)),
+        purchase_offer(
+            note_rate=rate("6.500"),
+            apr=rate("6.625"),
+            tiers=(tier("t", 0, 80, TierDimension.LTV),),
+        ),
         prior=None,
     )
     assert R.TIER_RATE_MISMATCH in mismatched.reasons

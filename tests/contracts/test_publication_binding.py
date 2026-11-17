@@ -36,8 +36,9 @@ from cu_rates.contracts import (
     value_fingerprint,
 )
 from cu_rates.contracts.base import CONTRACT_VERSION
-from cu_rates.contracts.enums import EvidenceKind, RateType
+from cu_rates.contracts.enums import EvidenceKind, FetchMethod, RateType
 from cu_rates.contracts.publication import SUPPRESS_REASONS
+from cu_rates.contracts.sources import profile_sha256
 
 from .factories import (
     ARTIFACT_ID,
@@ -50,6 +51,7 @@ from .factories import (
     context,
     equity_offer,
     extraction,
+    fetch_profile,
     fetch_run,
     heloc_details,
     heloc_offer,
@@ -78,6 +80,8 @@ D = Decimal
 EQUITY_PRODUCT = product(family=ProductFamily.HOME_EQUITY_LOAN)
 HELOC_PRODUCT = product(family=ProductFamily.HELOC)
 OTHER_ARTIFACT = "c" * 64
+RENDER_PROFILE = fetch_profile(method=FetchMethod.RENDERED_BROWSER)
+RENDER_DIGEST = profile_sha256(RENDER_PROFILE)
 
 
 def decide(offer: NormalizedOffer | None = None, **ctx: Any) -> PublicationDecision:
@@ -239,7 +243,12 @@ def test_source_approval_is_immutable_and_audited() -> None:
             type(approval).model_validate({k: v for k, v in payload.items() if k != missing})
     with pytest.raises(ValidationError, match="schema_version"):
         type(approval).model_validate({k: v for k, v in payload.items() if k != "schema_version"})
-    assert decide(source_approval=source_approval(decided_at=EVALUATED_AT)).publishable_now
+    # The approval must predate the fetch. A decision at evaluation time is too late.
+    started = fetch_run().started_at
+    assert decide(source_approval=source_approval(decided_at=started)).publishable_now
+    late = decide(source_approval=source_approval(decided_at=EVALUATED_AT))
+    assert R.PROFILE_UNAPPROVED in late.reasons
+    assert not late.publishable_now
 
 
 # --- 3. contract fields are compared with the canonical scenario -----------------------------
@@ -634,14 +643,20 @@ def _correction(**overrides: Any) -> Any:
 
 def test_unbound_correction_forces_review_until_the_state_is_reviewed() -> None:
     offer = purchase_offer()
-    # The prior review (decided one day before T0) covers the current content and follows a
-    # correction made two days earlier, so that correction is cleared by a matching review.
-    assert decide(offer, corrections=(_correction(),)).publishable_now
-    boundary = _correction(corrected_at=T0 - timedelta(days=1))
-    assert decide(offer, corrections=(boundary,)).publishable_now
-    # A correction made after the last review has no reviewed corrected state yet.
-    recent = _correction(corrected_at=T0 - timedelta(hours=1))
-    blocked(decide(offer, corrections=(recent,)), R.CORRECTION_PENDING, RV)
+    correction = _correction(corrected_value="6.125", evidence=(provenance("6.125%"),))
+    # The review from before the new capture does not cover its fresh evidence.
+    blocked(decide(offer, corrections=(correction,)), R.CORRECTION_PENDING, RV)
+    after_capture = prior(offer).model_copy(
+        update={
+            "review": review(offer).model_copy(update={"decided_at": T0}),
+            "published": published_snapshot(offer, published_at=T0),
+        }
+    )
+    assert decide(offer, prior=after_capture, corrections=(correction,)).publishable_now
+    no_evidence = correction.model_copy(update={"evidence": ()})
+    blocked(
+        decide(offer, prior=after_capture, corrections=(no_evidence,)), R.CORRECTION_PENDING, RV
+    )
     changed = purchase_offer(note_rate=rate("6.250"))  # review covers other content
     blocked(
         decide(changed, prior=prior(offer), corrections=(_correction(),)), R.CORRECTION_PENDING, RV
@@ -659,7 +674,15 @@ def test_correction_bound_to_the_current_content_clears() -> None:
     recent = {"corrected_at": T0 - timedelta(hours=1)}  # newer than the prior review
     unbound = _correction(**recent)
     blocked(decide(offer, corrections=(unbound,)), R.CORRECTION_PENDING, RV)
-    bound = _correction(corrected_fingerprints=offer_fingerprints(offer), **recent)
+    # A fingerprint alone does not clear a replacement that is not on the offer.
+    contradictory = _correction(corrected_fingerprints=offer_fingerprints(offer), **recent)
+    blocked(decide(offer, corrections=(contradictory,)), R.CORRECTION_PENDING, RV)
+    bound = _correction(
+        corrected_fingerprints=offer_fingerprints(offer),
+        corrected_value="6.125",
+        evidence=(provenance("6.125%"),),
+        **recent,
+    )
     assert decide(offer, corrections=(bound,)).publishable_now
     other = offer_fingerprints(purchase_offer(note_rate=rate("6.200")))
     mismatched = _correction(corrected_fingerprints=other, **recent)
@@ -753,7 +776,12 @@ def test_source_evidence_kind_must_admit_the_locator(kind: EvidenceKind) -> None
 
 
 def test_rendered_dom_source_admits_dom_and_html_locators() -> None:
-    assert decide(source=rate_source(evidence_kind=EvidenceKind.RENDERED_DOM)).publishable_now
+    assert decide(
+        source=rate_source(evidence_kind=EvidenceKind.RENDERED_DOM),
+        approved_profile=RENDER_PROFILE,
+        source_approval=source_approval(approved_profile_sha256=RENDER_DIGEST),
+        fetch_runs=(fetch_run(profile_sha256=RENDER_DIGEST),),
+    ).publishable_now
 
 
 def _dom_offer(response_ids: tuple[str, ...]) -> NormalizedOffer:
@@ -771,6 +799,9 @@ def _dom_offer(response_ids: tuple[str, ...]) -> NormalizedOffer:
 
 def _dom_decision(response_ids: tuple[str, ...], **ctx: Any) -> PublicationDecision:
     ctx.setdefault("source", rate_source(evidence_kind=EvidenceKind.RENDERED_DOM))
+    ctx.setdefault("approved_profile", RENDER_PROFILE)
+    ctx.setdefault("source_approval", source_approval(approved_profile_sha256=RENDER_DIGEST))
+    ctx.setdefault("fetch_runs", (fetch_run(profile_sha256=RENDER_DIGEST),))
     return decide(_dom_offer(response_ids), **ctx)
 
 
@@ -778,7 +809,7 @@ def test_rendered_dom_response_ids_must_be_stored_artifacts_of_the_same_fetch() 
     xhr = raw_artifact(OTHER_ARTIFACT, "application/json", source_url="https://example.invalid/api")
     both = {
         "known_artifacts": (raw_artifact(), xhr),
-        "fetch_runs": (fetch_run(ARTIFACT_ID, OTHER_ARTIFACT),),
+        "fetch_runs": (fetch_run(ARTIFACT_ID, OTHER_ARTIFACT, profile_sha256=RENDER_DIGEST),),
     }
     assert _dom_decision((OTHER_ARTIFACT,), **both).publishable_now
     assert _dom_decision(

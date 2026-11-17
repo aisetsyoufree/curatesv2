@@ -6,6 +6,7 @@ from typing import Any
 
 from cu_rates.contracts import (
     APR_RULE_ID,
+    CANONICAL_SCENARIOS,
     CONTRACT_VERSION,
     REQUIRED_DIMENSIONS,
     ArmTerms,
@@ -15,6 +16,8 @@ from cu_rates.contracts import (
     DimensionMatch,
     EvidenceKind,
     ExtractionProvenance,
+    FetchMethod,
+    FetchProfile,
     FetchRun,
     FieldEvidence,
     FixedEquityDetails,
@@ -49,11 +52,13 @@ from cu_rates.contracts import (
     ReviewDecision,
     ReviewSubject,
     ReviewVerdict,
+    ScenarioDimension,
     SnapshotEntry,
     SourceApproval,
     SourcedMargin,
     SourcedPoints,
     SourcedRate,
+    SourceFingerprint,
     SourceRelationshipKind,
     TierBound,
     TierDimension,
@@ -65,6 +70,10 @@ from cu_rates.contracts import (
     product_content_sha256,
     snapshot_manifest_sha256,
 )
+from cu_rates.contracts.fingerprints import offer_evidence_sha256
+from cu_rates.contracts.publication import VerifiedScenarioCondition, VerifiedScenarioStatement
+from cu_rates.contracts.scenarios import matching_statement
+from cu_rates.contracts.sources import profile_sha256
 
 T0 = datetime(2026, 11, 15, 12, 0, tzinfo=UTC)
 EVALUATED_AT = T0 + timedelta(hours=1)
@@ -81,6 +90,7 @@ SOURCE_URL = "https://example.invalid/rates"
 SV = CONTRACT_VERSION
 VALIDATOR = ParserVersion(name="synthetic-validator", version="1.0.0")
 IMAGE_ARTIFACT_ID = "abcdef0123456789" * 4
+LAYOUT_SHA = "ab" * 32
 
 
 def extraction(rule_id: str | None = None, parser: ParserVersion = PARSER) -> ExtractionProvenance:
@@ -142,12 +152,27 @@ def rate_source(**overrides: Any) -> RateSource:
     return RateSource(**kwargs)
 
 
+def fetch_profile(**overrides: Any) -> FetchProfile:
+    """The one profile a valid publication context treats as human-approved."""
+    kwargs: dict[str, Any] = {
+        "schema_version": SV,
+        "profile_id": "profile-1",
+        "source_id": SOURCE_ID,
+        "method": FetchMethod.HTTP_GET,
+        "min_interval_seconds": 60,
+        "timeout_seconds": 30,
+    }
+    kwargs.update(overrides)
+    return FetchProfile(**kwargs)
+
+
 def fetch_run(*artifact_ids: str, **overrides: Any) -> FetchRun:
     kwargs: dict[str, Any] = {
         "schema_version": SV,
         "run_id": "fetch-001",
         "source_id": SOURCE_ID,
         "profile_id": "profile-1",
+        "profile_sha256": profile_sha256(fetch_profile()),
         "status": "succeeded",
         "started_at": T0 - timedelta(minutes=1),
         "finished_at": T0 + timedelta(minutes=1),
@@ -170,9 +195,28 @@ def source_approval(**overrides: Any) -> SourceApproval:
         "policy_id": "source-policy",
         "policy_version": "1",
         "rationale": "Official first-party rates page.",
+        "approved_profile_sha256": profile_sha256(fetch_profile()),
+        "approved_layout_sha256": LAYOUT_SHA,
+        "adapter": PARSER,
     }
     kwargs.update(overrides)
     return SourceApproval(**kwargs)
+
+
+def source_fingerprint(**overrides: Any) -> SourceFingerprint:
+    """Layout digest of the baseline artifact, tied to the approved adapter."""
+    kwargs: dict[str, Any] = {
+        "schema_version": SV,
+        "source_id": SOURCE_ID,
+        "fetch_run_id": "fetch-001",
+        "artifact_id": ARTIFACT_ID,
+        "observed_at": T0,
+        "content_sha256": ARTIFACT_ID,
+        "structure_sha256": LAYOUT_SHA,
+        "adapter": PARSER,
+    }
+    kwargs.update(overrides)
+    return SourceFingerprint(**kwargs)
 
 
 def points(value: str) -> SourcedPoints:
@@ -180,9 +224,28 @@ def points(value: str) -> SourcedPoints:
 
 
 def matches_all(scenario_id: CanonicalScenarioId) -> tuple[DimensionMatch, ...]:
+    scenario = CANONICAL_SCENARIOS[scenario_id]
+    texts = {
+        ScenarioDimension.OCCUPANCY: "Owner-occupied primary residence",
+        ScenarioDimension.PROPERTY_TYPE: "Single-family",
+        ScenarioDimension.CREDIT_SCORE: str(scenario.credit_score),
+        ScenarioDimension.RATE_TYPE: "Fixed",
+        ScenarioDimension.TERM_MONTHS: f"{scenario.term_months} months",
+        ScenarioDimension.LTV: f"{scenario.ltv}%",
+        ScenarioDimension.CLTV: f"{scenario.cltv}%",
+        ScenarioDimension.LOCK_DAYS: f"{scenario.lock_days} days",
+        ScenarioDimension.LOAN_AMOUNT: "$" + str(scenario.loan_amount),
+        ScenarioDimension.POINTS: f"{scenario.points} points",
+        ScenarioDimension.CASH_OUT: "No cash out",
+        ScenarioDimension.RELATIONSHIP_DISCOUNT: "No relationship discount",
+    }
     return tuple(
         DimensionMatch(
-            dimension=dimension, state=MatchState.MATCHES, source_text=f"{dimension.value} stated"
+            dimension=dimension,
+            state=MatchState.MATCHES,
+            source_text=texts[dimension],
+            stated=matching_statement(scenario, dimension),
+            provenance=provenance(texts[dimension]),
         )
         for dimension in sorted(REQUIRED_DIMENSIONS[scenario_id])
     )
@@ -298,6 +361,8 @@ def heloc_details(**overrides: Any) -> HelocDetails:
         "margin": margin("0.500"),
         "floor": rate("4.000"),
         "lien_position": LienPosition.SECOND,
+        "draw_period_months": 120,
+        "repayment_period_months": 240,
     }
     kwargs.update(overrides)
     return HelocDetails(**kwargs)
@@ -373,6 +438,7 @@ def review(
         decided_at=T0 - timedelta(days=1),
         rationale="Matches the stored source page.",
         reviewed_fingerprints=offer_fingerprints(offer),
+        reviewed_evidence_sha256=offer_evidence_sha256(offer),
     )
 
 
@@ -428,6 +494,9 @@ def prior(
         published=published_snapshot(offer),
         review=review(offer) if reviewed else None,
         last_value_change_at=T0 - timedelta(days=changed_days_ago),
+        verified_artifact_id=ARTIFACT_ID,
+        verified_configuration_sha256=CONFIG_HASH,
+        verified_parser=PARSER,
     )
 
 
@@ -513,11 +582,50 @@ def context(
         "approved_parsers": (PARSER,),
         "known_artifacts": (raw_artifact(),),
         "fetch_runs": (fetch_run(),),
+        "approved_profile": fetch_profile(),
+        "source_fingerprints": (source_fingerprint(),),
         "validations": validations_for(current),
         "prior": prior(baseline),
         "evaluated_at": EVALUATED_AT,
     }
     kwargs.update(overrides)
+    if "source_fingerprints" not in overrides:
+        kwargs["source_fingerprints"] = tuple(
+            source_fingerprint(
+                artifact_id=artifact.artifact_id,
+                content_sha256=artifact.artifact_id,
+                fetch_run_id=artifact.fetch_run_id,
+                observed_at=artifact.fetched_at,
+            )
+            for artifact in kwargs["known_artifacts"]
+            if artifact.source_url == kwargs["source"].url
+        )
+    runs = {art.artifact_id: art.fetch_run_id for art in kwargs["known_artifacts"]}
+    if "verified_scenario_statements" not in overrides:
+        kwargs["verified_scenario_statements"] = tuple(
+            VerifiedScenarioStatement(
+                offer_id=current.offer_id,
+                dimension=match.dimension,
+                fetch_run_id=runs[match.provenance.artifact_id],
+                provenance=match.provenance,
+                stated=match.stated,
+            )
+            for match in current.scenario_matches
+            if match.stated is not None
+            and match.provenance is not None
+            and match.provenance.artifact_id in runs
+        )
+    if "verified_scenario_conditions" not in overrides and current.scenario_id is not None:
+        kwargs["verified_scenario_conditions"] = tuple(
+            VerifiedScenarioCondition(
+                offer_id=current.offer_id,
+                scenario_id=current.scenario_id,
+                fetch_run_id=runs[item.provenance.artifact_id],
+                condition=item,
+            )
+            for item in current.conditions
+            if item.provenance.artifact_id in runs
+        )
     if "product_review" not in kwargs:
         kwargs["product_review"] = product_review(reviewed=kwargs["product"])
     return PublicationContext(**kwargs)

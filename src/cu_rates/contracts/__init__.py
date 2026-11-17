@@ -77,6 +77,7 @@ from cu_rates.contracts.fingerprints import (
     RateChangeProof,
     RateValue,
     classify_change,
+    offer_evidence_sha256,
     offer_fingerprints,
     product_content_sha256,
     prove_rate_change,
@@ -106,6 +107,8 @@ from cu_rates.contracts.publication import (
     ReasonCode,
     ValidationPolicy,
     ValidationResult,
+    VerifiedScenarioCondition,
+    VerifiedScenarioStatement,
     evaluate_publication,
 )
 from cu_rates.contracts.registry import (
@@ -248,6 +251,8 @@ __all__ = [
     "TierDimension",
     "ValidationPolicy",
     "ValidationResult",
+    "VerifiedScenarioCondition",
+    "VerifiedScenarioStatement",
     "VersionedModel",
     "WithdrawalEntry",
     "WithdrawalScope",
@@ -261,6 +266,7 @@ __all__ = [
     "fetch_method_for",
     "locator_fits_media_type",
     "match_numeric",
+    "offer_evidence_sha256",
     "offer_fingerprints",
     "product_content_sha256",
     "prove_rate_change",

@@ -334,6 +334,7 @@ def test_every_product_kind_lists_its_material_details() -> None:
         "details.index_name",
         "details.lien_position",
         "details.draw_period_months",
+        "details.repayment_period_months",
         "details.max_cltv",
         "details.intro.duration_months",
     }

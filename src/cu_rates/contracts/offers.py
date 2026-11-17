@@ -493,8 +493,8 @@ class NormalizedOffer(VersionedModel):
         """Every publicly material non-rate field that needs a field-level evidence mapping.
 
         Sourced rates and points carry their own provenance inline, so they are not listed.
-        Scenario matches carry their quoted ``source_text`` instead of provenance (typed
-        limitation: they are evidence-quoted, not evidence-addressable).
+        Scenario matches carry their own stated value and locator; publication recomputes
+        the match and does not treat the excerpt alone as evidence.
         """
         paths = set(self.details.material_paths())
         paths |= {f"conditions.{c.condition_id}" for c in self.conditions}
@@ -527,12 +527,21 @@ class NormalizedOffer(VersionedModel):
 
     def iter_provenance(self) -> Iterator[Provenance]:
         """Every provenance record backing a value or condition on this offer."""
-        yield from self.supporting_evidence
-        for _, item in self.rate_items():
-            yield item.provenance
+        for _, item in self.iter_labeled_provenance():
+            yield item
+
+    def iter_labeled_provenance(self) -> Iterator[tuple[str, Provenance]]:
+        """Evidence by claim key, including located scenario statements."""
+        for support in self.supporting_evidence:
+            yield "supporting", support
+        for path, item in self.rate_items():
+            yield path, item.provenance
         if self.points is not None:
-            yield self.points.provenance
+            yield "points", self.points.provenance
         for condition in self.conditions:
-            yield condition.provenance
+            yield f"conditions.{condition.condition_id}", condition.provenance
         for evidence in self.field_provenance:
-            yield evidence.provenance
+            yield f"fields.{evidence.path}", evidence.provenance
+        for match in self.scenario_matches:
+            if match.provenance is not None:
+                yield f"scenario_matches.{match.dimension.value}", match.provenance
