@@ -64,7 +64,9 @@ metadata = MetaData()
 # Primary-key columns of every append-only table, in constraint order. The
 # replace guard aborts when this key is already present. SQLite otherwise
 # implements REPLACE as a delete plus an insert and skips the delete trigger
-# unless recursive_triggers is enabled.
+# unless recursive_triggers is enabled. Roster tables also name every extra
+# unique key in ROSTER_CONFLICT_KEYS, because REPLACE can delete through
+# artifact_id without matching the primary key.
 APPEND_ONLY_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "fetch_runs": ("run_id",),
     "not_modified_observations": ("run_id",),
@@ -97,6 +99,13 @@ APPEND_ONLY_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "slice_normalization_failures": ("extraction_run_id", "row_id"),
     "roster_imports": ("import_id",),
     "roster_import_entries": ("import_id", "charter_number"),
+}
+# Every unique conflict key on the roster history tables. A completed import
+# stays sealed when any of these keys already exists: REPLACE must not delete
+# the row through artifact_id and leave its entries orphaned.
+ROSTER_CONFLICT_KEYS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "roster_imports": (("import_id",), ("artifact_id",)),
+    "roster_import_entries": (("import_id", "charter_number"),),
 }
 APPEND_ONLY_TABLES = frozenset(APPEND_ONLY_PRIMARY_KEYS)
 # Offers may change lifecycle columns. They still cannot be replaced, because
@@ -960,12 +969,22 @@ def _append_only_message(table: str) -> str:
     return f"{table} is append-only"
 
 
+def _conflict_predicate(table_name: str, keys: tuple[str, ...]) -> str:
+    """SQL boolean that is true when ``NEW`` hits any unique conflict key."""
+    groups = ROSTER_CONFLICT_KEYS.get(table_name, (keys,))
+    parts = [" AND ".join(f"{column} = NEW.{column}" for column in group) for group in groups]
+    if len(parts) == 1:
+        return parts[0]
+    return " OR ".join(parts)
+
+
 def schema_triggers(tables: Iterable[str] | None = None) -> tuple[tuple[str, str], ...]:
     """``(name, CREATE TRIGGER statement)`` for the operational database.
 
     Update and delete triggers reject ordinary mutation. The insert trigger
     rejects ``REPLACE`` even when ``recursive_triggers`` is off, because the
-    old primary key is still visible to ``BEFORE INSERT``.
+    conflicting row is still visible to ``BEFORE INSERT``. Roster replace
+    guards name every unique key, not only the primary key.
     """
     target_tables: frozenset[str] | None = frozenset(tables) if tables is not None else None
     if target_tables is None:
@@ -992,7 +1011,7 @@ def schema_triggers(tables: Iterable[str] | None = None) -> tuple[tuple[str, str
                     f"BEGIN SELECT RAISE(ABORT, '{message}'); END",
                 )
             )
-        match = " AND ".join(f"{column} = NEW.{column}" for column in keys)
+        match = _conflict_predicate(table_name, keys)
         replace_name = f"{table_name}_no_replace"
         statements.append(
             (
