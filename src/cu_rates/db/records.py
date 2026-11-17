@@ -217,6 +217,7 @@ def load_review_decision(conn: Connection, review_id: str) -> ReviewDecision:
             "evidence": [loaded[item.provenance_id].model_dump() for item in evidence_rows],
             "reviewed_fingerprints": row.fingerprints_json,
             "reviewed_product_sha256": row.reviewed_product_sha256,
+            "reviewed_evidence_sha256": row.reviewed_evidence_sha256,
         }
     )
 
@@ -516,6 +517,7 @@ def _write_review(conn: Connection, review: ReviewDecision, institution_charter:
             if review.reviewed_fingerprints is None
             else review.reviewed_fingerprints.model_dump(mode="json"),
             "reviewed_product_sha256": review.reviewed_product_sha256,
+            "reviewed_evidence_sha256": review.reviewed_evidence_sha256,
         },
     )
     if review.evidence:

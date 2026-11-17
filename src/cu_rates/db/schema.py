@@ -53,6 +53,7 @@ from cu_rates.contracts.enums import (
     ReviewSubject,
     ReviewVerdict,
     RunStatus,
+    ScenarioDimension,
     SourceRelationshipKind,
     WithdrawalScope,
 )
@@ -88,6 +89,8 @@ APPEND_ONLY_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "published_snapshots": ("snapshot_id",),
     "snapshot_entries": ("snapshot_id", "offer_id"),
     "snapshot_reviews": ("snapshot_id", "review_id"),
+    "verified_scenario_statements": ("statement_id",),
+    "verified_scenario_conditions": ("offer_id", "scenario_id", "condition_id"),
     "roster_imports": ("import_id",),
     "roster_import_entries": ("import_id", "charter_number"),
 }
@@ -435,6 +438,13 @@ source_fingerprints = Table(
     Column("observed_at", UtcDateTime, nullable=False),
     Column("content_sha256", SqlText, nullable=False),
     Column("structure_sha256", SqlText, nullable=False),
+    Column("adapter_name", SqlText),
+    Column("adapter_version", SqlText),
+    CheckConstraint(
+        "(adapter_name IS NULL AND adapter_version IS NULL)"
+        " OR (adapter_name IS NOT NULL AND adapter_version IS NOT NULL)",
+        name="ck_source_fingerprints_adapter",
+    ),
 )
 
 source_approvals = Table(
@@ -450,6 +460,16 @@ source_approvals = Table(
     Column("policy_id", SqlText, nullable=False),
     Column("policy_version", SqlText, nullable=False),
     Column("rationale", SqlText, nullable=False),
+    Column("approved_profile_sha256", SqlText),
+    Column("approved_layout_sha256", SqlText),
+    Column("adapter_name", SqlText),
+    Column("adapter_version", SqlText),
+    Column("approved_origins_json", JsonDocument),
+    CheckConstraint(
+        "(adapter_name IS NULL AND adapter_version IS NULL)"
+        " OR (adapter_name IS NOT NULL AND adapter_version IS NOT NULL)",
+        name="ck_source_approvals_adapter",
+    ),
     _enum_check("source_approvals", "decision", ReviewVerdict),
 )
 
@@ -657,6 +677,7 @@ review_decisions = Table(
     Column("rationale", SqlText, nullable=False),
     Column("fingerprints_json", JsonDocument),
     Column("reviewed_product_sha256", SqlText),
+    Column("reviewed_evidence_sha256", SqlText),
     CheckConstraint(
         "(subject = 'offer' AND fingerprints_json IS NOT NULL AND reviewed_product_sha256 IS NULL)"
         " OR (subject = 'product' AND fingerprints_json IS NULL"
@@ -812,6 +833,32 @@ snapshot_entries = Table(
     Column("offer_id", SqlText, ForeignKey("normalized_offers.offer_id"), primary_key=True),
     Column("structural_sha256", SqlText, nullable=False),
     Column("value_sha256", SqlText, nullable=False),
+)
+
+verified_scenario_statements = Table(
+    "verified_scenario_statements",
+    metadata,
+    _id("statement_id", primary_key=True),
+    _schema_version(),
+    Column("offer_id", SqlText, ForeignKey("normalized_offers.offer_id"), nullable=False),
+    Column("dimension", SqlText, nullable=False),
+    Column("fetch_run_id", SqlText, ForeignKey("fetch_runs.run_id"), nullable=False),
+    Column("stated_json", JsonDocument, nullable=False),
+    Column("provenance_id", SqlText, ForeignKey("provenance.provenance_id"), nullable=False),
+    UniqueConstraint("offer_id", "dimension", name="uq_verified_statements_dimension"),
+    _enum_check("verified_scenario_statements", "dimension", ScenarioDimension),
+)
+
+verified_scenario_conditions = Table(
+    "verified_scenario_conditions",
+    metadata,
+    Column("offer_id", SqlText, ForeignKey("normalized_offers.offer_id"), primary_key=True),
+    Column("scenario_id", SqlText, primary_key=True),
+    Column("condition_id", SqlText, primary_key=True),
+    _schema_version(),
+    Column("fetch_run_id", SqlText, ForeignKey("fetch_runs.run_id"), nullable=False),
+    Column("condition_json", JsonDocument, nullable=False),
+    _enum_check("verified_scenario_conditions", "scenario_id", CanonicalScenarioId),
 )
 
 snapshot_reviews = Table(

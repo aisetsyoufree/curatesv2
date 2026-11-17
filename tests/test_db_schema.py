@@ -473,18 +473,11 @@ def test_enum_checks_use_contract_values(tmp_path: Path) -> None:
     engine = open_operational_database(path)
     with engine.connect() as conn:
         checker = inspect(conn)
-        # AUD1 added WithdrawalScope.SOURCE. The frozen t012 CHECK does not list it yet.
-        # A later migration must accept 'source' before a source withdrawal is stored.
-        frozen_gap = {("withdrawal_entries", "scope", "source")}
         for table_name, column, enum_cls in ENUM_CHECKS:
             sql = " ".join(item["sqltext"] for item in checker.get_check_constraints(table_name))
             assert column in sql
             for member in enum_cls:
-                token = f"'{member.value}'"
-                if (table_name, column, member.value) in frozen_gap:
-                    assert token not in sql
-                    continue
-                assert token in sql
+                assert f"'{member.value}'" in sql
         with pytest.raises(IntegrityError):
             conn.execute(
                 insert(institutions),
