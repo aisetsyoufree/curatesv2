@@ -11,6 +11,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from cu_rates.contracts.audit import PublishedSnapshot, SnapshotEntry
+from cu_rates.contracts.publication import WITHDRAW_AFTER
 
 from ._files import SnapshotError, read_bytes, regular_file, require_directory
 from ._models import PublicOffer, SnapshotInfo, Version
@@ -98,10 +99,17 @@ def verify_database(
                     or not offer.observed_at <= info.published_at < offer.valid_until
                 ):
                     raise SnapshotError("offer row does not match the manifest or release time")
+                admission = offer.require_protocol2()
+                if any(
+                    not info.published_at - WITHDRAW_AFTER <= p.observed_at <= info.published_at
+                    for p in admission.publication_evidence
+                ):
+                    raise SnapshotError("publication evidence is stale at release time")
                 offers.append(offer)
         PublishedSnapshot(
-            **info.model_dump(), entries=tuple(snapshot_entry(offer) for offer in offers)
+            **info.model_dump(exclude={"publication_version"}),
+            entries=tuple(snapshot_entry(offer) for offer in offers),
         )
         return info, tuple(offers)
-    except (OSError, sqlite3.Error, ValidationError) as exc:
+    except (OSError, sqlite3.Error, ValueError) as exc:
         raise SnapshotError("cannot verify public snapshot database or manifest") from exc
