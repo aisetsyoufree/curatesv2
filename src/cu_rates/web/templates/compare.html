@@ -39,7 +39,7 @@
   </form>
 
   <div class="active-filters-bar" role="status">
-    <p>Active scenario: <strong>{{ 'All Scenarios' if scenario_param == 'all' else scenario_sections[0].spec.short_title }}</strong> | Active sort: <strong>{{ active_sort_label }}</strong></p>
+    <p>Active scenario: <strong>{{ 'All Scenarios' if scenario_param == 'all' else scenario_sections[0].spec.short_title }}</strong> | Active sort: <strong>{{ active_sort_label }}</strong> <span class="sort-scope-note">(applies to comparable grids; incomplete offers maintain neutral alphabetical order)</span></p>
   </div>
 
   {% if not has_published_data %}
@@ -75,6 +75,16 @@
       {% endfor %}
     </div>
   </section>
+  {% elif total_displayed == 0 %}
+  <section class="empty-state-section" aria-labelledby="empty-filtered-heading">
+    <div class="empty-state-card card">
+      <h2 id="empty-filtered-heading">No Verified Rates Published for This Scenario</h2>
+      <p>
+        No verified offers are currently published that match the selected scenario filter.
+        Offers for other scenarios may be available by changing the scenario filter.
+      </p>
+    </div>
+  </section>
   {% else %}
   {% for section in scenario_sections %}
   <section class="scenario-block" aria-labelledby="heading-{{ section.spec.scenario_id }}">
@@ -93,38 +103,46 @@
 
       <div class="scenario-grid-panel">
         <h3>Comparable Offers (Standard Terms)</h3>
-        {% if section.comparable %}
-        <div class="table-responsive card">
-          <table class="data-table">
-            <caption>Comparable offers for {{ section.spec.title }} meeting all declared scenario assumptions</caption>
-            <thead>
-              <tr>
-                <th scope="col">Institution</th>
-                <th scope="col">Note Rate</th>
-                <th scope="col">APR</th>
-                <th scope="col">Points</th>
-                <th scope="col">Term</th>
-                <th scope="col">Loan Type</th>
-                <th scope="col">Conditions</th>
-                <th scope="col">Freshness</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for offer in section.comparable %}
-              <tr>
-                <th scope="row" class="institution-cell">{{ offer.institution_name }}</th>
-                <td>{{ offer.note_rate_display }}</td>
-                <td>{{ offer.apr_display }}</td>
-                <td>{{ offer.points_display }}</td>
-                <td>{{ offer.term_display }}</td>
-                <td>{{ offer.loan_type_display }}</td>
-                <td>{{ offer.conditions_display }}</td>
-                <td>{{ offer.freshness_display }}</td>
-              </tr>
-              {% endfor %}
-            </tbody>
-          </table>
-        </div>
+        {% if section.structure_groups %}
+          {% for group in section.structure_groups %}
+          {% if group.label %}
+          <h4 class="structure-group-heading">Structure: {{ group.label }}</h4>
+          {% endif %}
+          <div class="table-responsive card">
+            <table class="data-table">
+              <caption>Comparable offers for {{ section.spec.title }}{% if group.label %} ({{ group.label }}){% endif %} meeting all declared scenario assumptions</caption>
+              <thead>
+                <tr>
+                  <th scope="col">Institution</th>
+                  <th scope="col">Note Rate</th>
+                  <th scope="col">APR</th>
+                  <th scope="col">Points</th>
+                  <th scope="col">Term</th>
+                  <th scope="col">Loan Type</th>
+                  <th scope="col">Conditions</th>
+                  <th scope="col">Freshness</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for offer in group.offers %}
+                <tr>
+                  <th scope="row" class="institution-cell">
+                    <span class="inst-name">{{ offer.institution_name }}</span>
+                    <a href="{{ offer.source_url }}" class="source-link" rel="nofollow noopener noreferrer" target="_blank" aria-label="Source reference for {{ offer.institution_name }}">Source</a>
+                  </th>
+                  <td>{{ offer.note_rate_display }}</td>
+                  <td>{{ offer.apr_display }}</td>
+                  <td>{{ offer.points_display }}</td>
+                  <td>{{ offer.term_display }}</td>
+                  <td>{{ offer.loan_type_display }}</td>
+                  <td>{{ offer.conditions_display }}</td>
+                  <td>{{ offer.freshness_display }}</td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+          {% endfor %}
         {% else %}
         <div class="card notice-card">
           <p class="no-offers-notice">No comparable offers currently published for this scenario.</p>
@@ -151,6 +169,7 @@
               <th scope="col">APR</th>
               <th scope="col">Points</th>
               <th scope="col">Term</th>
+              <th scope="col">Loan Type</th>
               <th scope="col">Conditions</th>
               <th scope="col">Freshness</th>
             </tr>
@@ -158,12 +177,16 @@
           <tbody>
             {% for offer in section.incomparable %}
             <tr>
-              <th scope="row" class="institution-cell">{{ offer.institution_name }}</th>
+              <th scope="row" class="institution-cell">
+                <span class="inst-name">{{ offer.institution_name }}</span>
+                <a href="{{ offer.source_url }}" class="source-link" rel="nofollow noopener noreferrer" target="_blank" aria-label="Source reference for {{ offer.institution_name }}">Source</a>
+              </th>
               <td class="reason-cell"><span class="reason-badge">{{ offer.separation_reason }}</span></td>
               <td>{{ offer.note_rate_display }}</td>
               <td>{{ offer.apr_display }}</td>
               <td>{{ offer.points_display }}</td>
               <td>{{ offer.term_display }}</td>
+              <td>{{ offer.loan_type_display }}</td>
               <td>{{ offer.conditions_display }}</td>
               <td>{{ offer.freshness_display }}</td>
             </tr>

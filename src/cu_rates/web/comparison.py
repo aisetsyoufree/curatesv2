@@ -14,6 +14,7 @@ from flask import current_app
 from cu_rates.contracts.enums import (
     CanonicalScenarioId,
     ConditionKind,
+    LoanPurpose,
     MatchState,
     ProductFamily,
 )
@@ -49,10 +50,10 @@ ALLOWED_SORTS = frozenset(
 SORT_LABELS = {
     "institution": "Institution Name (A-Z)",
     "institution_desc": "Institution Name (Z-A)",
-    "apr": "APR (Lowest First)",
-    "apr_desc": "APR (Highest First)",
-    "rate": "Note Rate (Lowest First)",
-    "rate_desc": "Note Rate (Highest First)",
+    "apr": "APR (Low to High)",
+    "apr_desc": "APR (High to Low)",
+    "rate": "Note Rate (Low to High)",
+    "rate_desc": "Note Rate (High to Low)",
     "freshness": "Observed Time (Newest First)",
 }
 
@@ -178,6 +179,9 @@ class FormattedOffer:
     sort_apr: Decimal | None
     sort_rate: Decimal | None
     sort_freshness: datetime
+    draw_period_months: int | None = None
+    repayment_period_months: int | None = None
+    structure_label: str = ""
 
 
 def format_age(delta: timedelta) -> str:
@@ -192,26 +196,75 @@ def format_age(delta: timedelta) -> str:
     return f"{minutes}m ago"
 
 
+def format_heloc_structure(draw: int | None, repay: int | None) -> str:
+    if draw is not None and repay is not None:
+        draw_yrs = f"{draw // 12}Y" if draw % 12 == 0 else f"{draw}m"
+        repay_yrs = f"{repay // 12}Y" if repay % 12 == 0 else f"{repay}m"
+        return f"{draw_yrs} Draw / {repay_yrs} Repay ({draw}/{repay} mos)"
+    if draw is not None:
+        return f"{draw} mos draw"
+    if repay is not None:
+        return f"{repay} mos repay"
+    return "Structure not published"
+
+
 def format_conditions(offer: PublicOffer) -> str:
     items: list[str] = []
     if offer.headline_is_as_low_as:
         items.append("Advertised as 'as low as'")
+
+    # Precise tier qualifications
+    for tier in offer.tiers:
+        for bound in tier.bounds:
+            dim = bound.dimension.value.upper()
+            if bound.lower is not None and bound.upper is not None:
+                items.append(f"Tier qualification ({dim}: {bound.lower} to {bound.upper})")
+            elif bound.lower is not None:
+                items.append(f"Tier qualification ({dim} >= {bound.lower})")
+            elif bound.upper is not None:
+                items.append(f"Tier qualification ({dim} <= {bound.upper})")
+
+    # Flag conflicting scenario assumptions
+    for assumption in offer.assumptions:
+        if assumption.state is MatchState.CONFLICTS:
+            dim_name = assumption.dimension.value.replace("_", " ")
+            if assumption.stated is not None:
+                st = assumption.stated
+                if st.exact is not None:
+                    val_str = str(st.exact)
+                elif st.lower is not None and st.upper is not None:
+                    val_str = f"{st.lower} to {st.upper}"
+                elif st.lower is not None:
+                    val_str = f">= {st.lower}"
+                elif st.upper is not None:
+                    val_str = f"<= {st.upper}"
+                elif st.token is not None:
+                    val_str = str(st.token)
+                else:
+                    val_str = "conflicting bound"
+                items.append(f"Conflicts with scenario {dim_name} ({val_str})")
+            else:
+                items.append(f"Conflicts with scenario {dim_name}")
+
+    # Condition kinds as condition disclosures (never asserted requirements)
     for cond in offer.conditions:
         if cond.kind is ConditionKind.AUTOPAY:
-            items.append("Requires automatic payment discount")
+            items.append("Autopay discount condition")
         elif cond.kind is ConditionKind.RELATIONSHIP:
-            items.append("Requires account relationship")
+            items.append("Account relationship condition")
         elif cond.kind is ConditionKind.TIER:
-            items.append("Tier-based pricing")
+            if not offer.tiers:
+                items.append("Tier pricing condition")
         elif cond.kind is ConditionKind.DISCOUNT:
-            items.append("Special discount applied")
+            items.append("Discount condition")
         elif cond.kind is ConditionKind.BORROWER_REQUIREMENT:
-            items.append("Borrower eligibility requirement")
+            items.append("Borrower eligibility condition")
         elif cond.kind is ConditionKind.AS_LOW_AS:
             if not offer.headline_is_as_low_as:
-                items.append("Tier or qualification condition")
+                items.append("As-low-as qualification condition")
         else:
             items.append(f"Condition: {cond.kind.value.replace('_', ' ')}")
+
     return ", ".join(items) if items else "None published"
 
 
@@ -224,38 +277,115 @@ def format_term(offer: PublicOffer) -> str:
     if offer.family is ProductFamily.HELOC:
         draw = offer.details.get("draw_period_months")
         repay = offer.details.get("repayment_period_months")
-        if draw or repay:
-            return f"Draw: {draw or 'not published'}, Repay: {repay or 'not published'}"
+        if draw is not None or repay is not None:
+            draw_str = f"{draw} mos" if draw is not None else "not published"
+            repay_str = f"{repay} mos" if repay is not None else "not published"
+            return f"Draw: {draw_str}, Repay: {repay_str}"
         return "Revolving line"
     return "Not published"
 
 
 def format_loan_type(offer: PublicOffer) -> str:
+    """Format loan type using only verified attributes present in snapshot data."""
+    parts: list[str] = []
+
+    rate_type = offer.details.get("rate_type")
+    if rate_type == "fixed":
+        parts.append("Fixed-Rate")
+    elif rate_type == "adjustable":
+        parts.append("Adjustable-Rate (ARM)")
+    elif (
+        offer.family is ProductFamily.HOME_EQUITY_LOAN
+        and offer.details.get("kind") == "fixed_equity"
+    ):
+        parts.append("Fixed-Rate")
+    elif offer.family is ProductFamily.HELOC:
+        parts.append("Variable-Rate")
+
+    conforming = offer.details.get("conforming_status")
+    if conforming == "conforming":
+        parts.append("Conforming")
+    elif conforming == "jumbo":
+        parts.append("Jumbo")
+    elif conforming == "high_balance_conforming":
+        parts.append("High-Balance Conforming")
+
     if offer.family is ProductFamily.MORTGAGE:
-        rate_type = offer.details.get("rate_type", "fixed")
-        type_str = "Fixed-Rate" if rate_type == "fixed" else "Adjustable-Rate (ARM)"
-        purpose_val = offer.purpose.value if offer.purpose else "purchase"
-        purpose_str = "Purchase" if purpose_val == "purchase" else "Refinance"
-        return f"{type_str} Conforming Mortgage ({purpose_str})"
-    if offer.family is ProductFamily.HOME_EQUITY_LOAN:
-        return "Fixed-Rate Home Equity Loan (Second Lien)"
-    if offer.family is ProductFamily.HELOC:
-        return "Variable-Rate HELOC (Second Lien)"
-    return "Not published"
+        parts.append("Mortgage")
+    elif offer.family is ProductFamily.HOME_EQUITY_LOAN:
+        parts.append("Home Equity Loan")
+    elif offer.family is ProductFamily.HELOC:
+        parts.append("HELOC")
+
+    purpose_str: str | None = None
+    if offer.purpose is not None:
+        if offer.purpose is LoanPurpose.PURCHASE:
+            purpose_str = "Purchase"
+        elif offer.purpose is LoanPurpose.RATE_TERM_REFINANCE:
+            purpose_str = "Rate/Term Refinance"
+        elif offer.purpose is LoanPurpose.CASH_OUT_REFINANCE:
+            purpose_str = "Cash-Out Refinance"
+        else:
+            purpose_str = offer.purpose.value.replace("_", " ").title()
+
+    lien = offer.details.get("lien_position")
+    lien_str: str | None = None
+    if lien == "second":
+        lien_str = "Second Lien"
+    elif lien == "first":
+        lien_str = "First Lien"
+
+    if not parts and purpose_str is None and lien_str is None:
+        return "Not published"
+
+    base = " ".join(parts) if parts else "Loan"
+    qualifiers: list[str] = []
+    if purpose_str is not None:
+        qualifiers.append(purpose_str)
+    if lien_str is not None:
+        qualifiers.append(lien_str)
+
+    if qualifiers:
+        return f"{base} ({', '.join(qualifiers)})"
+    return base
 
 
 def classify_and_format_offer(offer: PublicOffer, now: datetime) -> FormattedOffer | None:
-    """Return a formatted offer projection or None if stale/withdrawn/denylisted."""
-    if now >= offer.valid_until or now - offer.observed_at > WITHDRAW_AFTER:
+    """Return a formatted offer projection or None if stale/withdrawn/denylisted/detail-only."""
+    if (
+        offer.placement is Placement.INSTITUTION_DETAIL_ONLY
+        or offer.placement is Placement.NONE
+        or now >= offer.valid_until
+        or now - offer.observed_at > WITHDRAW_AFTER
+    ):
         return None
 
     rates_by_path = {r.path: r.value for r in offer.rates}
     note_rate = rates_by_path.get("note_rate")
     apr = rates_by_path.get("apr")
-    if apr is None and offer.family is ProductFamily.HELOC:
-        apr = rates_by_path.get("details.stated_post_intro_apr") or rates_by_path.get(
-            "details.index_rate"
-        )
+
+    draw_val = offer.details.get("draw_period_months")
+    draw_period: int | None = draw_val if isinstance(draw_val, int) else None
+    repay_val = offer.details.get("repayment_period_months")
+    repay_period: int | None = repay_val if isinstance(repay_val, int) else None
+    structure_label = (
+        format_heloc_structure(draw_period, repay_period)
+        if offer.family is ProductFamily.HELOC
+        else ""
+    )
+
+    if offer.family is ProductFamily.HELOC:
+        # Use ONLY the proven details.post_intro_rate for post-intro figures
+        post_intro = rates_by_path.get("details.post_intro_rate")
+        stated_apr = rates_by_path.get("details.stated_post_intro_apr")
+        if stated_apr is not None:
+            apr = stated_apr
+        elif post_intro is not None and apr is None and note_rate is None:
+            # Post-intro figure is a variable rate, not an APR!
+            note_rate = post_intro
+        intro_rate = rates_by_path.get("details.intro.rate")
+        if intro_rate is not None:
+            note_rate = intro_rate
 
     reasons: list[str] = []
     if apr is None:
@@ -328,6 +458,9 @@ def classify_and_format_offer(offer: PublicOffer, now: datetime) -> FormattedOff
         sort_apr=apr,
         sort_rate=note_rate,
         sort_freshness=offer.observed_at,
+        draw_period_months=draw_period,
+        repayment_period_months=repay_period,
+        structure_label=structure_label,
     )
 
 

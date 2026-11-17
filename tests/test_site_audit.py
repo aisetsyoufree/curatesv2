@@ -153,5 +153,55 @@ def test_forbidden_ranking_words_guard_detects_ranking_claims() -> None:
         "forbidden ranking word 'top'",
     ]
 
-    clean = "Compare publicly advertised terms sorted by institution name or lowest APR"
+    clean = "Compare publicly advertised terms sorted by institution name or observed date"
     assert forbidden_ranking_problems(clean) == []
+
+    # Superlatives and ranking phrases in titles, headings, alt text and body
+    assert forbidden_ranking_problems("Find the lowest rates today") == [
+        "forbidden ranking word 'lowest'"
+    ]
+    assert forbidden_ranking_problems("<title>The #1 Credit Union in MA</title>") == [
+        "forbidden ranking word '#1'"
+    ]
+    assert forbidden_ranking_problems("<h1>Cheapest mortgage options</h1>") == [
+        "forbidden ranking word 'cheapest'"
+    ]
+    assert forbidden_ranking_problems('<img src="banner.png" alt="our top recommended picks">') == [
+        "forbidden ranking word 'recommended'",
+        "forbidden ranking word 'top'",
+    ]
+
+
+def test_database_findings_narrows_snapshot_sqlite_to_readonly() -> None:
+    """Snapshot module SQLite exception forbids write methods and statements."""
+    from tests.site_audit import database_findings
+
+    clean_sources = {
+        "cu_rates.web": "import cu_rates.snapshot.reader",
+        "cu_rates.snapshot.reader": (
+            "import sqlite3\n"
+            "conn = sqlite3.connect('file:pub.sqlite?mode=ro')\n"
+            "conn.execute('SELECT * FROM info')"
+        ),
+    }
+    assert database_findings(clean_sources, ["cu_rates.web"]) == []
+
+    commit_sources = {
+        "cu_rates.web": "import cu_rates.snapshot.reader",
+        "cu_rates.snapshot.reader": (
+            "import sqlite3\nconn = sqlite3.connect('test')\nconn.commit()"
+        ),
+    }
+    findings = database_findings(commit_sources, ["cu_rates.web"])
+    assert any("sqlite write method" in f for f in findings)
+
+    insert_sources = {
+        "cu_rates.web": "import cu_rates.snapshot.reader",
+        "cu_rates.snapshot.reader": (
+            "import sqlite3\n"
+            "conn = sqlite3.connect('test')\n"
+            "conn.execute('INSERT INTO test VALUES (1)')"
+        ),
+    }
+    findings = database_findings(insert_sources, ["cu_rates.web"])
+    assert any("sqlite write statement" in f for f in findings)

@@ -5,6 +5,7 @@ from typing import Any, TypedDict
 
 from flask import Blueprint, Response, abort, current_app, render_template, request
 
+from cu_rates.contracts.enums import ProductFamily
 from cu_rates.web.comparison import (
     ALLOWED_PARAMS,
     ALLOWED_SCENARIOS,
@@ -12,6 +13,7 @@ from cu_rates.web.comparison import (
     CANONICAL_SCENARIO_SPECS,
     SCENARIOS_BY_ID,
     SORT_LABELS,
+    FormattedOffer,
     classify_and_format_offer,
     read_snapshot_offers,
     sort_offers,
@@ -243,10 +245,22 @@ def privacy() -> str:
     return render_template("privacy.html")
 
 
+MAX_COMPARE_QUERY_BYTES = 2048
+MAX_COMPARE_QUERY_PARAMS = 10
+
+
 @web_bp.route("/compare")
 def compare() -> Response:
     """Render the rate comparison experience reading only from the published snapshot."""
+    if len(request.query_string) > MAX_COMPARE_QUERY_BYTES:
+        abort(400)
+
+    if len(request.args) > MAX_COMPARE_QUERY_PARAMS:
+        abort(400)
+
     for param in request.args:
+        if len(request.args.getlist(param)) > 1:
+            abort(400)
         if param not in ALLOWED_PARAMS:
             abort(400)
 
@@ -281,7 +295,7 @@ def compare() -> Response:
         else ((SCENARIOS_BY_ID[scenario_param],) if scenario_param in SCENARIOS_BY_ID else ())
     )
 
-    scenario_sections = []
+    scenario_sections: list[dict[str, Any]] = []
     for spec in selected_specs:
         scenario_offers = [
             o
@@ -292,20 +306,54 @@ def compare() -> Response:
         comparable = [o for o in scenario_offers if o.is_comparable]
         incomparable = [o for o in scenario_offers if not o.is_comparable]
 
-        sorted_comparable = sort_offers(comparable, sort_param)
-        sorted_incomparable = sort_offers(incomparable, sort_param)
+        # Group identical structures for HELOC before sorting; never mix structures in one grid
+        structure_groups = []
+        if spec.family is ProductFamily.HELOC:
+            groups_map: dict[tuple[int | None, int | None], list[FormattedOffer]] = {}
+            for o in comparable:
+                key = (o.draw_period_months, o.repayment_period_months)
+                groups_map.setdefault(key, []).append(o)
+            for _key, group_offers in sorted(
+                groups_map.items(),
+                key=lambda item: (item[0][0] or 0, item[0][1] or 0),
+            ):
+                label = group_offers[0].structure_label if group_offers else ""
+                structure_groups.append(
+                    {
+                        "label": label,
+                        "offers": sort_offers(group_offers, sort_param),
+                    }
+                )
+        else:
+            if comparable:
+                structure_groups.append(
+                    {
+                        "label": "",
+                        "offers": sort_offers(comparable, sort_param),
+                    }
+                )
+
+        # Incomparable/incomplete sections keep neutral institution ordering
+        # regardless of sort parameters (Finding 4)
+        sorted_incomparable = sort_offers(incomparable, "institution")
 
         scenario_sections.append(
             {
                 "spec": spec,
-                "comparable": sorted_comparable,
+                "structure_groups": structure_groups,
+                "comparable": sort_offers(comparable, sort_param),
                 "incomparable": sorted_incomparable,
+                "comparable_count": len(comparable),
+                "incomparable_count": len(incomparable),
                 "total_count": len(scenario_offers),
             }
         )
 
+    total_displayed = sum(int(s["total_count"]) for s in scenario_sections)
+    noindex = (not has_published_data) or (total_displayed == 0)
+
     headers: dict[str, str] = {}
-    if not has_published_data:
+    if noindex:
         headers["X-Robots-Tag"] = "noindex, follow"
 
     rendered = render_template(
@@ -318,7 +366,8 @@ def compare() -> Response:
         scenario_sections=scenario_sections,
         all_scenario_specs=CANONICAL_SCENARIO_SPECS,
         snapshot_info=info,
-        noindex=not has_published_data,
+        noindex=noindex,
+        total_displayed=total_displayed,
     )
     return Response(rendered, headers=headers)
 

@@ -429,17 +429,49 @@ def publication_problems(
     return problems
 
 
-FORBIDDEN_RANKING_WORDS = ("best", "cheapest", "top", "recommended")
+FORBIDDEN_RANKING_WORDS = ("#1", "best", "cheapest", "lowest", "recommended", "top")
 FORBIDDEN_RANKING_PATTERN = re.compile(
-    r"\b(best|cheapest|top|recommended)\b",
+    r"\b(best|cheapest|top|recommended|lowest)\b|#1\b",
     re.IGNORECASE,
 )
 
 
+class _RankingScanner(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.texts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        for key, value in attrs:
+            if key == "alt" and value:
+                self.texts.append(value)
+
+    def handle_data(self, data: str) -> None:
+        if data.strip():
+            self.texts.append(data)
+
+
 def forbidden_ranking_problems(text: str) -> list[str]:
-    """Detect words that imply an unsupported ranking or endorsement."""
-    matches = FORBIDDEN_RANKING_PATTERN.findall(text)
-    return [f"forbidden ranking word '{word.lower()}'" for word in sorted(set(matches))]
+    """Detect words that imply an unsupported ranking or endorsement in text or HTML elements."""
+    matches: set[str] = set()
+    for m in FORBIDDEN_RANKING_PATTERN.finditer(text):
+        matches.add(m.group(0).lower())
+    if "<" in text and ">" in text:
+        scanner = _RankingScanner()
+        try:
+            scanner.feed(text)
+            for snippet in scanner.texts:
+                for m in FORBIDDEN_RANKING_PATTERN.finditer(snippet):
+                    matches.add(m.group(0).lower())
+        except Exception:
+            pass
+    return [f"forbidden ranking word '{word}'" for word in sorted(matches)]
+
+
+_SQLITE_WRITE_KEYWORDS = re.compile(
+    r"\b(insert\s+into|update\s+\w+|delete\s+from|drop\s+table|create\s+table|alter\s+table|replace\s+into|vacuum)\b",
+    re.IGNORECASE,
+)
 
 
 def is_forbidden_module(name: str, *, from_module: str = "") -> bool:
@@ -524,6 +556,19 @@ def _scan_module(
                 and isinstance(node.args[0].value, str)
             ):
                 imports.add(node.args[0].value)
+            if module.startswith("cu_rates.snapshot"):
+                method_name = called.rsplit(".", 1)[-1]
+                if method_name in {"commit", "rollback"}:
+                    references.append(f"sqlite write method '{called}'")
+                elif method_name in {"execute", "executemany", "executescript"} and node.args:
+                    first_arg = node.args[0]
+                    if (
+                        isinstance(first_arg, ast.Constant)
+                        and isinstance(first_arg.value, str)
+                        and _SQLITE_WRITE_KEYWORDS.search(first_arg.value)
+                    ):
+                        stmt_preview = first_arg.value.strip()[:30]
+                        references.append(f"sqlite write statement '{stmt_preview}'")
     return imports, references
 
 
@@ -544,7 +589,11 @@ def database_findings(sources: Mapping[str, str], roots: Sequence[str]) -> list[
                 findings.append(f"import {module}")
             continue
         imports, references = _scan_module(source, module=module, packages=packages)
-        findings.extend(f"open {reference} in {module}" for reference in references)
+        for reference in references:
+            if reference.startswith("sqlite write"):
+                findings.append(f"{reference} in {module}")
+            else:
+                findings.append(f"open {reference} in {module}")
         for imported in sorted(imports):
             if is_forbidden_module(imported, from_module=module):
                 findings.append(f"import {imported} from {module}")

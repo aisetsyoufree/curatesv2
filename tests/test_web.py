@@ -4,6 +4,7 @@ import json
 import re
 import sqlite3
 from datetime import datetime, timedelta
+from decimal import Decimal
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
@@ -17,13 +18,21 @@ from cu_rates.contracts.audit import PublishedSnapshot, SnapshotEntry, snapshot_
 from cu_rates.contracts.enums import (
     CanonicalScenarioId,
     ConditionKind,
+    LienPosition,
+    LoanPurpose,
     MatchState,
     OfferStatus,
     RateType,
     WithdrawalScope,
 )
 from cu_rates.contracts.fingerprints import offer_fingerprints
-from cu_rates.contracts.offers import OfferCondition, PurchaseMortgageDetails
+from cu_rates.contracts.offers import (
+    FixedEquityDetails,
+    HelocDetails,
+    OfferCondition,
+    PurchaseMortgageDetails,
+    RefinanceMortgageDetails,
+)
 from cu_rates.contracts.publication import Placement
 from cu_rates.snapshot import Denylist
 from cu_rates.snapshot.builder import SnapshotCandidate, SnapshotPublisher
@@ -744,6 +753,17 @@ def test_compare_query_parameter_allow_list(client: FlaskClient) -> None:
     bad_sort_best = client.get("/compare?sort=best")
     assert bad_sort_best.status_code == 400
 
+    # Reject duplicate query parameters (Finding 8)
+    bad_duplicate = client.get("/compare?scenario=all&scenario=purchase_30y_fixed")
+    assert bad_duplicate.status_code == 400
+
+    bad_duplicate_sort = client.get("/compare?sort=apr&sort=rate")
+    assert bad_duplicate_sort.status_code == 400
+
+    # Query length bound (Finding 8)
+    bad_long = client.get("/compare?" + "a" * 2100)
+    assert bad_long.status_code == 400
+
     # Valid parameters pass with 200
     valid_scenario = client.get("/compare?scenario=purchase_30y_fixed")
     assert valid_scenario.status_code == 200
@@ -755,7 +775,7 @@ def test_compare_query_parameter_allow_list(client: FlaskClient) -> None:
     assert valid_sort.status_code == 200
     valid_sort_html = valid_sort.get_data(as_text=True)
     assert "Active sort:" in valid_sort_html
-    assert "APR (Lowest First)" in valid_sort_html
+    assert "APR (Low to High)" in valid_sort_html
 
 
 def test_compare_fixture_snapshot_rendering_and_incomparable_separation(
@@ -786,7 +806,7 @@ def test_compare_fixture_snapshot_rendering_and_incomparable_separation(
         now=now,
     )
 
-    # 3. Incomparable: note rate only, no APR (Decision D-05)
+    # 3. Incomparable: note rate only, no APR (Decision D-05) -> Placement.INSTITUTION_DETAIL_ONLY
     gamma_no_apr = _make_candidate(
         "offer-gamma",
         "Gamma Community Credit Union",
@@ -797,7 +817,7 @@ def test_compare_fixture_snapshot_rendering_and_incomparable_separation(
         now=now,
     )
 
-    # 4. Incomparable: conditional autopay discount
+    # 4. Incomparable: conditional autopay discount -> Placement.BROWSE_ONLY
     autopay_cond = OfferCondition(
         condition_id="cond-autopay",
         kind=ConditionKind.AUTOPAY,
@@ -816,7 +836,26 @@ def test_compare_fixture_snapshot_rendering_and_incomparable_separation(
         now=now,
     )
 
-    # 5. Withdrawn / Stale on denylist
+    # 5. Incomparable: relationship condition -> Placement.BROWSE_ONLY
+    rel_cond = OfferCondition(
+        condition_id="cond-rel",
+        kind=ConditionKind.RELATIONSHIP,
+        description="existing member discount",
+        provenance=make.provenance("existing member discount"),
+        scenario_state=MatchState.CONFLICTS,
+    )
+    zeta_rel = _make_candidate(
+        "offer-zeta",
+        "Zeta State Credit Union",
+        note_rate_str="6.200",
+        apr_str="6.300",
+        points_str="0",
+        term_months=360,
+        conditions=(rel_cond,),
+        now=now,
+    )
+
+    # 6. Withdrawn / Stale on denylist
     epsilon_withdrawn = _make_candidate(
         "offer-epsilon",
         "Epsilon Expired Credit Union",
@@ -827,7 +866,7 @@ def test_compare_fixture_snapshot_rendering_and_incomparable_separation(
 
     publisher, denylist = _build_test_snapshot(
         tmp_path,
-        [alpha, beta, gamma_no_apr, delta_autopay, epsilon_withdrawn],
+        [alpha, beta, gamma_no_apr, delta_autopay, zeta_rel, epsilon_withdrawn],
         now=now,
     )
 
@@ -855,15 +894,31 @@ def test_compare_fixture_snapshot_rendering_and_incomparable_separation(
     sitemap = client.get("/sitemap.xml").get_data(as_text=True)
     assert "/compare" in sitemap
 
-    # 1. Main Grid contains comparable offers: Alpha and Beta
-    assert "Alpha Federal Credit Union" in html
-    assert "Beta State Credit Union" in html
-    assert "6.125%" in html
-    assert "6.250%" in html
-    assert "6.375%" in html
-    assert "6.500%" in html
-    assert "30 years (360 mos)" in html
-    assert "Fixed-Rate Conforming Mortgage (Purchase)" in html
+    # Section-specific assertions proving strict separation (Finding 11)
+    assert "incomparable-section" in html
+    comp_html = html[: html.index("incomparable-section")]
+    incomp_html = html[html.index("incomparable-section") :]
+
+    # 1. Main Grid contains ONLY comparable offers: Alpha and Beta
+    assert "Alpha Federal Credit Union" in comp_html
+    assert "Beta State Credit Union" in comp_html
+    assert "Delta Credit Union" not in comp_html
+    assert "Zeta State Credit Union" not in comp_html
+    assert "Gamma Community Credit Union" not in comp_html
+    assert "Epsilon Expired Credit Union" not in comp_html
+
+    assert "6.125%" in comp_html
+    assert "6.250%" in comp_html
+    assert "6.375%" in comp_html
+    assert "6.500%" in comp_html
+    assert "30 years (360 mos)" in comp_html
+    assert "Fixed-Rate Mortgage (Purchase)" in comp_html
+    assert "Fixed-Rate Conforming Mortgage" not in comp_html  # Conforming not inferred (Finding 5)
+
+    # Source reference links rendered in every comparable row (Finding 7)
+    assert 'class="source-link"' in comp_html
+    assert 'aria-label="Source reference for Alpha Federal Credit Union"' in comp_html
+    assert 'aria-label="Source reference for Beta State Credit Union"' in comp_html
 
     # Discloses scenario assumptions next to grid
     assert "$500,000" in html
@@ -871,45 +926,64 @@ def test_compare_fixture_snapshot_rendering_and_incomparable_separation(
     assert "80.000%" in html
     assert "780" in html
 
-    # 2. Incomparable / Incomplete section contains Gamma and Delta with plain reasons
-    assert "Incomparable or Incomplete Offers" in html
-    assert "Gamma Community Credit Union" in html
-    assert "Decision D-05" in html or "Lacks published APR disclosure" in html
+    # 2. Incomparable / Incomplete section contains Delta and Zeta with plain reasons
+    assert "Incomparable or Incomplete Offers" in incomp_html
+    assert "Delta Credit Union" in incomp_html
+    assert "Zeta State Credit Union" in incomp_html
+    assert "Alpha Federal Credit Union" not in incomp_html
+    assert "Beta State Credit Union" not in incomp_html
 
-    assert "Delta Credit Union" in html
-    assert "Requires automatic payment discount" in html or "Conditional discount" in html
+    # Incomplete table renders Loan Type column and source attribution (Finding 7)
+    assert '<th scope="col">Loan Type</th>' in incomp_html
+    assert "Fixed-Rate Mortgage (Purchase)" in incomp_html
+    assert 'aria-label="Source reference for Delta Credit Union"' in incomp_html
+    assert 'aria-label="Source reference for Zeta State Credit Union"' in incomp_html
 
-    # 3. Withdrawn offer Epsilon MUST NOT appear anywhere on the page
+    # Discloses conditions precisely (Finding 6)
+    assert "Autopay discount condition" in incomp_html
+    assert "Account relationship condition" in incomp_html
+
+    # 3. Decision D-05 and Denylist exclusions:
+    # Gamma (INSTITUTION_DETAIL_ONLY under D-05) and Epsilon (withdrawn)
+    # MUST NOT appear anywhere on page (Finding 3)
+    assert "Gamma Community Credit Union" not in html
+    assert "offer-gamma" not in html
     assert "Epsilon Expired Credit Union" not in html
     assert "offer-epsilon" not in html
 
     # 4. Sorting behavior
-    # Default sort: institution alphabetical ascending (Alpha before Beta)
-    alpha_pos = html.index("Alpha Federal Credit Union")
-    beta_pos = html.index("Beta State Credit Union")
-    assert alpha_pos < beta_pos
+    # Default sort: institution alphabetical ascending (Alpha before Beta in comparable grid)
+    a_idx = comp_html.index("Alpha Federal Credit Union")
+    b_idx = comp_html.index("Beta State Credit Union")
+    assert a_idx < b_idx
 
-    # Sort by APR descending (Beta 6.500% before Alpha 6.250%)
+    # Sort by APR descending (Beta 6.500% before Alpha 6.250% in comparable grid)
     apr_desc_resp = client.get("/compare?sort=apr_desc")
     apr_desc_html = apr_desc_resp.get_data(as_text=True)
-    b_pos = apr_desc_html.index("Beta State Credit Union")
-    a_pos = apr_desc_html.index("Alpha Federal Credit Union")
-    assert b_pos < a_pos
+    comp_desc = apr_desc_html[: apr_desc_html.index("incomparable-section")]
+    b_desc_idx = comp_desc.index("Beta State Credit Union")
+    a_desc_idx = comp_desc.index("Alpha Federal Credit Union")
+    assert b_desc_idx < a_desc_idx
+
+    # Incomparable section ALWAYS maintains neutral institution alphabetical order (Finding 4)
+    incomp_desc = apr_desc_html[apr_desc_html.index("incomparable-section") :]
+    assert incomp_desc.index("Delta Credit Union") < incomp_desc.index("Zeta State Credit Union")
 
     # Sort by APR ascending (Alpha 6.250% before Beta 6.500%)
     apr_asc_resp = client.get("/compare?sort=apr")
     apr_asc_html = apr_asc_resp.get_data(as_text=True)
-    assert apr_asc_html.index("Alpha Federal Credit Union") < apr_asc_html.index(
-        "Beta State Credit Union"
-    )
+    comp_asc = apr_asc_html[: apr_asc_html.index("incomparable-section")]
+    assert comp_asc.index("Alpha Federal Credit Union") < comp_asc.index("Beta State Credit Union")
+    incomp_asc = apr_asc_html[apr_asc_html.index("incomparable-section") :]
+    assert incomp_asc.index("Delta Credit Union") < incomp_asc.index("Zeta State Credit Union")
 
     # 5. Accessibility requirements
     doc = parse_page(html)
-    assert len(doc.tables) >= 1
-    assert len(doc.table_captions) >= 1
+    assert len(doc.tables) >= 2
+    assert len(doc.table_captions) == len(doc.tables)
     for caption in doc.table_captions:
-        assert caption != ""
-    assert len(doc.th_tags) >= 8
+        assert caption.strip() != ""
+    assert len(doc.th_tags) >= 16
     for th in doc.th_tags:
         assert th.get("scope") in ("col", "row")
 
@@ -922,14 +996,14 @@ def test_compare_fixture_snapshot_rendering_and_incomparable_separation(
 
 
 def test_compare_freshness_degradation_and_expiry(tmp_path: Path) -> None:
-    """Offers degrade to browse-only after 72h and withdraw after 96h or valid_until."""
+    """Offers degrade to browse-only after 72h and withdraw after 96h independent guard."""
     now = make.EVALUATED_AT
     item = _make_candidate(
         "offer-decay",
         "Decay Federal Credit Union",
         note_rate_str="6.125",
         apr_str="6.250",
-        validity=timedelta(hours=90),
+        validity=timedelta(hours=96),  # Valid for 96h (WITHDRAW_AFTER max validity)
         now=now,
     )
     publisher, denylist = _build_test_snapshot(tmp_path, [item], now=now)
@@ -947,7 +1021,7 @@ def test_compare_freshness_degradation_and_expiry(tmp_path: Path) -> None:
     assert "Decay Federal Credit Union" in fresh_html
     assert "Incomparable or Incomplete Offers" not in fresh_html
 
-    # 2. Degraded read (> 72h, < 90h): degraded to BROWSE_ONLY and separated
+    # 2. Degraded read (> 72h, < 96h): degraded to BROWSE_ONLY and separated
     degraded_app = create_app(
         {
             "TESTING": True,
@@ -961,13 +1035,25 @@ def test_compare_freshness_degradation_and_expiry(tmp_path: Path) -> None:
     assert "Incomparable or Incomplete Offers" in degraded_html
     assert "Degraded freshness (observed over 72 hours ago)" in degraded_html
 
-    # 3. Withdrawn / expired read (>= valid_until or > 96h): excluded completely from page
+    # Still visible at 95h as degraded
+    active_95_app = create_app(
+        {
+            "TESTING": True,
+            "SNAPSHOT_ROOT": str(publisher.root),
+            "DENYLIST_PATH": str(denylist.path),
+            "SNAPSHOT_CLOCK": make.T0 + timedelta(hours=95),
+        }
+    )
+    active_95_html = active_95_app.test_client().get("/compare").get_data(as_text=True)
+    assert "Decay Federal Credit Union" in active_95_html
+
+    # 3. Withdrawn read (> 96h): excluded completely by the independent 96-hour guard (Finding 11)
     withdrawn_app = create_app(
         {
             "TESTING": True,
             "SNAPSHOT_ROOT": str(publisher.root),
             "DENYLIST_PATH": str(denylist.path),
-            "SNAPSHOT_CLOCK": make.T0 + timedelta(hours=90),
+            "SNAPSHOT_CLOCK": make.T0 + timedelta(hours=97),
         }
     )
     withdrawn_html = withdrawn_app.test_client().get("/compare").get_data(as_text=True)
@@ -1002,26 +1088,27 @@ def test_guard_forbidden_ranking_words_catches_injected_claim_in_compare(
     assert "forbidden ranking word 'top'" in problems
     assert "forbidden ranking word 'recommended'" in problems
 
+    injected_lowest = clean_html.replace(
+        "All comparisons use declared canonical borrower scenarios",
+        "Find the lowest loan rates available",
+    )
+    assert "forbidden ranking word 'lowest'" in forbidden_ranking_problems(injected_lowest)
+
 
 def test_guard_incomparable_offers_never_classified_as_comparable() -> None:
     """Offers without APR, with degraded freshness, or with conditions never enter main grid."""
+    from cu_rates.snapshot.builder import _public_projection
     from cu_rates.web.comparison import classify_and_format_offer
 
     now = make.EVALUATED_AT
-    # 1. Missing APR offer
+    # 1. Missing APR offer -> Placement.INSTITUTION_DETAIL_ONLY is excluded completely (Finding 3)
     candidate_no_apr = _make_candidate(
         "no-apr-guard", "Test CU", note_rate_str="6.000", apr_str=None, now=now
     )
-    # Convert candidate's NormalizedOffer to PublicOffer-like inspection
-    from cu_rates.snapshot.builder import _public_projection
+    pub_detail_only = _public_projection(candidate_no_apr, Placement.INSTITUTION_DETAIL_ONLY, False)
+    assert classify_and_format_offer(pub_detail_only, now) is None
 
-    pub_no_apr = _public_projection(candidate_no_apr, Placement.BROWSE_ONLY, False)
-    formatted_no_apr = classify_and_format_offer(pub_no_apr, now)
-    assert formatted_no_apr is not None
-    assert not formatted_no_apr.is_comparable
-    assert "Decision D-05" in formatted_no_apr.separation_reason
-
-    # 2. Conditional autopay discount
+    # 2. Conditional autopay discount -> Placement.BROWSE_ONLY
     cond = OfferCondition(
         condition_id="c-guard",
         kind=ConditionKind.AUTOPAY,
@@ -1030,13 +1117,18 @@ def test_guard_incomparable_offers_never_classified_as_comparable() -> None:
         scenario_state=MatchState.CONFLICTS,
     )
     candidate_cond = _make_candidate(
-        "cond-guard", "Test CU", note_rate_str="6.000", apr_str="6.100", conditions=(cond,), now=now
+        "cond-guard",
+        "Test CU",
+        note_rate_str="6.000",
+        apr_str="6.100",
+        conditions=(cond,),
+        now=now,
     )
     pub_cond = _public_projection(candidate_cond, Placement.BROWSE_ONLY, False)
     formatted_cond = classify_and_format_offer(pub_cond, now)
     assert formatted_cond is not None
     assert not formatted_cond.is_comparable
-    assert "Conditional discount" in formatted_cond.separation_reason
+    assert "Autopay discount condition" in formatted_cond.conditions_display
 
     # 3. Degraded freshness (> 72 hours)
     candidate_degraded = _make_candidate(
@@ -1044,16 +1136,399 @@ def test_guard_incomparable_offers_never_classified_as_comparable() -> None:
         "Test CU",
         note_rate_str="6.000",
         apr_str="6.100",
-        validity=timedelta(hours=90),
+        validity=timedelta(hours=120),
         now=now,
     )
     pub_degraded = _public_projection(candidate_degraded, Placement.BROWSE_ONLY, False)
-    # Evaluate at 73 hours after observation
     formatted_degraded = classify_and_format_offer(pub_degraded, make.T0 + timedelta(hours=73))
     assert formatted_degraded is not None
     assert not formatted_degraded.is_comparable
     assert "Degraded freshness" in formatted_degraded.separation_reason
 
-    # 4. Stale offer (> 96 hours): excluded completely
+    # 4. Independent 96-hour expiry guard: excluded completely at 97 hours (Finding 11)
     formatted_stale = classify_and_format_offer(pub_degraded, make.T0 + timedelta(hours=97))
     assert formatted_stale is None
+
+
+def test_compare_all_four_canonical_scenarios_and_heloc_grouping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test all four canonical scenarios render comparable offers and HELOC groups structures."""
+    now = make.EVALUATED_AT
+
+    # 1. Purchase mortgage
+    purchase = _make_candidate(
+        "offer-purch",
+        "Purchase Credit Union",
+        note_rate_str="6.125",
+        apr_str="6.250",
+        points_str="0",
+        term_months=360,
+        scenario_id=CanonicalScenarioId.PURCHASE_30Y_FIXED,
+        now=now,
+    )
+
+    # 2. Refinance mortgage
+    effective = make.T0 - timedelta(days=1)
+    refi_offer = draft(
+        offer_id="offer-refi",
+        status=OfferStatus.APPROVED,
+        effective_at=effective,
+        observed_at=make.T0,
+        valid_until=make.T0 + timedelta(days=3),
+        scenario_id=CanonicalScenarioId.RATE_TERM_REFI_30Y_FIXED,
+        note_rate=make.rate("6.000"),
+        apr=make.rate("6.150"),
+        points=make.points("0"),
+        supporting_evidence=(make.provenance("CAPTURE refi"),),
+        scenario_matches=make.matches_all(CanonicalScenarioId.RATE_TERM_REFI_30Y_FIXED),
+        details=RefinanceMortgageDetails(
+            term_months=360,
+            rate_type=RateType.FIXED,
+            lock_days=30,
+            purpose=LoanPurpose.RATE_TERM_REFINANCE,
+        ),
+    )
+    refi_cand = SnapshotCandidate(
+        offer=refi_offer,
+        context=make.context(
+            refi_offer,
+            evaluated_at=now,
+            institution=make.institution(legal_name="Refi Credit Union"),
+        ),
+        candidates=(claim("effective_at", effective.isoformat()),),
+    )
+
+    # 3. Fixed equity 10Y
+    equity_offer = draft(
+        offer_id="offer-eq",
+        status=OfferStatus.APPROVED,
+        effective_at=effective,
+        observed_at=make.T0,
+        valid_until=make.T0 + timedelta(days=3),
+        scenario_id=CanonicalScenarioId.FIXED_HOME_EQUITY_10Y,
+        note_rate=make.rate("7.250"),
+        apr=make.rate("7.350"),
+        points=make.points("0"),
+        supporting_evidence=(make.provenance("CAPTURE eq"),),
+        scenario_matches=make.matches_all(CanonicalScenarioId.FIXED_HOME_EQUITY_10Y),
+        details=FixedEquityDetails(
+            term_months=120,
+            lien_position=LienPosition.SECOND,
+        ),
+    )
+    equity_cand = SnapshotCandidate(
+        offer=equity_offer,
+        context=make.context(
+            equity_offer,
+            evaluated_at=now,
+            institution=make.institution(legal_name="Equity Credit Union"),
+        ),
+        candidates=(claim("effective_at", effective.isoformat()),),
+    )
+
+    # 4. HELOC Structure A: 10Y draw / 20Y repay
+    heloc_a_details = HelocDetails(
+        index_name="Prime",
+        index_rate=make.rate("7.500"),
+        margin=make.margin("0.500"),
+        floor=make.rate("4.000"),
+        stated_post_intro_apr=make.rate("8.000"),
+        lien_position=LienPosition.SECOND,
+        draw_period_months=120,
+        repayment_period_months=240,
+    )
+    heloc_a_offer = draft(
+        offer_id="offer-heloc-a",
+        status=OfferStatus.APPROVED,
+        effective_at=effective,
+        observed_at=make.T0,
+        valid_until=make.T0 + timedelta(days=3),
+        scenario_id=CanonicalScenarioId.HELOC,
+        note_rate=None,
+        apr=None,
+        points=make.points("0"),
+        supporting_evidence=(make.provenance("CAPTURE heloc-a"),),
+        scenario_matches=make.matches_all(CanonicalScenarioId.HELOC),
+        details=heloc_a_details,
+    )
+    heloc_a_cand = SnapshotCandidate(
+        offer=heloc_a_offer,
+        context=make.context(
+            heloc_a_offer,
+            evaluated_at=now,
+            institution=make.institution(legal_name="Heloc Alpha Credit Union"),
+        ),
+        candidates=(claim("effective_at", effective.isoformat()),),
+    )
+
+    # 5. HELOC Structure B: 5Y draw / 15Y repay (different structure!)
+    heloc_b_details = HelocDetails(
+        index_name="Prime",
+        index_rate=make.rate("7.500"),
+        margin=make.margin("0.250"),
+        floor=make.rate("4.000"),
+        stated_post_intro_apr=make.rate("7.750"),
+        lien_position=LienPosition.SECOND,
+        draw_period_months=60,
+        repayment_period_months=180,
+    )
+    heloc_b_offer = draft(
+        offer_id="offer-heloc-b",
+        status=OfferStatus.APPROVED,
+        effective_at=effective,
+        observed_at=make.T0,
+        valid_until=make.T0 + timedelta(days=3),
+        scenario_id=CanonicalScenarioId.HELOC,
+        note_rate=None,
+        apr=None,
+        points=make.points("0"),
+        supporting_evidence=(make.provenance("CAPTURE heloc-b"),),
+        scenario_matches=make.matches_all(CanonicalScenarioId.HELOC),
+        details=heloc_b_details,
+    )
+    heloc_b_cand = SnapshotCandidate(
+        offer=heloc_b_offer,
+        context=make.context(
+            heloc_b_offer,
+            evaluated_at=now,
+            institution=make.institution(legal_name="Heloc Beta Credit Union"),
+        ),
+        candidates=(claim("effective_at", effective.isoformat()),),
+    )
+
+    from cu_rates.snapshot._models import SnapshotInfo
+    from cu_rates.snapshot.builder import _public_projection
+
+    info = SnapshotInfo(
+        schema_version=make.SV,
+        snapshot_id="mock-multi-snap",
+        published_at=now,
+        published_by="Publisher",
+        manifest_sha256="0" * 64,
+        supersedes=None,
+    )
+    all_offers = (
+        _public_projection(purchase, Placement.RANKED, False),
+        _public_projection(refi_cand, Placement.RANKED, False),
+        _public_projection(equity_cand, Placement.RANKED, False),
+        _public_projection(heloc_a_cand, Placement.RANKED, False),
+        _public_projection(heloc_b_cand, Placement.RANKED, False),
+    )
+    monkeypatch.setattr(
+        "cu_rates.web.views.read_snapshot_offers",
+        lambda at=None: (info, all_offers),
+    )
+
+    app = create_app({"TESTING": True, "SNAPSHOT_CLOCK": now})
+    html = app.test_client().get("/compare").get_data(as_text=True)
+
+    # All four canonical scenario titles present
+    assert "30-Year Fixed Mortgage — Home Purchase" in html
+    assert "30-Year Fixed Mortgage — Rate and Term Refinance" in html
+    assert "Fixed-Rate Home Equity Loan — 10-Year" in html
+    assert "Home Equity Line of Credit (HELOC)" in html
+
+    # Offers appear under their respective scenarios
+    assert "Purchase Credit Union" in html
+    assert "Refi Credit Union" in html
+    assert "Equity Credit Union" in html
+    assert "Heloc Alpha Credit Union" in html
+    assert "Heloc Beta Credit Union" in html
+
+    # Finding 2: HELOC structures are grouped separately and never mixed in one grid
+    assert "Structure: 10Y Draw / 20Y Repay (120/240 mos)" in html
+    assert "Structure: 5Y Draw / 15Y Repay (60/180 mos)" in html
+
+    doc = parse_page(html)
+    # Each scenario + the 2 distinct HELOC structures have separate tables with captions
+    assert len(doc.tables) >= 5
+    assert len(doc.table_captions) == len(doc.tables)
+    for c in doc.table_captions:
+        assert c.strip() != ""
+
+
+def test_heloc_post_intro_proven_figures_and_labeling(tmp_path: Path) -> None:
+    """Probe test: HELOC post-intro rate uses proven details.post_intro_rate, not index."""
+    from cu_rates.snapshot.builder import _public_projection
+    from cu_rates.web.comparison import classify_and_format_offer
+
+    now = make.EVALUATED_AT
+    effective = make.T0 - timedelta(days=1)
+
+    # Derived post-intro rate = 8.000% (index 7.500% + margin 0.500%), no stated APR
+    heloc_derived = HelocDetails(
+        index_name="Prime",
+        index_rate=make.rate("7.500"),
+        margin=make.margin("0.500"),
+        floor=make.rate("4.000"),
+        stated_post_intro_apr=None,
+        lien_position=LienPosition.SECOND,
+        draw_period_months=120,
+        repayment_period_months=240,
+    )
+    offer_derived = draft(
+        offer_id="heloc-probe-derived",
+        status=OfferStatus.APPROVED,
+        effective_at=effective,
+        observed_at=make.T0,
+        valid_until=make.T0 + timedelta(days=3),
+        scenario_id=CanonicalScenarioId.HELOC,
+        note_rate=None,
+        apr=None,
+        points=make.points("0"),
+        supporting_evidence=(make.provenance("CAPTURE heloc-probe"),),
+        scenario_matches=make.matches_all(CanonicalScenarioId.HELOC),
+        details=heloc_derived,
+    )
+    cand_derived = SnapshotCandidate(
+        offer=offer_derived,
+        context=make.context(
+            offer_derived,
+            evaluated_at=now,
+            institution=make.institution(legal_name="Probe Credit Union"),
+        ),
+        candidates=(claim("effective_at", effective.isoformat()),),
+    )
+
+    pub = _public_projection(cand_derived, Placement.BROWSE_ONLY, False)
+    formatted = classify_and_format_offer(pub, now)
+    assert formatted is not None
+
+    # Proven post-intro figure 8.000% must be displayed, NOT index 7.500%!
+    assert formatted.note_rate_display == "8.000%"
+    assert formatted.apr_display == "Not published"  # Not stated as APR in source!
+    assert "7.500%" not in formatted.note_rate_display
+    assert "7.500%" not in formatted.apr_display
+
+    # When stated APR 8.000% is present, it is labeled as APR
+    heloc_stated = HelocDetails(
+        index_name="Prime",
+        index_rate=make.rate("7.500"),
+        margin=make.margin("0.500"),
+        floor=make.rate("4.000"),
+        stated_post_intro_apr=make.rate("8.000"),
+        lien_position=LienPosition.SECOND,
+        draw_period_months=120,
+        repayment_period_months=240,
+    )
+    offer_stated = draft(
+        offer_id="heloc-probe-stated",
+        status=OfferStatus.APPROVED,
+        effective_at=effective,
+        observed_at=make.T0,
+        valid_until=make.T0 + timedelta(days=3),
+        scenario_id=CanonicalScenarioId.HELOC,
+        note_rate=None,
+        apr=None,
+        points=make.points("0"),
+        supporting_evidence=(make.provenance("CAPTURE heloc-stated"),),
+        scenario_matches=make.matches_all(CanonicalScenarioId.HELOC),
+        details=heloc_stated,
+    )
+    cand_stated = SnapshotCandidate(
+        offer=offer_stated,
+        context=make.context(
+            offer_stated,
+            evaluated_at=now,
+            institution=make.institution(legal_name="Stated Credit Union"),
+        ),
+        candidates=(claim("effective_at", effective.isoformat()),),
+    )
+    pub_stated = _public_projection(cand_stated, Placement.RANKED, False)
+    formatted_stated = classify_and_format_offer(pub_stated, now)
+    assert formatted_stated is not None
+    assert formatted_stated.apr_display == "8.000%"
+    assert formatted_stated.is_comparable
+
+
+def test_compare_empty_filtered_results_have_noindex(tmp_path: Path) -> None:
+    """Empty filtered results receive noindex header (Finding 9)."""
+    now = make.EVALUATED_AT
+    # Snapshot contains only purchase mortgages
+    item = _make_candidate(
+        "offer-only-purch",
+        "Purchase Only Credit Union",
+        note_rate_str="6.125",
+        apr_str="6.250",
+        now=now,
+    )
+    publisher, denylist = _build_test_snapshot(tmp_path, [item], now=now)
+
+    app = create_app(
+        {
+            "TESTING": True,
+            "SNAPSHOT_ROOT": str(publisher.root),
+            "DENYLIST_PATH": str(denylist.path),
+            "SNAPSHOT_CLOCK": now,
+        }
+    )
+    client = app.test_client()
+
+    # Full compare page with published data has NO noindex
+    resp_all = client.get("/compare")
+    assert resp_all.status_code == 200
+    assert "noindex" not in resp_all.headers.get("X-Robots-Tag", "")
+
+    # Filtered scenario with NO offers receives noindex header (Finding 9)
+    resp_empty = client.get("/compare?scenario=heloc")
+    assert resp_empty.status_code == 200
+    assert "noindex" in resp_empty.headers.get("X-Robots-Tag", "")
+    assert "No Verified Rates Published for This Scenario" in resp_empty.get_data(as_text=True)
+
+
+def test_format_conditions_precise_tier_and_conflict_disclosure() -> None:
+    """Finding 6: Condition disclosures with precise tier bounds and conflict flags."""
+    from cu_rates.contracts.enums import ScenarioDimension, TierDimension
+    from cu_rates.contracts.offers import OfferCondition, RateTier, TierBound
+    from cu_rates.contracts.scenarios import DimensionMatch, StatedBound
+    from cu_rates.snapshot.builder import _public_projection
+    from cu_rates.web.comparison import format_conditions
+
+    now = make.EVALUATED_AT
+    cand = _make_candidate("offer-cond-test", "Condition CU", now=now)
+
+    tier = RateTier(
+        tier_id="tier-1",
+        bounds=(
+            TierBound(
+                dimension=TierDimension.LTV,
+                lower=None,
+                upper=Decimal("80.000"),
+            ),
+        ),
+        note_rate=make.rate("6.125"),
+    )
+    conflict_match = DimensionMatch(
+        dimension=ScenarioDimension.LTV,
+        state=MatchState.CONFLICTS,
+        stated=StatedBound(exact=Decimal("90.000")),
+        source_text="90% LTV",
+        provenance=make.provenance("90% LTV"),
+    )
+    ala_cond = OfferCondition(
+        condition_id="c-ala",
+        kind=ConditionKind.AS_LOW_AS,
+        description="as low as",
+        provenance=make.provenance("as low as"),
+        scenario_state=MatchState.MATCHES,
+    )
+    updated_offer = cand.offer.model_copy(
+        update={
+            "tiers": (tier,),
+            "scenario_matches": (conflict_match,),
+            "headline_is_as_low_as": True,
+            "conditions": (ala_cond,),
+        }
+    )
+    updated_cand = SnapshotCandidate(
+        offer=updated_offer,
+        context=cand.context,
+        candidates=cand.candidates,
+    )
+    pub = _public_projection(updated_cand, Placement.BROWSE_ONLY, False)
+    cond_text = format_conditions(pub)
+
+    assert "Advertised as 'as low as'" in cond_text
+    assert "Tier qualification (LTV <= 80.000)" in cond_text
+    assert "Conflicts with scenario ltv (90.000)" in cond_text
