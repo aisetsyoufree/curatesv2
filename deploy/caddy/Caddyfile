@@ -25,19 +25,13 @@ http://cu-rates.org:8080 {
         -Server
     }
 
-    # Access and error logging:
-    # Discard access logging at Caddy layer (structured query-free logging is handled upstream by Gunicorn).
-    # Configure log filter so request URIs (including query strings) and headers are redacted/deleted,
-    # ensuring upstream proxy failures or error logs never record sensitive query strings or headers.
+    # Access logging:
+    # Discard HTTP access logging at Caddy layer (structured query-free access logging is handled upstream by Gunicorn).
+    # Note: Site-level log blocks govern only HTTP access logs, NOT Caddy runtime or error logs (http.log.error).
+    # Redaction of query strings and headers on upstream errors must be configured in the global options block
+    # of the host's main /etc/caddy/Caddyfile (see deploy/README.md).
     log {
         output discard
-        format filter {
-            wrap console
-            fields {
-                request>uri delete
-                request>headers delete
-            }
-        }
     }
 }
 

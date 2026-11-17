@@ -103,7 +103,20 @@ cd /var/lib/cu-rates/app
 sudo -u cu-rates UV_PROJECT_ENVIRONMENT=/var/lib/cu-rates/venv UV_CACHE_DIR=/var/lib/cu-rates/.cache/uv uv sync --locked --no-dev --group deploy
 ```
 
-### Step 5: Configure Environment
+### Step 5: Initialize Emergency Withdrawal Ledger
+The emergency withdrawal mechanism requires an initialized ledger file at `/var/lib/cu-rates/snapshots/denylist.json` before any withdrawal records can be appended (uninitialized reads fail closed). Initial provisioning creates the parent directory `/var/lib/cu-rates/snapshots` but does not establish the ledger. Initialize the empty ledger as the `cu-rates` service user:
+```bash
+sudo -u cu-rates /var/lib/cu-rates/venv/bin/python -c '
+from pathlib import Path
+from cu_rates.snapshot import Denylist
+
+denylist = Denylist(Path("/var/lib/cu-rates/snapshots/denylist.json"))
+denylist.initialize()
+'
+```
+This explicitly establishes the empty ledger with version 1 (`mode 0640`) so subsequent operator withdrawals can append records safely.
+
+### Step 6: Configure Environment
 Review and edit `/etc/cu-rates/cu-rates.env`:
 ```bash
 sudo nano /etc/cu-rates/cu-rates.env
@@ -112,44 +125,75 @@ sudo chmod 0600 /etc/cu-rates/cu-rates.env
 ```
 > **Note on Environment Variables:** The Flask application in `src/cu_rates/web/` does NOT read environment variables today (`create_app` takes an explicit configuration dictionary). Therefore, application variables in `/etc/cu-rates/cu-rates.env` (such as `CANONICAL_ORIGIN`, `ENABLE_ANALYTICS`, `CU_RATES_SNAPSHOT_DIR`) currently have no effect until environment-to-config wiring is implemented in task T055. Only `GUNICORN_CMD_ARGS` is read by Gunicorn directly.
 
-### Step 6: Configure Caddy Reverse Proxy & Cloudflare Tunnel
-1. Integrate `deploy/caddy/Caddyfile` into Caddy's configuration:
-`deploy/caddy/Caddyfile` is a **site-only fragment** (no global options block) to prevent syntax conflicts with existing global configuration in `/etc/caddy/Caddyfile`.
+### Step 7: Configure Caddy Reverse Proxy & Cloudflare Tunnel
 
-Copy the fragment into Caddy's configuration directory:
-```bash
-sudo mkdir -p /etc/caddy/conf.d
-sudo cp deploy/caddy/Caddyfile /etc/caddy/conf.d/cu-rates.caddyfile
-```
+1. **Host-Level Global Logging Configuration (REQUIRED):**
+   `deploy/caddy/Caddyfile` is a site-only fragment. Site-level `log` blocks in Caddy govern ONLY HTTP access logs; Caddy's runtime and error logs (`http.log.error` and the default logger) are configured at the host level in the global options block. Without global logging filtering, upstream proxy failures (e.g., when the backend Gunicorn service is unavailable or returning errors) can still emit request URIs with query strings to the system journal.
 
-Add the explicit `import` directive to `/etc/caddy/Caddyfile` (if not already present):
+   Because other services may share the Caddy installation on the Raspberry Pi 5, the deployment bundle cannot enforce host-level global configuration. **This global snippet must be merged by the operator into `/etc/caddy/Caddyfile`; the bundle cannot enforce it.**
+
+   Ensure the global options block at the top of `/etc/caddy/Caddyfile` contains the following configuration, setting the default logger to level ERROR (or WARN), writing to stderr, and applying a `format filter` that deletes `request>uri` and `request>headers` (`request>remote_ip` is allowed to remain):
 ```caddy
-import /etc/caddy/conf.d/*.caddyfile
+{
+    log {
+        output stderr
+        level ERROR
+        format filter {
+            wrap console
+            fields {
+                request>uri delete
+                request>headers delete
+            }
+        }
+    }
+}
 ```
 
-Validate the Caddy configuration with `caddy validate` before reloading:
-```bash
-caddy validate --config /etc/caddy/Caddyfile
-```
+   The operator must verify a failing upstream request leaves no query string in `journalctl -u caddy`:
+   ```bash
+   # Verify error logging query redaction (trigger request while upstream or endpoint returns error):
+   curl -s -i "http://127.0.0.1:8080/nonexistent?test_query_string=redact_me"
+   # Inspect Caddy journal logs:
+   sudo journalctl -u caddy -n 20 --no-pager
+   # Confirm no query string appears in the journal log output.
+   ```
 
-Reload Caddy to apply configuration:
-```bash
-sudo systemctl reload caddy
-```
+2. **Integrate `deploy/caddy/Caddyfile` Site Fragment:**
+   `deploy/caddy/Caddyfile` is a **site-only fragment** (no global options block) to prevent syntax conflicts with existing global configuration in `/etc/caddy/Caddyfile`. HTTP access logging is discarded (`log { output discard }`) at the Caddy layer because structured query-free access logging is handled upstream by Gunicorn in `cu-rates-web.service`.
 
-Caddy listens on loopback plain HTTP port 8080 (`http://127.0.0.1:8080`) and proxies upstream to Gunicorn on `127.0.0.1:8000`. Caddy access logging is discarded (`output discard`), and error/runtime logging is filtered (`request>uri delete`, `request>headers delete`) to prevent query strings or sensitive headers from being logged on upstream failures; structured query-free access logging is handled upstream by Gunicorn in `cu-rates-web.service`.
+   Copy the fragment into Caddy's configuration directory:
+   ```bash
+   sudo mkdir -p /etc/caddy/conf.d
+   sudo cp deploy/caddy/Caddyfile /etc/caddy/conf.d/cu-rates.caddyfile
+   ```
 
-2. In Cloudflare Tunnel (`cloudflared` configuration), configure ingress to route `cu-rates.org` to Caddy at `http://127.0.0.1:8080`:
-```yaml
-ingress:
-  - hostname: cu-rates.org
-    service: http://127.0.0.1:8080
-  - hostname: www.cu-rates.org
-    service: http://127.0.0.1:8080
-  - service: http_status:404
-```
+   Add the explicit `import` directive to `/etc/caddy/Caddyfile` (if not already present):
+   ```caddy
+   import /etc/caddy/conf.d/*.caddyfile
+   ```
 
-### Step 7: Start Web Service
+   Validate the Caddy configuration with `caddy validate` before reloading:
+   ```bash
+   caddy validate --config /etc/caddy/Caddyfile
+   ```
+
+   Reload Caddy to apply configuration:
+   ```bash
+   sudo systemctl reload caddy
+   ```
+
+3. **Cloudflare Tunnel Routing:**
+   In Cloudflare Tunnel (`cloudflared` configuration), configure ingress to route `cu-rates.org` to Caddy at `http://127.0.0.1:8080`:
+   ```yaml
+   ingress:
+     - hostname: cu-rates.org
+       service: http://127.0.0.1:8080
+     - hostname: www.cu-rates.org
+       service: http://127.0.0.1:8080
+     - service: http_status:404
+   ```
+
+### Step 8: Start Web Service
 Start the web application:
 ```bash
 sudo systemctl start cu-rates-web.service
@@ -227,6 +271,15 @@ Target procedure once wired:
 ### Emergency Withdrawal Denylist (Not yet effective)
 > **STATUS: NOT WIRED / NOT YET EFFECTIVE**  
 > Emergency withdrawal denylisting (`MASTER.md` §5, §6) is **not yet wired** in the web application (`src/cu_rates/web` never opens `denylist.json`). Dropping denied rows dynamically requires the web app to integrate `SnapshotReader` denylist filtering in a later task. Until wired, editing `denylist.json` has no effect on served traffic.
+
+> **Prerequisite:** Withdrawal requires an initialized ledger. If `/var/lib/cu-rates/snapshots/denylist.json` was not already initialized during initial setup, run `Denylist.initialize()` once before appending entries (otherwise uninitialized reads fail closed):
+> ```python
+> from pathlib import Path
+> from cu_rates.snapshot import Denylist
+>
+> denylist = Denylist(Path("/var/lib/cu-rates/snapshots/denylist.json"))
+> denylist.initialize()
+> ```
 
 Target procedure once wired:
 1. Append an emergency withdrawal record using `Denylist.withdraw()` (from `src/cu_rates/snapshot/denylist.py`) with all required audit fields:

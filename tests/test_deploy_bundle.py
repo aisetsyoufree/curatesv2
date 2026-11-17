@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import subprocess
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEPLOY_DIR = REPO_ROOT / "deploy"
@@ -487,9 +490,106 @@ def test_install_script_no_hidden_failures_or_recursive_chown() -> None:
     assert "--adopt" in install_sh
 
 
+ALLOWED_CADDY_DIRECTIVES = frozenset(
+    {
+        "bind",
+        "reverse_proxy",
+        "header_up",
+        "header_down",
+        "header",
+        "-Server",
+        "log",
+        "output",
+        "format",
+        "level",
+        "wrap",
+        "fields",
+        "redir",
+        "handle",
+        "respond",
+        "encode",
+        "import",
+    }
+)
+
+
+def parse_and_validate_caddyfile(content: str) -> list[dict[str, object]]:
+    """Parse Caddyfile structurally, checking balanced braces and allowed vocabulary."""
+    depth = 0
+    parsed: list[dict[str, object]] = []
+
+    for line_no, raw_line in enumerate(content.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        # Strip inline comment respecting quotes
+        if "#" in line:
+            in_quote = False
+            quote_char = ""
+            for idx, ch in enumerate(line):
+                if ch in ('"', "'"):
+                    if not in_quote:
+                        in_quote = True
+                        quote_char = ch
+                    elif quote_char == ch:
+                        in_quote = False
+                elif ch == "#" and not in_quote:
+                    line = line[:idx].strip()
+                    break
+
+        if not line:
+            continue
+
+        if line == "}":
+            if depth <= 0:
+                raise ValueError(f"Unbalanced braces: unexpected closing brace at line {line_no}")
+            depth -= 1
+            continue
+
+        opens_block = False
+        if line.endswith("{"):
+            prefix = line[:-1].rstrip()
+            opens_block = True
+            tokens = shlex.split(prefix)
+        else:
+            tokens = shlex.split(line)
+
+        if not tokens:
+            raise ValueError(f"Empty statement with opening brace at line {line_no}")
+
+        if depth == 0:
+            if not opens_block:
+                raise ValueError(
+                    f"Top-level directive '{tokens[0]}' outside site block at line {line_no}"
+                )
+            parsed.append({"type": "site", "addresses": tokens, "line": line_no})
+            depth += 1
+        else:
+            directive = tokens[0]
+            if directive not in ALLOWED_CADDY_DIRECTIVES:
+                raise ValueError(
+                    f"Disallowed or unknown Caddy directive '{directive}' at line {line_no}"
+                )
+            parsed.append(
+                {"type": "directive", "name": directive, "args": tokens[1:], "line": line_no}
+            )
+            if opens_block:
+                depth += 1
+
+    if depth != 0:
+        raise ValueError(f"Unbalanced braces: {depth} unclosed block(s) at end of file")
+
+    return parsed
+
+
 def test_caddyfile_configuration() -> None:
     """Verify Caddy reverse proxy configuration behind Cloudflare Tunnel."""
     caddyfile = (DEPLOY_DIR / "caddy" / "Caddyfile").read_text(encoding="utf-8")
+
+    # Structural parsing: must have balanced braces and only allowed directives
+    parsed = parse_and_validate_caddyfile(caddyfile)
+    assert parsed, "Caddyfile must contain structural directives"
 
     # Site-only fragment: no global options block to avoid conflicts
     # with the host's existing main Caddyfile.
@@ -518,12 +618,11 @@ def test_caddyfile_configuration() -> None:
     # Must contain comment stating app must not trust forwarded header for security decisions
     assert "must not trust" in caddyfile.lower() or "not trust" in caddyfile.lower()
 
-    # Access logs discarded and error/runtime logs filtered to redact URIs/query strings and headers
+    # Access logs discarded at site level; runtime/error logging is governed globally
     assert "output discard" in caddyfile
     assert "cu-rates-access.log" not in caddyfile
-    assert "format filter" in caddyfile
-    assert "request>uri delete" in caddyfile
-    assert "request>headers delete" in caddyfile
+    # Site fragment must not configure error logging filter (governed globally in host Caddyfile)
+    assert "format filter" not in caddyfile
 
     # Must NOT duplicate app security headers from src/cu_rates/web/app.py
     duplicated_headers = [
@@ -541,13 +640,81 @@ def test_caddyfile_configuration() -> None:
     assert "-Server" in caddyfile
 
 
+def test_caddyfile_negative_control_unknown_directive() -> None:
+    """Negative control: verify structural parser rejects unknown/injected Caddy directives."""
+    caddyfile = (DEPLOY_DIR / "caddy" / "Caddyfile").read_text(encoding="utf-8")
+    corrupted = caddyfile.replace(
+        "bind 127.0.0.1", "bind 127.0.0.1\n    injected_bogus_directive 12345"
+    )
+    with pytest.raises(
+        ValueError, match="Disallowed or unknown Caddy directive 'injected_bogus_directive'"
+    ):
+        parse_and_validate_caddyfile(corrupted)
+
+
+def test_caddyfile_negative_control_unbalanced_brace() -> None:
+    """Negative control: parser rejects unbalanced braces (dropped closing brace)."""
+    caddyfile = (DEPLOY_DIR / "caddy" / "Caddyfile").read_text(encoding="utf-8")
+    corrupted = caddyfile.rstrip()
+    assert corrupted.endswith("}")
+    corrupted = corrupted[:-1].rstrip()
+    with pytest.raises(ValueError, match="Unbalanced braces"):
+        parse_and_validate_caddyfile(corrupted)
+
+
+def test_caddy_readme_documents_required_global_logging_snippet() -> None:
+    """Verify README documents the required global logging snippet for the host Caddyfile."""
+    readme = (DEPLOY_DIR / "README.md").read_text(encoding="utf-8")
+    exact_snippet = (
+        "{\n"
+        "    log {\n"
+        "        output stderr\n"
+        "        level ERROR\n"
+        "        format filter {\n"
+        "            wrap console\n"
+        "            fields {\n"
+        "                request>uri delete\n"
+        "                request>headers delete\n"
+        "            }\n"
+        "        }\n"
+        "    }\n"
+        "}"
+    )
+    assert exact_snippet in readme
+    assert "journalctl -u caddy" in readme
+    assert "this global snippet must be merged by the operator" in readme.lower()
+    assert "the bundle cannot enforce it" in readme.lower()
+    assert "failing upstream request leaves no query string" in readme.lower()
+
+
 def test_caddy_readme_documents_import_and_validate_steps() -> None:
     """Verify README documents explicit Caddy import directive and validation step."""
     readme = (DEPLOY_DIR / "README.md").read_text(encoding="utf-8")
-    assert "import /etc/caddy/conf.d/*.caddyfile" in readme or "import" in readme
+    # Exact documented import directive line is strictly required
+    assert "import /etc/caddy/conf.d/*.caddyfile" in readme
     assert "caddy validate" in readme
     assert "systemctl reload caddy" in readme
     assert "conf.d" in readme
+
+
+def test_caddy_readme_negative_control_remove_import() -> None:
+    """Negative control: verify removing exact import line fails even if generic 'import' exists."""
+    readme = (DEPLOY_DIR / "README.md").read_text(encoding="utf-8")
+    corrupted = readme.replace(
+        "import /etc/caddy/conf.d/*.caddyfile",
+        "# import omitted for test",
+    )
+    with pytest.raises(AssertionError):
+        assert "import /etc/caddy/conf.d/*.caddyfile" in corrupted
+
+
+def test_readme_documents_denylist_initialize_step() -> None:
+    """Verify README documents explicit Denylist.initialize() step in initial setup and runbook."""
+    readme = (DEPLOY_DIR / "README.md").read_text(encoding="utf-8")
+    assert "Denylist.initialize()" in readme
+    assert "denylist.initialize()" in readme
+    assert "/var/lib/cu-rates/snapshots/denylist.json" in readme
+    assert "Denylist(Path(" in readme
 
 
 def test_tunnel_port_consistency() -> None:
