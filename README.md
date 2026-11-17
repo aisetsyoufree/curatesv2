@@ -77,3 +77,31 @@ uv run ruff format --check .
   the code and review history.
 - Security issues: see [`SECURITY.md`](SECURITY.md). Licensing: see [`LICENSE`](LICENSE) and
   `MASTER.md` decision D-06.
+
+## Offline registry validation
+
+`cu_rates.registry_validation` rebuilds untrusted registry rows through the existing
+schema and contracts and returns a typed, canonically ordered report with stable
+reason codes and a SHA-256 digest. It performs no DNS or HTTP requests, migrations,
+or database writes. Use a checkpointed offline database copy; a nonempty WAL is
+rejected so immutable reads cannot silently miss pending changes.
+
+```sh
+uv run python -m cu_rates.registry_validation registry.sqlite \
+  --as-of 2026-11-17T12:00:00+00:00 --output registry-report.json
+```
+
+The explicit evaluation time makes repeated reports reproducible. Standard output
+contains `report` and `sha256`; exit status is 1 when findings exist, 0 otherwise.
+`--output` is optional and is the only file written. Coverage counts one slot per
+institution and product family: `absent` means uncataloged, `unknown` means unverified,
+`verified` means a fresh evidenced product classification, and `blocked`,
+`not_offered`, `no_public_rate`, `quote_only`, `login_required`, and `stale` remain
+separate. Classification degrades after 72 hours; offer validity beyond 96 hours is
+invalid. Coverage verification never authorizes publication.
+
+MA scope relies on the existing MA-filtered roster import and its stored raw-file
+hash. The frozen schema cannot retain a human identity-review citation or a direct
+relationship-evidence link: verified flags therefore produce explicit missing-proof
+findings. The validator does not invent those proofs, fetch the roster, or read raw
+private artifact bytes; evidence checks establish stored reference consistency only.
