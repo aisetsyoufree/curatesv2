@@ -149,14 +149,7 @@ sudo chmod 0600 /etc/cu-rates/cu-rates.env
 }
 ```
 
-   The operator must verify a failing upstream request leaves no query string in `journalctl -u caddy`:
-   ```bash
-   # Verify error logging query redaction (trigger request while upstream or endpoint returns error):
-   curl -s -i "http://127.0.0.1:8080/nonexistent?test_query_string=redact_me"
-   # Inspect Caddy journal logs:
-   sudo journalctl -u caddy -n 20 --no-pager
-   # Confirm no query string appears in the journal log output.
-   ```
+   The operator must verify a failing upstream request leaves no query string in `journalctl -u caddy` (verified after reloading Caddy in item 2 below).
 
 2. **Integrate `deploy/caddy/Caddyfile` Site Fragment:**
    `deploy/caddy/Caddyfile` is a **site-only fragment** (no global options block) to prevent syntax conflicts with existing global configuration in `/etc/caddy/Caddyfile`. HTTP access logging is discarded (`log { output discard }`) at the Caddy layer because structured query-free access logging is handled upstream by Gunicorn in `cu-rates-web.service`.
@@ -180,6 +173,25 @@ sudo chmod 0600 /etc/cu-rates/cu-rates.env
    Reload Caddy to apply configuration:
    ```bash
    sudo systemctl reload caddy
+   ```
+
+   **Verify Redaction Probe (Controlled Upstream Failure):**
+   After `systemctl reload caddy`, with the web service stopped (a controlled upstream failure), run `curl -sS -H 'Host: cu-rates.org' 'http://127.0.0.1:8080/?probe=SECRET_QUERY_VALUE'`, then check `journalctl -u caddy --since '1 minute ago'` shows a proxy error event (positive check that an error was logged) AND does NOT contain SECRET_QUERY_VALUE; restart the web service afterwards.
+
+   ```bash
+   # 1. Ensure the web service is stopped for a controlled upstream failure:
+   sudo systemctl stop cu-rates-web.service
+
+   # 2. Run redaction probe with Host header and secret query value:
+   curl -sS -H 'Host: cu-rates.org' 'http://127.0.0.1:8080/?probe=SECRET_QUERY_VALUE'
+
+   # 3. Check Caddy journal logs from the last minute:
+   #    - Positive check: shows a proxy error event (e.g. dial tcp 127.0.0.1:8000: connect: connection refused)
+   #    - Negative check: does NOT contain SECRET_QUERY_VALUE
+   sudo journalctl -u caddy --since '1 minute ago'
+
+   # 4. Restart the web service afterwards:
+   sudo systemctl restart cu-rates-web.service
    ```
 
 3. **Cloudflare Tunnel Routing:**

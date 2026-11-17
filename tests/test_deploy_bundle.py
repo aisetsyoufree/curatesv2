@@ -490,33 +490,48 @@ def test_install_script_no_hidden_failures_or_recursive_chown() -> None:
     assert "--adopt" in install_sh
 
 
-ALLOWED_CADDY_DIRECTIVES = frozenset(
-    {
-        "bind",
-        "reverse_proxy",
-        "header_up",
-        "header_down",
-        "header",
-        "-Server",
-        "log",
-        "output",
-        "format",
-        "level",
-        "wrap",
-        "fields",
-        "redir",
-        "handle",
-        "respond",
-        "encode",
-        "import",
-    }
-)
+VALID_PARENTS: dict[str, frozenset[str]] = {
+    # Site-level directives (allowed parent: "site")
+    "bind": frozenset({"site"}),
+    "reverse_proxy": frozenset({"site"}),
+    "header": frozenset({"site"}),
+    "redir": frozenset({"site"}),
+    "handle": frozenset({"site"}),
+    "respond": frozenset({"site"}),
+    "encode": frozenset({"site"}),
+    "import": frozenset({"root", "site"}),
+    # reverse_proxy subdirectives (allowed parent: "reverse_proxy")
+    "header_up": frozenset({"reverse_proxy"}),
+    "header_down": frozenset({"reverse_proxy"}),
+    # header subdirectives (allowed parent: "header")
+    "-Server": frozenset({"header"}),
+    # log directive may appear at site level or within global options block
+    "log": frozenset({"site", "global"}),
+    # log subdirectives (allowed parent: "log")
+    "output": frozenset({"log"}),
+    "level": frozenset({"log"}),
+    "format": frozenset({"log"}),
+    # format subdirectives (allowed parent: "format")
+    "wrap": frozenset({"format"}),
+    "fields": frozenset({"format"}),
+    # fields subdirectives (allowed parent: "fields")
+    "request>uri": frozenset({"fields"}),
+    "request>headers": frozenset({"fields"}),
+}
+
+ALLOWED_CADDY_DIRECTIVES = frozenset(VALID_PARENTS.keys())
 
 
 def parse_and_validate_caddyfile(content: str) -> list[dict[str, object]]:
-    """Parse Caddyfile structurally, checking balanced braces and allowed vocabulary."""
-    depth = 0
-    parsed: list[dict[str, object]] = []
+    """Parse Caddyfile structurally into a block tree, enforcing context-aware placement."""
+    root_node: dict[str, object] = {
+        "type": "root",
+        "name": "root",
+        "args": [],
+        "children": [],
+        "line": 0,
+    }
+    stack: list[dict[str, object]] = [root_node]
 
     for line_no, raw_line in enumerate(content.splitlines(), start=1):
         line = raw_line.strip()
@@ -542,54 +557,161 @@ def parse_and_validate_caddyfile(content: str) -> list[dict[str, object]]:
             continue
 
         if line == "}":
-            if depth <= 0:
+            if len(stack) <= 1:
                 raise ValueError(f"Unbalanced braces: unexpected closing brace at line {line_no}")
-            depth -= 1
+            stack.pop()
             continue
 
         opens_block = False
         if line.endswith("{"):
             prefix = line[:-1].rstrip()
             opens_block = True
-            tokens = shlex.split(prefix)
+            tokens = shlex.split(prefix) if prefix else []
         else:
             tokens = shlex.split(line)
 
-        if not tokens:
-            raise ValueError(f"Empty statement with opening brace at line {line_no}")
+        current_parent_node = stack[-1]
+        current_context = str(current_parent_node.get("name", "root"))
+        children_list = current_parent_node.setdefault("children", [])
+        assert isinstance(children_list, list)
 
-        if depth == 0:
-            if not opens_block:
-                raise ValueError(
-                    f"Top-level directive '{tokens[0]}' outside site block at line {line_no}"
-                )
-            parsed.append({"type": "site", "addresses": tokens, "line": line_no})
-            depth += 1
+        if current_context == "root":
+            if opens_block:
+                if not tokens:
+                    # Global options block: "{"
+                    global_node: dict[str, object] = {
+                        "type": "global",
+                        "name": "global",
+                        "args": [],
+                        "parent": "root",
+                        "children": [],
+                        "line": line_no,
+                    }
+                    children_list.append(global_node)
+                    stack.append(global_node)
+                else:
+                    directive = tokens[0]
+                    if directive in VALID_PARENTS:
+                        if "root" not in VALID_PARENTS[directive]:
+                            raise ValueError(
+                                f"Directive '{directive}' cannot appear in context"
+                                f" '{current_context}' at line {line_no}"
+                            )
+                        block_node: dict[str, object] = {
+                            "type": "directive",
+                            "name": directive,
+                            "args": tokens[1:],
+                            "parent": "root",
+                            "children": [],
+                            "line": line_no,
+                        }
+                        children_list.append(block_node)
+                        stack.append(block_node)
+                    else:
+                        # Site address block (e.g. "http://cu-rates.org:8080 {")
+                        site_node: dict[str, object] = {
+                            "type": "site",
+                            "name": "site",
+                            "addresses": tokens,
+                            "args": tokens,
+                            "parent": "root",
+                            "children": [],
+                            "line": line_no,
+                        }
+                        children_list.append(site_node)
+                        stack.append(site_node)
+            else:
+                if not tokens:
+                    continue
+                directive = tokens[0]
+                if directive not in VALID_PARENTS:
+                    raise ValueError(
+                        f"Disallowed or unknown Caddy directive '{directive}' at line {line_no}"
+                    )
+                if "root" not in VALID_PARENTS[directive]:
+                    raise ValueError(
+                        f"Directive '{directive}' cannot appear in context"
+                        f" '{current_context}' at line {line_no}"
+                    )
+                leaf_node: dict[str, object] = {
+                    "type": "directive",
+                    "name": directive,
+                    "args": tokens[1:],
+                    "parent": "root",
+                    "children": [],
+                    "line": line_no,
+                }
+                children_list.append(leaf_node)
         else:
+            if not tokens:
+                raise ValueError(f"Empty statement with opening brace at line {line_no}")
             directive = tokens[0]
-            if directive not in ALLOWED_CADDY_DIRECTIVES:
+            if directive not in VALID_PARENTS:
                 raise ValueError(
                     f"Disallowed or unknown Caddy directive '{directive}' at line {line_no}"
                 )
-            parsed.append(
-                {"type": "directive", "name": directive, "args": tokens[1:], "line": line_no}
-            )
+            if current_context not in VALID_PARENTS[directive]:
+                raise ValueError(
+                    f"Directive '{directive}' cannot appear in context"
+                    f" '{current_context}' at line {line_no}"
+                )
+            node: dict[str, object] = {
+                "type": "directive",
+                "name": directive,
+                "args": tokens[1:],
+                "parent": current_context,
+                "children": [],
+                "line": line_no,
+            }
+            children_list.append(node)
             if opens_block:
-                depth += 1
+                stack.append(node)
 
-    if depth != 0:
-        raise ValueError(f"Unbalanced braces: {depth} unclosed block(s) at end of file")
+    if len(stack) != 1:
+        raise ValueError(f"Unbalanced braces: {len(stack) - 1} unclosed block(s) at end of file")
 
-    return parsed
+    children = root_node.get("children", [])
+    assert isinstance(children, list)
+    return [c for c in children if isinstance(c, dict)]
 
 
 def test_caddyfile_configuration() -> None:
     """Verify Caddy reverse proxy configuration behind Cloudflare Tunnel."""
     caddyfile = (DEPLOY_DIR / "caddy" / "Caddyfile").read_text(encoding="utf-8")
 
-    # Structural parsing: must have balanced braces and only allowed directives
+    # Structural parsing: must have balanced braces and only allowed directives in valid contexts
     parsed = parse_and_validate_caddyfile(caddyfile)
     assert parsed, "Caddyfile must contain structural directives"
+    assert len(parsed) == 2, "Caddyfile must contain exactly two site blocks"
+
+    canonical_site = parsed[0]
+    assert canonical_site["type"] == "site"
+    addresses = canonical_site.get("addresses", [])
+    assert isinstance(addresses, list)
+    assert "http://cu-rates.org:8080" in addresses
+    canonical_children = canonical_site.get("children", [])
+    assert isinstance(canonical_children, list)
+    child_names = [child["name"] for child in canonical_children if isinstance(child, dict)]
+    assert "bind" in child_names
+    assert "reverse_proxy" in child_names
+    assert "header" in child_names
+    assert "log" in child_names
+
+    # Verify reverse_proxy subdirectives
+    rp_node = next(
+        child
+        for child in canonical_children
+        if isinstance(child, dict) and child.get("name") == "reverse_proxy"
+    )
+    rp_children = rp_node.get("children", [])
+    assert isinstance(rp_children, list)
+    assert any(
+        isinstance(c, dict)
+        and c.get("name") == "header_up"
+        and isinstance(c.get("args"), list)
+        and "CF-Connecting-IP" in c["args"]
+        for c in rp_children
+    )
 
     # Site-only fragment: no global options block to avoid conflicts
     # with the host's existing main Caddyfile.
@@ -640,6 +762,14 @@ def test_caddyfile_configuration() -> None:
     assert "-Server" in caddyfile
 
 
+def test_caddyfile_negative_control_site_level_header_up() -> None:
+    """Negative control: verify context-aware parser rejects site-level header_up."""
+    caddyfile = (DEPLOY_DIR / "caddy" / "Caddyfile").read_text(encoding="utf-8")
+    corrupted = caddyfile.replace("bind 127.0.0.1", "bind 127.0.0.1\n    header_up Host {host}")
+    with pytest.raises(ValueError, match="Directive 'header_up' cannot appear in context 'site'"):
+        parse_and_validate_caddyfile(corrupted)
+
+
 def test_caddyfile_negative_control_unknown_directive() -> None:
     """Negative control: verify structural parser rejects unknown/injected Caddy directives."""
     caddyfile = (DEPLOY_DIR / "caddy" / "Caddyfile").read_text(encoding="utf-8")
@@ -686,6 +816,17 @@ def test_caddy_readme_documents_required_global_logging_snippet() -> None:
     assert "the bundle cannot enforce it" in readme.lower()
     assert "failing upstream request leaves no query string" in readme.lower()
 
+    # Verify global snippet parses into a valid context-aware block tree
+    parsed_global = parse_and_validate_caddyfile(exact_snippet)
+    assert parsed_global, "Global logging snippet must parse into a valid tree"
+    assert parsed_global[0]["type"] == "global"
+    global_children = parsed_global[0].get("children", [])
+    assert isinstance(global_children, list)
+    assert len(global_children) == 1
+    first_child = global_children[0]
+    assert isinstance(first_child, dict)
+    assert first_child.get("name") == "log"
+
 
 def test_caddy_readme_documents_import_and_validate_steps() -> None:
     """Verify README documents explicit Caddy import directive and validation step."""
@@ -706,6 +847,78 @@ def test_caddy_readme_negative_control_remove_import() -> None:
     )
     with pytest.raises(AssertionError):
         assert "import /etc/caddy/conf.d/*.caddyfile" in corrupted
+
+
+def test_caddy_readme_redaction_probe_verification() -> None:
+    """Verify README documents redaction probe with required verification elements.
+
+    Asserts exact elements: Host header, reload before probe, stopped upstream
+    (controlled upstream failure), positive error check, negative secret check,
+    and restart afterwards.
+    """
+    readme = (DEPLOY_DIR / "README.md").read_text(encoding="utf-8")
+
+    # 1. Reload before probe
+    reload_idx = readme.find("systemctl reload caddy")
+    probe_cmd = "curl -sS -H 'Host: cu-rates.org' 'http://127.0.0.1:8080/?probe=SECRET_QUERY_VALUE'"
+    probe_idx = readme.find(probe_cmd)
+    assert reload_idx != -1, "README must document 'systemctl reload caddy'"
+    assert probe_idx != -1, f"README must contain exact probe command: {probe_cmd}"
+    assert reload_idx < probe_idx, (
+        "Caddy reload ('systemctl reload caddy') must occur before redaction probe"
+    )
+
+    # 2. Host header in probe
+    assert "-H 'Host: cu-rates.org'" in readme
+
+    # 3. Stopped upstream (controlled upstream failure)
+    assert "web service stopped" in readme.lower()
+    assert "controlled upstream failure" in readme.lower()
+    assert "stop cu-rates-web.service" in readme
+    prose_stop_idx = readme.find("with the web service stopped")
+    assert prose_stop_idx != -1
+    assert prose_stop_idx < probe_idx, "Prose must state web service is stopped before probe"
+
+    stop_cmd_idx = readme.find("sudo systemctl stop cu-rates-web.service")
+    assert stop_cmd_idx != -1
+    probe_code_idx = readme.find(probe_cmd, stop_cmd_idx)
+    assert probe_code_idx != -1, "Probe command must appear after stopping web service in runbook"
+
+    # 4. Positive error check that an error was logged
+    assert "journalctl -u caddy --since '1 minute ago'" in readme
+    assert "proxy error event" in readme.lower()
+    assert "positive check" in readme.lower()
+
+    # 5. Negative secret check (does not contain SECRET_QUERY_VALUE)
+    assert "SECRET_QUERY_VALUE" in readme
+    assert (
+        "does not contain secret_query_value" in readme.lower()
+        or "not contain secret_query_value" in readme.lower()
+    )
+    assert "negative check" in readme.lower()
+
+    # 6. Restart the web service afterwards
+    restart_idx = readme.find("restart cu-rates-web.service")
+    assert restart_idx != -1, "README must document restarting web service afterwards"
+    assert probe_idx < restart_idx, "Restarting web service must occur after redaction probe"
+
+
+def test_caddy_readme_negative_control_probe_elements() -> None:
+    """Negative control: verify probe check fails if Host header or secret checks are corrupted."""
+    readme = (DEPLOY_DIR / "README.md").read_text(encoding="utf-8")
+
+    # Host header omitted
+    corrupted_no_host = readme.replace("-H 'Host: cu-rates.org' ", "")
+    with pytest.raises(AssertionError):
+        assert (
+            "curl -sS -H 'Host: cu-rates.org' 'http://127.0.0.1:8080/?probe=SECRET_QUERY_VALUE'"
+            in corrupted_no_host
+        )
+
+    # Secret check omitted
+    corrupted_no_secret = readme.replace("SECRET_QUERY_VALUE", "OTHER_VALUE")
+    with pytest.raises(AssertionError):
+        assert "SECRET_QUERY_VALUE" in corrupted_no_secret
 
 
 def test_readme_documents_denylist_initialize_step() -> None:
