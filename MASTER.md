@@ -569,6 +569,10 @@ in the issue/PR; durable product or architecture decisions are incorporated here
 | D-10 | Use the outside-iCloud clone as authoritative; the iCloud repository is an integrator-updated checkpoint mirror only. |
 | D-11 | `MASTER.md` is the only durable project specification; GitHub Issues/Project replace repository task ledgers and standalone review reports. |
 | D-12 | Adopt §5 as the collection, evidence, corrections, and licensing policy. Publish only verified public rate facts and their context; keep full source captures private. |
+| D-13 | Risky changes (contracts, publication, collection, database, security) require an independent review by a different reviewer or vendor than the author before merge; a writer never approves its own work. The integrator merges by pull request only after `scripts/check`, the format check, and CI pass, and records evidence on the issue (D-11). Adopted 2026-11-16. |
+| D-14 | Institution identity data comes from the NCUA quarterly call-report ZIP, downloaded manually by the product owner once per quarter and imported from the local file. No automated retrieval of NCUA or Mass.gov data is approved; the Division of Banks cross-check list is still to be identified. The raw file stays private and only normalized fields are published. Approved 2026-11-16 (issue #18). |
+| D-15 | Live transport and live collection stay disabled until the gateway-owned pinned dialer (issue #68) is built and independently reviewed, and until each source has its own recorded approval under §5. The fetch worker dispatches only a mock transport today. Adopted 2026-11-16. |
+| D-16 | Workers run headless in visible terminals with Grok 4.7 (high reasoning), Gemini 3.8 Flash (high) through Antigravity, and GPT-6.1-Sol (high) through Codex. Before assigning work the orchestrator checks the worker's 5-hour and weekly quota and assigns only if both are at least 15%; Codex is reserved for independent reviews of high-risk work. Adopted 2026-11-16. |
 
 Reopening a resolved decision requires a recorded rationale and impact review in the
 relevant GitHub issue or pull request, followed by an update to this document.
