@@ -1,8 +1,8 @@
 """Web views for CU-Rates.org."""
 
-from typing import Any
+from typing import Any, TypedDict
 
-from flask import Blueprint, Response, abort, render_template
+from flask import Blueprint, Response, abort, current_app, render_template, request
 
 web_bp = Blueprint("web", __name__)
 
@@ -89,6 +89,123 @@ ARTICLES: dict[str, dict[str, Any]] = {
 }
 
 
+class Crumb(TypedDict):
+    name: str
+    path: str
+
+
+class Seo(TypedDict):
+    title: str
+    description: str
+    canonical: str
+    breadcrumbs: list[Crumb]
+    json_ld: dict[str, Any]
+
+
+_PAGE_META: dict[str, tuple[str, str, tuple[tuple[str, str], ...]]] = {
+    "web.home": (
+        "Massachusetts Credit Union Residential Lending Directory",
+        "An educational directory of publicly advertised Massachusetts credit union "
+        "residential lending terms. Not a lender and not personalized financial advice.",
+        (("Home", "/"),),
+    ),
+    "web.methodology": (
+        "Methodology and Comparison Principles",
+        "How CU-Rates.org plans to compare residential lending terms using provenance, "
+        "declared scenarios, freshness windows, and corrections.",
+        (("Home", "/"), ("Methodology and Comparison Principles", "/methodology")),
+    ),
+    "web.privacy": (
+        "Privacy Policy and Consent Notice",
+        "How CU-Rates.org handles privacy and server logs, and the planned status of "
+        "analytics consent.",
+        (("Home", "/"), ("Privacy Policy and Consent Notice", "/privacy")),
+    ),
+    "web.learn_index": (
+        "Educational Guides and Lending Concepts",
+        "Educational guides to residential mortgage and home equity concepts. "
+        "Unreviewed articles stay out of the search index.",
+        (("Home", "/"), ("Learn", "/learn")),
+    ),
+}
+
+
+def _origin() -> str:
+    origin = current_app.config.get("CANONICAL_ORIGIN")
+    if not isinstance(origin, str) or not origin:
+        raise RuntimeError("CANONICAL_ORIGIN is not configured")
+    return origin
+
+
+def _json_ld(
+    origin: str,
+    title: str,
+    description: str,
+    canonical: str,
+    crumbs: list[Crumb],
+) -> dict[str, Any]:
+    """Conservative WebPage markup: identity, description, and breadcrumbs only."""
+    items: list[dict[str, Any]] = []
+    for position, crumb in enumerate(crumbs, start=1):
+        items.append(
+            {
+                "@type": "ListItem",
+                "position": position,
+                "name": crumb["name"],
+                "item": f"{origin}{crumb['path']}",
+            }
+        )
+    return {
+        "@context": "https://schema.org",
+        "@type": "WebPage",
+        "name": title,
+        "url": canonical,
+        "description": description,
+        "inLanguage": "en",
+        "isPartOf": {
+            "@type": "WebSite",
+            "name": "CU-Rates.org",
+            "url": f"{origin}/",
+        },
+        "breadcrumb": {
+            "@type": "BreadcrumbList",
+            "itemListElement": items,
+        },
+    }
+
+
+def seo_for_request() -> Seo | None:
+    """Build canonical, Open Graph, breadcrumb, and JSON-LD data for a real page."""
+    endpoint = request.endpoint
+    title: str
+    description: str
+    crumb_pairs: tuple[tuple[str, str], ...]
+    if endpoint == "web.learn_article":
+        slug = str((request.view_args or {}).get("slug", ""))
+        article = ARTICLES.get(slug)
+        if article is None:
+            return None
+        title = str(article["title"])
+        description = str(article["summary"])
+        path = f"/learn/{slug}"
+        crumb_pairs = (("Home", "/"), ("Learn", "/learn"), (title, path))
+    elif endpoint in _PAGE_META:
+        title, description, crumb_pairs = _PAGE_META[endpoint]
+    else:
+        return None
+
+    origin = _origin()
+    crumbs = [Crumb(name=name, path=path) for name, path in crumb_pairs]
+    canonical = f"{origin}{crumbs[-1]['path']}"
+    return Seo(
+        title=title,
+        description=description,
+        canonical=canonical,
+        breadcrumbs=crumbs,
+        json_ld=_json_ld(origin, title, description, canonical, crumbs),
+    )
+
+
 @web_bp.route("/")
 def home() -> str:
     """Render directory home page."""
@@ -110,10 +227,11 @@ def privacy() -> str:
 @web_bp.route("/learn")
 def learn_index() -> Response:
     """Render educational content index."""
+    articles = list(ARTICLES.values())
     rendered = render_template(
         "learn/index.html",
-        articles=list(ARTICLES.values()),
-        is_draft=True,
+        articles=articles,
+        is_draft=any(not bool(item.get("reviewed", False)) for item in articles),
     )
     return Response(rendered, headers={"X-Robots-Tag": "noindex, follow"})
 
@@ -141,22 +259,24 @@ def learn_article(slug: str) -> Response:
 @web_bp.route("/robots.txt")
 def robots_txt() -> Response:
     """Serve robots.txt file pointing to sitemap."""
-    content = "User-agent: *\nAllow: /\nSitemap: https://cu-rates.org/sitemap.xml\n"
+    origin = _origin()
+    content = f"User-agent: *\nAllow: /\nSitemap: {origin}/sitemap.xml\n"
     return Response(content, mimetype="text/plain")
 
 
 @web_bp.route("/sitemap.xml")
 def sitemap_xml() -> Response:
     """Serve sitemap.xml with verified canonical pages only."""
+    origin = _origin()
     urls = [
-        "https://cu-rates.org/",
-        "https://cu-rates.org/methodology",
-        "https://cu-rates.org/privacy",
+        f"{origin}/",
+        f"{origin}/methodology",
+        f"{origin}/privacy",
     ]
     # Unreviewed articles remain excluded from sitemap until verified
     for slug, meta in ARTICLES.items():
         if meta.get("reviewed", False):
-            urls.append(f"https://cu-rates.org/learn/{slug}")
+            urls.append(f"{origin}/learn/{slug}")
 
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',

@@ -1,7 +1,5 @@
 {% extends "base.html" %}
 
-{% block title %}Data Collection, Freshness, and Requesting Corrections{% endblock %}
-
 {% block meta %}
 {% if is_draft %}
 <meta name="robots" content="noindex, follow">
@@ -20,7 +18,7 @@
 
   <section class="card" aria-labelledby="collection-methods-heading">
     <h2 id="collection-methods-heading">Planned Automated Public Data Collection</h2>
-    <p>Once data collection is live, CU-Rates.org will compile residential mortgage and home equity data directly from publicly accessible rate tables, product schedules, and fee disclosures published by Massachusetts credit unions. The Massachusetts Division of Banks is the chartering authority for financial service providers in Massachusetts and supervises state-chartered banks and credit unions. The platform is designed around a strict fail-closed provenance architecture: financial information will be gathered exclusively from original institution publications, preserving an immutable audit trail for every public observation.</p>
+    <p>Once data collection is live, CU-Rates.org will compile residential mortgage and home equity data from publicly accessible rate tables, product schedules, and fee disclosures. The Massachusetts Division of Banks is the chartering authority for financial service providers in Massachusetts and supervises state-chartered banks and credit unions. The platform is designed around a strict fail-closed provenance architecture. A collected rate will come from a public page of the institution or of an approved provider for that product, and every public observation will keep an immutable audit trail.</p>
     <p>The system is designed so that automated retrieval routines will execute on scheduled, rate-limited intervals to minimize server load on participating institutions. Parsing logic will extract verified terms, product families, and offer conditions deterministically without synthetic interpolation, predictive modeling, or unverified estimation. If an institution website alters its layout or obscures terms, the pipeline is designed to quarantine the affected record until updated extraction rules can be verified by maintainers.</p>
   </section>
 
@@ -38,7 +36,7 @@
         <strong>96-Hour Withdrawal Rule:</strong> Records that remain unverified beyond ninety-six hours will be fully withdrawn from rate comparisons until fresh source data is successfully collected and verified.
       </li>
     </ul>
-    <p>This planned freshness policy ensures that outdated or stale figures will never linger in public displays when institution pages change or experience temporary unavailability.</p>
+    <p>These rules are freshness windows. A record that has not been re-observed degrades after seventy-two hours and leaves primary comparison rankings. Rate comparisons are withdrawn after ninety-six hours until a new observation is verified. Until those windows are reached, a previously observed figure can remain on display.</p>
   </section>
 
   <section class="card" aria-labelledby="correction-process-heading">
@@ -47,7 +45,7 @@
     <p><strong>Notice: The public correction channel is not yet available during this initial site foundation phase.</strong> Public submissions are not currently being accepted.</p>
 
     <h3>Warning: Do Not Submit Personal Financial Data</h3>
-    <p><strong>Users must not submit loan applications, account numbers, financial records, or other personal data.</strong> CU-Rates.org is strictly an educational directory and research project; it is not a lender, broker, or financial institution. Unsolicited personal financial documentation or borrower applications will not be processed and will be deleted immediately.</p>
+    <p><strong>Users must not submit loan applications, account numbers, financial records, or other personal data.</strong> CU-Rates.org is strictly an educational directory and research project; it is not a lender, broker, or financial institution. The project does not intentionally collect borrower personal data. If stray personal data arrives, access will be restricted, it will be removed from working records, and it will be deleted as soon as it can be handled safely.</p>
 
     <h3>Planned Submission Specifications</h3>
     <p>Once operational, the public correction channel will accept structured requests containing:</p>

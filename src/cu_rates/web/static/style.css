@@ -245,10 +245,30 @@ li {
   padding: 1.5rem;
 }
 
-.article-item h2 {
+.article-item h3 {
   margin-top: 0;
   margin-bottom: 0.5rem;
   font-size: 1.25rem;
+}
+
+.breadcrumb ol {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.75rem;
+  padding: 0;
+  margin: 0 0 1.25rem 0;
+}
+
+.breadcrumb li {
+  margin: 0;
+  color: var(--color-text-muted);
+}
+
+.breadcrumb li + li::before {
+  content: "/";
+  margin-right: 0.75rem;
+  color: var(--color-text-muted);
 }
 
 .article-meta {

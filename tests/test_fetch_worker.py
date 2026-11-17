@@ -23,6 +23,7 @@ from cu_rates.contracts.sources import (
     RateSource,
     profile_sha256,
 )
+from cu_rates.fetch_dialer import TOTAL_TIMEOUT_EXTENSION, LoopbackOverride, PinnedTransport
 from cu_rates.fetch_worker import (
     ROBOTS_TTL,
     USER_AGENT,
@@ -583,6 +584,158 @@ def test_transport_receives_validated_addresses(pilot: Pilot) -> None:
     assert len(pilot.dialed) == 2
     for addrs in pilot.dialed:
         assert addrs == (ipaddress.IPv4Address("8.8.8.8"),)
+
+
+def pinned_worker(
+    pilot: Pilot, pinned: Callable[[tuple[_IPAddress, ...]], PinnedTransport]
+) -> FetchWorker:
+    return FetchWorker(
+        pilot.path / "state",
+        pilot.store,
+        pinned,
+        git_sha="0" * 40,
+        clock=pilot.clock.now,
+        monotonic=pilot.clock.now,
+        sleep=pilot.clock.sleep,
+        resolve=public_resolver,
+    )
+
+
+def test_worker_dispatches_the_gateway_dialer_pinned_to_validated_addresses(
+    pilot: Pilot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    served: list[str] = []
+
+    def stub(transport: PinnedTransport, request: httpx.Request) -> httpx.Response:
+        served.append(request.url.path)
+        return ok(request)
+
+    monkeypatch.setattr(PinnedTransport, "handle_request", stub)  # never touches a network
+    worker = pinned_worker(pilot, PinnedTransport)
+    result = worker.fetch(pilot.source, pilot.profile, pilot.approval, pilot.terms)
+    assert result.reason == "fetched"
+    assert served == ["/robots.txt", "/rates"]
+
+
+def test_worker_passes_the_profile_deadline_to_the_dialer(
+    pilot: Pilot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[object] = []
+
+    def stub(transport: PinnedTransport, request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions.get(TOTAL_TIMEOUT_EXTENSION))
+        return ok(request)
+
+    monkeypatch.setattr(PinnedTransport, "handle_request", stub)
+    pinned_worker(pilot, PinnedTransport).fetch(
+        pilot.source, pilot.profile, pilot.approval, pilot.terms
+    )
+    assert seen == [pilot.profile.timeout_seconds] * 2
+
+
+class NoChunks(httpx.SyncByteStream):
+    def __iter__(self) -> Iterator[bytes]:
+        return iter(())
+
+
+def test_empty_body_past_the_profile_deadline_is_stopped(pilot: Pilot) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/robots.txt":
+            return robots()
+        pilot.clock.sleep(pilot.profile.timeout_seconds + 5)
+        # A stream that yields no chunk at all, as a real empty body does.
+        return httpx.Response(200, stream=NoChunks(), headers={"Content-Type": "text/html"})
+
+    result = pilot.fetch(handler)
+    assert result.reason == "response-time-limit" and result.artifact is None
+
+
+def test_late_304_past_the_profile_deadline_is_not_reobserved(pilot: Pilot) -> None:
+    pilot.fetch(lambda req: robots() if req.url.path == "/robots.txt" else page(ETag='"v1"'))
+    pilot.clock.sleep(60)
+
+    def late(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/robots.txt":
+            return robots()
+        pilot.clock.sleep(pilot.profile.timeout_seconds + 5)
+        return httpx.Response(304, headers={"ETag": '"v1"'})
+
+    result = pilot.fetch(late)
+    assert result.reason == "response-time-limit" and result.reobserved is None
+
+
+def test_resolver_rebinding_never_reaches_the_dialer(
+    pilot: Pilot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answers = iter([("8.8.8.8",), ("127.0.0.1",)])
+    dialed: list[tuple[_IPAddress, ...]] = []
+
+    def resolve(host: str) -> tuple[str, ...]:
+        return next(answers)
+
+    def factory(addresses: tuple[_IPAddress, ...]) -> PinnedTransport:
+        dialed.append(addresses)
+        return PinnedTransport(addresses)
+
+    monkeypatch.setattr(PinnedTransport, "handle_request", lambda t, request: ok(request))
+    worker = FetchWorker(
+        pilot.path / "state",
+        pilot.store,
+        factory,
+        git_sha="0" * 40,
+        clock=pilot.clock.now,
+        monotonic=pilot.clock.now,
+        sleep=pilot.clock.sleep,
+        resolve=resolve,
+    )
+    result = worker.fetch(pilot.source, pilot.profile, pilot.approval, pilot.terms)
+    assert result.reason == "non-routable-address"
+    assert dialed == [(ipaddress.IPv4Address("8.8.8.8"),)]  # the rebound answer never got a dialer
+
+
+def test_worker_refuses_a_dialer_not_pinned_to_the_validated_set(
+    pilot: Pilot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def forbidden(transport: PinnedTransport, request: httpx.Request) -> httpx.Response:
+        pytest.fail("a mispinned dialer reached dispatch")
+
+    monkeypatch.setattr(PinnedTransport, "handle_request", forbidden)
+    worker = pinned_worker(
+        pilot, lambda addresses: PinnedTransport([ipaddress.ip_address("8.8.4.4")])
+    )
+    result = worker.fetch(pilot.source, pilot.profile, pilot.approval, pilot.terms)
+    assert result.reason == "pin-mismatch"
+
+
+def test_worker_refuses_a_dialer_with_the_test_override(
+    pilot: Pilot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def forbidden(transport: PinnedTransport, request: httpx.Request) -> httpx.Response:
+        pytest.fail("an overridden dialer reached dispatch")
+
+    monkeypatch.setattr(PinnedTransport, "handle_request", forbidden)
+    worker = pinned_worker(
+        pilot, lambda addresses: PinnedTransport(addresses, test_override=LoopbackOverride(8443))
+    )
+    result = worker.fetch(pilot.source, pilot.profile, pilot.approval, pilot.terms)
+    assert result.reason == "live-transport-disabled"
+
+
+def test_default_worker_has_no_resolver_so_nothing_can_dial(pilot: Pilot) -> None:
+    def factory(addresses: tuple[_IPAddress, ...]) -> httpx.BaseTransport:
+        pytest.fail("a transport was built without a configured resolver")
+
+    worker = FetchWorker(
+        pilot.path / "state",
+        pilot.store,
+        factory,
+        git_sha="0" * 40,
+        clock=pilot.clock.now,
+        monotonic=pilot.clock.now,
+        sleep=pilot.clock.sleep,
+    )
+    result = worker.fetch(pilot.source, pilot.profile, pilot.approval, pilot.terms)
+    assert result.reason == "address-resolution-failed"
 
 
 @pytest.mark.parametrize("after_robots", [False, True])

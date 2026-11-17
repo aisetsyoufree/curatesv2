@@ -3,21 +3,23 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{% block title %}{% endblock %} — CU-Rates.org</title>
+  <title>{% block title %}{% if seo %}{{ seo.title }}{% else %}CU-Rates.org{% endif %}{% endblock %} — CU-Rates.org</title>
+  {% if seo %}
+  <link rel="canonical" href="{{ seo.canonical }}">
+  <meta name="description" content="{{ seo.description }}">
+  <meta property="og:title" content="{{ seo.title }} — CU-Rates.org">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="{{ seo.canonical }}">
+  <meta property="og:description" content="{{ seo.description }}">
+  <meta property="og:site_name" content="CU-Rates.org">
+  {% endif %}
   {% block meta %}{% endblock %}
+  {% if seo %}
+  <script type="application/ld+json">{{ seo.json_ld | tojson }}</script>
+  {% endif %}
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
   {% if config.ENABLE_ANALYTICS and config.GA_MEASUREMENT_ID %}
-  <!-- Google Analytics / Consent Mode v2 integration point (OFF by default) -->
-  <script>
-    window.dataLayer = window.dataLayer || [];
-    function gtag(){dataLayer.push(arguments);}
-    gtag('consent', 'default', {
-      'analytics_storage': 'denied',
-      'ad_storage': 'denied',
-      'ad_user_data': 'denied',
-      'ad_personalization': 'denied'
-    });
-  </script>
+  <script src="{{ url_for('static', filename='consent.js') }}"></script>
   {% endif %}
 </head>
 <body>
@@ -28,16 +30,31 @@
       <a href="{{ url_for('web.home') }}" class="brand-link">CU-Rates.org</a>
       <nav class="main-nav" aria-label="Main navigation">
         <ul>
-          <li><a href="{{ url_for('web.home') }}" {% if request.endpoint == 'web.home' %}aria-current="page"{% endif %}>Home</a></li>
-          <li><a href="{{ url_for('web.learn_index') }}" {% if request.endpoint and request.endpoint.startswith('web.learn') %}aria-current="page"{% endif %}>Learn</a></li>
-          <li><a href="{{ url_for('web.methodology') }}" {% if request.endpoint == 'web.methodology' %}aria-current="page"{% endif %}>Methodology</a></li>
-          <li><a href="{{ url_for('web.privacy') }}" {% if request.endpoint == 'web.privacy' %}aria-current="page"{% endif %}>Privacy</a></li>
+          <li><a href="{{ url_for('web.home') }}"{% if request.endpoint == 'web.home' %} aria-current="page"{% endif %}>Home</a></li>
+          <li><a href="{{ url_for('web.learn_index') }}"{% if request.endpoint == 'web.learn_index' %} aria-current="page"{% endif %}>Learn</a></li>
+          <li><a href="{{ url_for('web.methodology') }}"{% if request.endpoint == 'web.methodology' %} aria-current="page"{% endif %}>Methodology</a></li>
+          <li><a href="{{ url_for('web.privacy') }}"{% if request.endpoint == 'web.privacy' %} aria-current="page"{% endif %}>Privacy</a></li>
         </ul>
       </nav>
     </div>
   </header>
 
   <main id="main-content" class="site-main">
+    {% if seo and seo.breadcrumbs %}
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <ol>
+        {% for crumb in seo.breadcrumbs %}
+        <li>
+          {% if loop.last %}
+          <span aria-current="page">{{ crumb.name }}</span>
+          {% else %}
+          <a href="{{ crumb.path }}">{{ crumb.name }}</a>
+          {% endif %}
+        </li>
+        {% endfor %}
+      </ol>
+    </nav>
+    {% endif %}
     {% block content %}{% endblock %}
   </main>
 
