@@ -10,6 +10,12 @@ from flask.testing import FlaskClient
 
 from cu_rates.web import create_app
 from cu_rates.web.views import ARTICLES
+from tests.site_audit import (
+    RATE_FIGURE,
+    csp_problems,
+    publication_problems,
+    source_section_problems,
+)
 
 FORBIDDEN_ADVICE_PHRASES = [
     "you should",
@@ -124,6 +130,7 @@ def test_learn_index_and_articles_return_200_with_headers(client: FlaskClient) -
         assert "frame-ancestors 'none'" in csp
         assert "base-uri 'self'" in csp
         assert "form-action 'self'" in csp
+        assert csp_problems(csp) == []
 
         # Security headers
         assert resp.headers.get("X-Content-Type-Options") == "nosniff"
@@ -194,14 +201,13 @@ def test_reviewed_article_included_in_sitemap_and_indexed(client: FlaskClient) -
 
 def test_no_rates_aprs_or_rate_digits_in_articles(client: FlaskClient) -> None:
     """No digit patterns that look like rates or APRs appear in any educational content."""
-    rate_pattern = re.compile(r"\b\d+(\.\d+)?%\b")
     apr_pattern = re.compile(r"(?i)\bapr\b\s*:?\s*\d+")
 
     routes = ["/learn", *[f"/learn/{slug}" for slug in ARTICLES]]
     for path in routes:
         resp = client.get(path)
         text = resp.get_data(as_text=True)
-        assert not rate_pattern.search(text), f"Found rate/percentage pattern on {path}"
+        assert not RATE_FIGURE.search(text), f"Found rate/percentage pattern on {path}"
         assert not apr_pattern.search(text), f"Found APR with digits pattern on {path}"
 
 
@@ -222,20 +228,11 @@ def test_every_article_has_marked_citations(client: FlaskClient) -> None:
         resp = client.get(path)
         text = resp.get_data(as_text=True)
 
-        # Check for citation notice and tag
+        # The sources section must keep a marked external citation.
         assert UNVERIFIED_CITATION_MARKER in text, f"Missing unverified citation marker on {path}"
         assert "Authoritative Sources" in text or "Regulatory Guidance" in text
-
-        # Check for at least one outbound citation link
-        doc = parse_learn_page(text)
-        citation_links = [
-            (attrs, text)
-            for attrs, text in doc.links
-            if attrs.get("href", "").startswith("http://")
-            or attrs.get("href", "").startswith("https://")
-            or attrs.get("href", "") == "/methodology"
-        ]
-        assert len(citation_links) >= 1, f"No citation links found on {path}"
+        origin = str(client.application.config["CANONICAL_ORIGIN"])
+        assert source_section_problems(text, origin) == [], path
 
 
 def test_correction_process_and_planned_channel_specifications(
@@ -342,17 +339,22 @@ def test_accessibility_basics_on_all_learn_pages(client: FlaskClient) -> None:
 
 
 def test_no_external_assets_loaded(client: FlaskClient) -> None:
-    """Educational articles do not embed external scripts, styles, images, or iframes."""
+    """Educational articles do not embed external scripts, styles, images, or header preloads."""
+    origin = str(client.application.config["CANONICAL_ORIGIN"])
     routes = ["/learn", *[f"/learn/{slug}" for slug in ARTICLES]]
 
     for path in routes:
         resp = client.get(path)
-        doc = parse_learn_page(resp.get_data(as_text=True))
-
-        for tag, url in doc.asset_urls:
-            assert not url.startswith("http://") and not url.startswith("https://"), (
-                f"External asset found in <{tag}> on {path}: {url}"
+        headers = {key: value for key, value in resp.headers.items()}
+        assert (
+            publication_problems(
+                resp.get_data(as_text=True),
+                headers,
+                origin,
+                allow_external_anchors=True,
             )
+            == []
+        )
 
 
 def test_unknown_article_returns_404(client: FlaskClient) -> None:
@@ -360,3 +362,60 @@ def test_unknown_article_returns_404(client: FlaskClient) -> None:
     resp = client.get("/learn/non-existent-article-slug")
     assert resp.status_code == 404
     assert "noindex" in resp.headers.get("X-Robots-Tag", "")
+
+
+def test_collection_page_matches_source_approval_and_retention_limits(
+    client: FlaskClient,
+) -> None:
+    """Collection copy allows approved providers and does not promise instant deletion."""
+    text = client.get("/learn/collection-and-corrections").get_data(as_text=True)
+    lowered = text.lower()
+    assert "approved provider" in lowered
+    assert "exclusively from original institution" not in lowered
+    assert "never linger" not in lowered
+    assert "seventy-two hours" in lowered
+    assert "ninety-six hours" in lowered
+    assert "as soon as it can be handled safely" in lowered
+    assert "deleted immediately" not in lowered
+
+
+def test_loan_estimate_deadline_names_covered_loans(client: FlaskClient) -> None:
+    """The Loan Estimate sentence uses the covered-loan timing from the disclosure rule."""
+    text = client.get("/learn/limits-of-comparison").get_data(as_text=True).lower()
+    assert "within three business days" in text
+    assert "covered loans" in text
+    assert "three business days after" not in text
+
+
+def test_learn_index_headings_draft_labels_and_aria_current(client: FlaskClient) -> None:
+    """Article titles are nested h3s, draft labels follow review, and aria-current is exact."""
+    html = client.get("/learn").get_data(as_text=True)
+    assert html.count("<h3>") == len(ARTICLES)
+    assert "<h2><a" not in html
+    document = parse_learn_page(html)
+    current = [text for attrs, text in document.links if attrs.get("aria-current") == "page"]
+    assert current == ["Learn"]
+
+    article = client.get("/learn/limits-of-comparison")
+    article_html = article.get_data(as_text=True)
+    article_doc = parse_learn_page(article_html)
+    assert all(attrs.get("aria-current") != "page" for attrs, _text in article_doc.links)
+    assert '<span aria-current="page">' in article_html
+
+
+def test_reviewed_article_drops_its_draft_label(client: FlaskClient) -> None:
+    """A reviewed article is not labeled as a draft on the index or on its page."""
+    slug = "mortgage-basics"
+    try:
+        ARTICLES[slug]["reviewed"] = True
+        html = client.get("/learn").get_data(as_text=True)
+        for part in html.split('<li class="article-item">')[1:]:
+            chunk = part.split("</li>", 1)[0]
+            if f"/learn/{slug}" in chunk:
+                assert "Draft - awaiting factual review" not in chunk
+            else:
+                assert "Draft - awaiting factual review" in chunk
+        page = client.get(f"/learn/{slug}").get_data(as_text=True)
+        assert "Draft - awaiting factual review" not in page
+    finally:
+        ARTICLES[slug]["reviewed"] = False
