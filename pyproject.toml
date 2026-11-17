@@ -13,6 +13,9 @@ dependencies = [
 ]
 
 [dependency-groups]
+deploy = [
+    "gunicorn>=27.0.1",
+]
 dev = [
     "mypy>=1.13",
     "pytest>=8.3",

@@ -1,0 +1,15 @@
+[Unit]
+Description=CU-Rates.org Batch Worker Timer (DISABLED - D-15)
+Documentation=file:///var/lib/cu-rates/app/deploy/README.md https://github.com/aisetsyoufree/curatesv2
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=1800
+Persistent=true
+Unit=cu-rates-worker.service
+
+[Install]
+# Disabled per MASTER.md decision D-15: live collection is not approved.
+# To enable after approval: uncomment the line below and run:
+#   systemctl daemon-reload && systemctl enable --now cu-rates-worker.timer
+# WantedBy=timers.target

@@ -1,0 +1,45 @@
+# CU-Rates.org V2 — Caddy Reverse Proxy Configuration
+# Behind Cloudflare Tunnel with no inbound router port (MASTER.md D-09).
+# Cloudflared handles edge TLS termination and routes traffic to loopback.
+# No secrets are stored in this file.
+
+# Canonical domain configuration
+cu-rates.org {
+    # Listen only on loopback interface behind Cloudflare Tunnel (no external router port)
+    bind 127.0.0.1
+
+    # Reverse proxy to Gunicorn WSGI server on 127.0.0.1:8000
+    reverse_proxy 127.0.0.1:8000 {
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+
+    # Security headers aligned with src/cu_rates/web/app.py
+    header {
+        Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Permissions-Policy "geolocation=(), camera=(), microphone=(), payment=()"
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        -Server
+    }
+
+    # Structured access logging
+    log {
+        output file /var/log/caddy/cu-rates-access.log {
+            roll_size 10MiB
+            roll_keep 5
+            roll_keep_for 90d
+        }
+        format json
+    }
+}
+
+# Redirect www to apex canonical origin (MASTER.md §8: https://cu-rates.org)
+www.cu-rates.org {
+    bind 127.0.0.1
+    redir https://cu-rates.org{uri} permanent
+}

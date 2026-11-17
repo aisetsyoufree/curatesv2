@@ -1,0 +1,46 @@
+[Unit]
+Description=CU-Rates.org Batch Worker (DISABLED - D-15)
+Documentation=file:///var/lib/cu-rates/app/deploy/README.md https://github.com/aisetsyoufree/curatesv2
+After=network.target
+
+[Service]
+Type=oneshot
+User=cu-rates
+Group=cu-rates
+WorkingDirectory=/var/lib/cu-rates/app
+EnvironmentFile=-/etc/cu-rates/cu-rates.env
+
+# Live collection is DISABLED per MASTER.md decision D-15 until gateway pinned dialer is implemented.
+# ExecStart fails safely if invoked while live collection remains unapproved.
+ExecStart=/var/lib/cu-rates/venv/bin/python -c "import sys; print('Worker execution disabled per MASTER.md D-15: live collection not approved.', file=sys.stderr); sys.exit(1)"
+Restart=on-failure
+RestartSec=30s
+
+RuntimeDirectory=cu-rates-worker
+RuntimeDirectoryMode=0750
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+# Filesystem Access: Worker writes to operational data, artifacts, and snapshots.
+ReadWritePaths=/var/lib/cu-rates/data /var/lib/cu-rates/artifacts /var/lib/cu-rates/snapshots /run/cu-rates-worker /tmp
+ReadOnlyPaths=/var/lib/cu-rates/app
+
+# Resource Limits (Raspberry Pi 5 with 16 GB RAM)
+MemoryMax=1G
+TasksMax=64
+CPUQuota=100%
+
+[Install]
+# Intentionally disabled: worker service is activated only via cu-rates-worker.timer
+# and must NOT start automatically on boot while live collection is unapproved (D-15).
