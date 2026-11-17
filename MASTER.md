@@ -12,7 +12,7 @@
 | Repository | [aisetsyoufree/curatesv2](https://github.com/aisetsyoufree/curatesv2) |
 | Work tracker | [CU-Rates.org V2 GitHub Project](https://github.com/users/aisetsyoufree/projects/1) |
 | Authoritative local clone | `/Users/sid/Code/cu-rates.org-v2` |
-| Last updated | 2026-11-15 |
+| Last updated | 2026-11-16 |
 
 ## 1. Vision and objective
 
@@ -575,13 +575,44 @@ relevant GitHub issue or pull request, followed by an update to this document.
 
 ## 13. Current implemented foundation
 
-The repository currently has:
+This section describes what exists in the repository, not what is planned. Everything below
+runs offline; no live collection has been approved or enabled.
 
-- `uv`-managed Python 3.12 with `.python-version`, PEP 621 metadata, and `uv.lock`
-- Minimal typed `cu_rates` package
-- Ruff, strict mypy, pytest, and the executable `scripts/check` quality gate
-- Smoke tests, clean-environment verification, package build verification, and
-  fail-fast proof for the quality gate
+- **Toolchain:** `uv`-managed Python 3.12, committed lockfile, Ruff, strict mypy, pytest, and
+  the executable `scripts/check` quality gate.
+- **Contracts (`cu_rates.contracts`):** frozen, versioned Pydantic v2 records at schema 1.0
+  (additive changes only), a separate taxonomy version 1.0 (product scope, out-of-scope
+  products, collection method, finding and review states; findings carry evidence and no
+  rate fields), and offer fingerprints (`fp1`, pinned to its original hashes, and `fp2`).
+- **Evidence (`artifact_store`):** private SHA-256 content-addressed store with immutable
+  per-fetch observations and tamper detection.
+- **Fetch worker (`fetch_worker`, `fetch_robots`):** policy-gated collector covering robots
+  decisions, spacing, bounded retries with `Retry-After`, the 403/429 pause and block rules,
+  challenge detection, and refusal of non-global destinations and of redirects. Only a mock
+  transport can be dispatched; a live transport stays disabled until a gateway-owned pinned
+  dialer is built and independently reviewed.
+- **Publication gate (`contracts.publication`):** deterministic, fail-closed evaluator with
+  stable reason codes: approved source and fetch-profile digest, current evidence, review and
+  fingerprint binding, scenario evidence, corrections, source/offer/product/institution/
+  snapshot withdrawals, and HTTP 304 refresh only with a matching strong ETag. A scenario
+  match is never publication approval.
+- **Normalization and validation (`normalize`, `validation`):** pure deterministic layers.
+  Normalization turns extracted candidates into CANDIDATE offers that preserve source text,
+  locators, and rule IDs and keep null, zero, unknown, and not-applicable distinct.
+  Validation runs ten versioned rules and returns quarantine records with their evidence.
+- **Database (`db`, `alembic`):** SQLAlchemy 2 and Alembic over SQLite in WAL mode, frozen
+  migrations (`t012_initial`, `t020_roster_import`, `t014_trusted_records`), enforced foreign
+  keys, composite institution-bound references, and append-only history guarded by triggers
+  and an engine check.
+- **Roster import (`roster`):** repeatable, source-versioned import from a local CSV with the
+  raw file kept as evidence; it never marks a charter verified.
+- **Offline vertical slice (`pipeline`):** one synthetic source from mock fetch to a reviewed
+  publication and a verified 304 republication, with a slice-only extractor; real adapters
+  do not exist yet.
+- **Website foundation (`web`):** server-rendered Flask pages with strict headers and no
+  third-party requests, optional analytics disabled, and educational articles that are all
+  marked unreviewed (draft banner, `noindex`, excluded from the sitemap) until a human
+  reviews them. It shows no rates or institution data and never opens the worker database.
 
-Task status and next work are intentionally not duplicated here; use the GitHub
-Project and Issues.
+Task status and next work are intentionally not duplicated here; use the GitHub Project and
+Issues.
