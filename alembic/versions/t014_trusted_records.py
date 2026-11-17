@@ -11,7 +11,6 @@ import sqlalchemy as sa
 from alembic import op
 
 import cu_rates.db.types
-from cu_rates.db.schema import schema_triggers
 
 revision: str = "t014_trusted_records"
 down_revision: str | None = "t020_roster_import"
@@ -19,20 +18,47 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 _NEW_TABLES = ("verified_scenario_statements", "verified_scenario_conditions")
+_SLICE_TABLES = ("slice_offer_captures", "slice_snapshot_baselines", "slice_normalization_failures")
+_TRIGGER_KEYS = {
+    "source_approvals": ("approval_id",),
+    "source_fingerprints": ("fingerprint_id",),
+    "withdrawal_entries": ("withdrawal_id",),
+    "verified_scenario_statements": ("statement_id",),
+    "verified_scenario_conditions": ("offer_id", "scenario_id", "condition_id", "fetch_run_id"),
+    "slice_offer_captures": ("offer_id", "fetch_run_id"),
+    "slice_snapshot_baselines": ("snapshot_id", "offer_id"),
+    "slice_normalization_failures": ("extraction_run_id", "row_id"),
+}
 _WITHDRAWAL_SCOPE = "scope IN ('offer', 'product', 'institution', 'source', 'snapshot')"
 _FROZEN_SCOPE = "scope IN ('offer', 'product', 'institution', 'snapshot')"
 
 
 def _triggers(tables: tuple[str, ...], *, present: bool) -> None:
-    for name, statement in schema_triggers(tables):
+    for table in tables:
+        message = f"{table} is append-only"
+        for action in ("update", "delete"):
+            name = f"{table}_no_{action}"
+            if present:
+                op.execute(
+                    f"CREATE TRIGGER {name} BEFORE {action.upper()} ON {table} "
+                    f"BEGIN SELECT RAISE(ABORT, '{message}'); END"
+                )
+            else:
+                op.execute(f"DROP TRIGGER IF EXISTS {name}")
+        name = f"{table}_no_replace"
         if present:
-            op.execute(statement)
+            match = " AND ".join(f"{column} = NEW.{column}" for column in _TRIGGER_KEYS[table])
+            op.execute(
+                f"CREATE TRIGGER {name} BEFORE INSERT ON {table} "
+                f"WHEN EXISTS (SELECT 1 FROM {table} WHERE {match}) "
+                f"BEGIN SELECT RAISE(ABORT, '{message}'); END"
+            )
         else:
             op.execute(f"DROP TRIGGER IF EXISTS {name}")
 
 
 def upgrade() -> None:
-    _triggers(("source_approvals", "source_fingerprints"), present=False)
+    _triggers(("source_approvals",), present=False)
     with op.batch_alter_table("source_approvals") as batch:
         batch.add_column(sa.Column("approved_profile_sha256", sa.Text(), nullable=True))
         batch.add_column(sa.Column("approved_layout_sha256", sa.Text(), nullable=True))
@@ -84,7 +110,9 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["offer_id"], ["normalized_offers.offer_id"]),
         sa.ForeignKeyConstraint(["provenance_id"], ["provenance.provenance_id"]),
         sa.PrimaryKeyConstraint("statement_id"),
-        sa.UniqueConstraint("offer_id", "dimension", name="uq_verified_statements_dimension"),
+        sa.UniqueConstraint(
+            "offer_id", "dimension", "fetch_run_id", name="uq_verified_statements_dimension"
+        ),
     )
     op.create_table(
         "verified_scenario_conditions",
@@ -103,12 +131,46 @@ def upgrade() -> None:
         ),
         sa.ForeignKeyConstraint(["fetch_run_id"], ["fetch_runs.run_id"]),
         sa.ForeignKeyConstraint(["offer_id"], ["normalized_offers.offer_id"]),
-        sa.PrimaryKeyConstraint("offer_id", "scenario_id", "condition_id"),
+        sa.PrimaryKeyConstraint("offer_id", "scenario_id", "condition_id", "fetch_run_id"),
     )
     _triggers(_NEW_TABLES, present=True)
+    op.create_table(
+        "slice_offer_captures",
+        sa.Column(
+            "offer_id", sa.Text(), sa.ForeignKey("normalized_offers.offer_id"), primary_key=True
+        ),
+        sa.Column("fetch_run_id", sa.Text(), sa.ForeignKey("fetch_runs.run_id"), primary_key=True),
+        sa.Column("offer_json", cu_rates.db.types.JsonDocument(), nullable=False),
+    )
+    op.create_table(
+        "slice_snapshot_baselines",
+        sa.Column("snapshot_id", sa.Text(), primary_key=True),
+        sa.Column("offer_id", sa.Text(), primary_key=True),
+        sa.Column("baseline_json", cu_rates.db.types.JsonDocument(), nullable=False),
+        sa.Column("last_value_change_at", cu_rates.db.types.UtcDateTime(), nullable=False),
+        sa.ForeignKeyConstraint(
+            ["snapshot_id", "offer_id"],
+            ["snapshot_entries.snapshot_id", "snapshot_entries.offer_id"],
+        ),
+    )
+    op.create_table(
+        "slice_normalization_failures",
+        sa.Column(
+            "extraction_run_id",
+            sa.Text(),
+            sa.ForeignKey("extraction_runs.run_id"),
+            primary_key=True,
+        ),
+        sa.Column("row_id", sa.Text(), primary_key=True),
+        sa.Column("reason", sa.Text(), nullable=False),
+    )
+    _triggers(_SLICE_TABLES, present=True)
 
 
 def downgrade() -> None:
+    _triggers(_SLICE_TABLES, present=False)
+    for table in reversed(_SLICE_TABLES):
+        op.drop_table(table)
     _triggers(_NEW_TABLES, present=False)
     op.drop_table("verified_scenario_conditions")
     op.drop_table("verified_scenario_statements")
@@ -130,4 +192,4 @@ def downgrade() -> None:
         batch.drop_column("adapter_name")
         batch.drop_column("approved_layout_sha256")
         batch.drop_column("approved_profile_sha256")
-    _triggers(("source_approvals", "source_fingerprints"), present=True)
+    _triggers(("source_approvals",), present=True)

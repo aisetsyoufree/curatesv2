@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import timedelta
+from hashlib import sha256
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.engine import Connection
 
+from cu_rates.artifact_store import ArtifactStore, ArtifactStoreError
 from cu_rates.contracts.audit import (
+    Correction,
     PublishedSnapshot,
     ReviewDecision,
     SnapshotEntry,
@@ -17,17 +20,27 @@ from cu_rates.contracts.audit import (
     snapshot_manifest_sha256,
 )
 from cu_rates.contracts.base import CONTRACT_VERSION, UtcDatetime
-from cu_rates.contracts.enums import RunStatus
-from cu_rates.contracts.evidence import ParserVersion, Provenance, RawArtifact
-from cu_rates.contracts.fingerprints import OfferSnapshot, offer_fingerprints
+from cu_rates.contracts.enums import OfferStatus, RunStatus
+from cu_rates.contracts.evidence import HtmlLocator, ParserVersion, Provenance, RawArtifact
+from cu_rates.contracts.fingerprints import (
+    OfferFingerprints,
+    OfferSnapshot,
+    offer_evidence_sha256,
+    offer_fingerprints,
+)
 from cu_rates.contracts.offers import NormalizedOffer, OfferCondition
 from cu_rates.contracts.publication import (
+    REVIEW_REASONS,
+    Placement,
     PriorPublication,
     PublicationContext,
+    PublicationOutcome,
+    ReasonCode,
     ValidationPolicy,
     ValidationResult,
     VerifiedScenarioCondition,
     VerifiedScenarioStatement,
+    evaluate_publication,
 )
 from cu_rates.contracts.registry import (
     Institution,
@@ -37,12 +50,15 @@ from cu_rates.contracts.registry import (
 from cu_rates.contracts.scenarios import StatedBound
 from cu_rates.contracts.sources import (
     ConditionalValidator,
+    ExtractedCandidate,
     FetchProfile,
     FetchRun,
     NotModifiedObservation,
     RateSource,
     SourceApproval,
     SourceFingerprint,
+    is_strong_etag,
+    profile_sha256,
 )
 from cu_rates.contracts.taxonomy import ProductFinding
 from cu_rates.db.records import (
@@ -57,6 +73,9 @@ from cu_rates.db.records import (
 from cu_rates.db.schema import (
     artifact_blobs,
     artifact_observations,
+    correction_evidence,
+    corrections,
+    extracted_candidates,
     extraction_runs,
     fetch_profiles,
     fetch_runs,
@@ -64,14 +83,18 @@ from cu_rates.db.schema import (
     finding_purposes,
     institution_source_relationships,
     institutions,
+    normalized_offers,
     not_modified_observations,
     product_findings,
     products,
     published_snapshots,
     rate_sources,
     review_decisions,
+    slice_offer_captures,
+    slice_snapshot_baselines,
     snapshot_entries,
     snapshot_reviews,
+    source_approval_evidence,
     source_approvals,
     source_fingerprints,
     validation_policies,
@@ -81,6 +104,7 @@ from cu_rates.db.schema import (
     withdrawal_entries,
     withdrawal_lifts,
 )
+from cu_rates.pipeline.extract import excerpt_is_located, layout_sha256, resolve_text
 
 _FRESHNESS = timedelta(hours=71)
 
@@ -91,6 +115,7 @@ class TrustedView:
 
     offer: NormalizedOffer
     context: PublicationContext
+    current_review: ReviewDecision | None
 
 
 def insert_institution(conn: Connection, institution: Institution) -> None:
@@ -193,7 +218,13 @@ def insert_approval(conn: Connection, approval: SourceApproval, charter: int) ->
         },
     )
     for record in approval.evidence:
-        _insert_provenance(conn, record, charter)
+        conn.execute(
+            source_approval_evidence.insert(),
+            {
+                "approval_id": approval.approval_id,
+                "provenance_id": _insert_provenance(conn, record, charter),
+            },
+        )
 
 
 def insert_run(conn: Connection, run: FetchRun) -> None:
@@ -307,12 +338,20 @@ def insert_offer(conn: Connection, offer: NormalizedOffer) -> NormalizedOffer:
 
 def insert_validations(conn: Connection, results: tuple[ValidationResult, ...]) -> None:
     for result in results:
+        validation_id = sha256(result.model_dump_json().encode()).hexdigest()
+        if (
+            conn.execute(
+                select(validation_results.c.validation_id).where(
+                    validation_results.c.validation_id == validation_id
+                )
+            ).first()
+            is not None
+        ):
+            continue
         conn.execute(
             validation_results.insert(),
             {
-                "validation_id": (
-                    f"{result.offer_id}.{result.rule_id}.{int(result.evaluated_at.timestamp())}"
-                ),
+                "validation_id": validation_id,
                 "rule_id": result.rule_id,
                 "passed": int(result.passed),
                 "detail": result.detail,
@@ -337,7 +376,9 @@ def insert_statements(
         conn.execute(
             verified_scenario_statements.insert(),
             {
-                "statement_id": f"{statement.offer_id}.{statement.dimension.value}",
+                "statement_id": (
+                    f"{statement.offer_id}.{statement.dimension.value}.{statement.fetch_run_id}"
+                ),
                 "schema_version": CONTRACT_VERSION,
                 "offer_id": statement.offer_id,
                 "dimension": statement.dimension.value,
@@ -436,7 +477,7 @@ def insert_withdrawal(conn: Connection, entry: WithdrawalEntry) -> None:
         )
 
 
-def insert_snapshot(conn: Connection, snapshot: PublishedSnapshot) -> None:
+def _insert_snapshot(conn: Connection, snapshot: PublishedSnapshot) -> None:
     if snapshot.manifest_sha256 != snapshot_manifest_sha256(snapshot.entries):
         raise ValueError("snapshot manifest does not match its entries")
     conn.execute(
@@ -476,6 +517,126 @@ def insert_extraction_run(conn: Connection, row: dict[str, object]) -> None:
     conn.execute(extraction_runs.insert(), row)
 
 
+def persist_candidate(conn: Connection, candidate: ExtractedCandidate, charter: int) -> None:
+    conn.execute(
+        extracted_candidates.insert(),
+        {
+            "candidate_id": f"{candidate.extraction_run_id}.{candidate.candidate_id}",
+            "schema_version": candidate.schema_version,
+            "extraction_run_id": candidate.extraction_run_id,
+            "proposed_path": candidate.proposed_path,
+            "raw_value": candidate.raw_value,
+            "provenance_id": _insert_provenance(conn, candidate.provenance, charter),
+        },
+    )
+
+
+def insert_capture(conn: Connection, offer: NormalizedOffer, run_id: str) -> None:
+    present = conn.execute(
+        select(slice_offer_captures.c.offer_id).where(
+            slice_offer_captures.c.offer_id == offer.offer_id
+        )
+    ).first()
+    if present is None:
+        insert_offer(conn, offer)
+    conn.execute(
+        slice_offer_captures.insert(),
+        {
+            "offer_id": offer.offer_id,
+            "fetch_run_id": run_id,
+            "offer_json": offer.model_dump(mode="json"),
+        },
+    )
+
+
+def verify_located_claim(body: bytes, provenance: Provenance) -> str:
+    locator = provenance.locator
+    if not isinstance(locator, HtmlLocator):
+        raise ValueError("slice claims use HTML locators")
+    node = resolve_text(body, locator.selector, locator.selector_type)
+    if sha256(
+        node.encode()
+    ).hexdigest() != locator.normalized_text_sha256 or not excerpt_is_located(
+        node, provenance.source_text
+    ):
+        raise ValueError("stored locator or excerpt differs from source")
+    return provenance.source_text
+
+
+def publish(
+    conn: Connection,
+    offer_id: str,
+    *,
+    store: ArtifactStore,
+    evaluated_at: UtcDatetime,
+    snapshot_id: str,
+    reviewed: bool = False,
+) -> PublishedSnapshot | None:
+    """Atomically persist only a gate-approved automatic or explicitly reviewed publication."""
+    view = load_publication_context(conn, offer_id, evaluated_at, store=store)
+    offer = view.offer
+    ctx = view.context.model_copy(update={"snapshot_id": snapshot_id})
+    review = view.current_review
+    decision = evaluate_publication(offer, ctx)
+    prior = ctx.prior
+    fp = offer_fingerprints(offer)
+    if reviewed:
+        # A first-publication lane is deliberately narrow: a human signature is not
+        # an override for missing dates, policy, corrections, withdrawn sources, or drift.
+        if not (
+            decision.outcome is PublicationOutcome.REQUIRES_REVIEW
+            and set(decision.reasons) & REVIEW_REASONS == {ReasonCode.FIRST_PUBLICATION}
+            and not decision.degraded
+            and decision.placement is not Placement.NONE
+            and review is not None
+            and review.approved
+            and offer.observed_at <= review.decided_at <= evaluated_at
+            and review.reviewed_fingerprints == fp
+            and review.reviewed_evidence_sha256 == offer_evidence_sha256(offer)
+        ):
+            return None
+    elif not decision.publishable_now:
+        return None
+    elif review is not None and (
+        review.reviewed_fingerprints != fp
+        or review.reviewed_evidence_sha256 != offer_evidence_sha256(offer)
+    ):
+        # A legitimate small rate change can auto-publish, but is not a new human review.
+        review = None
+
+    entry = SnapshotEntry(offer_id=offer_id, structural_sha256=fp.structural, value_sha256=fp.value)
+    snapshot = PublishedSnapshot(
+        schema_version=CONTRACT_VERSION,
+        snapshot_id=snapshot_id,
+        published_at=evaluated_at,
+        published_by=review.actor if reviewed and review is not None else "t014-fixture-publisher",
+        entries=(entry,),
+        manifest_sha256=snapshot_manifest_sha256((entry,)),
+        supersedes=prior.published.snapshot_id if prior else None,
+        review_ids=(review.review_id,) if review is not None else (),
+    )
+    baseline = OfferSnapshot.from_offer(offer)
+    _insert_snapshot(conn, snapshot)
+    changed_at = evaluated_at
+    if prior is not None and prior.snapshot.fingerprints.value == baseline.fingerprints.value:
+        changed_at = prior.last_value_change_at
+    conn.execute(
+        slice_snapshot_baselines.insert(),
+        {
+            "snapshot_id": snapshot_id,
+            "offer_id": offer_id,
+            "baseline_json": baseline.model_dump(mode="json"),
+            "last_value_change_at": changed_at,
+        },
+    )
+    conn.execute(
+        normalized_offers.update()
+        .where(normalized_offers.c.offer_id == offer_id, normalized_offers.c.published_at.is_(None))
+        .values(status=OfferStatus.PUBLISHED.value, published_at=evaluated_at)
+    )
+    return snapshot
+
+
 def _parser(name: str | None, version: str | None) -> ParserVersion | None:
     if name is None or version is None:
         return None
@@ -507,79 +668,133 @@ def _approval(row: Any) -> SourceApproval:
 
 
 def load_publication_context(
-    conn: Connection, offer_id: str, evaluated_at: UtcDatetime
+    conn: Connection, offer_id: str, evaluated_at: UtcDatetime, *, store: ArtifactStore
 ) -> TrustedView:
-    """Rebuild one offer and its gate context from the operational tables.
-
-    A 304 observation time is applied only when that observation row is stored.
-    A snapshot that does not list this offer's current fingerprints is ignored.
-    """
-    offer = load_normalized_offer(conn, offer_id)
-    institution_row = conn.execute(
-        select(institutions).where(institutions.c.charter_number == offer.institution_charter)
-    ).one()
-    product_row = conn.execute(
-        select(products).where(products.c.product_id == offer.product_id)
-    ).one()
-    relationship_row = conn.execute(
-        select(institution_source_relationships).where(
-            institution_source_relationships.c.institution_charter == offer.institution_charter,
-            institution_source_relationships.c.source_id == offer.source_id,
-            institution_source_relationships.c.product_id == offer.product_id,
+    """Rebuild a publication candidate from verified private bytes and append-only history."""
+    registered = load_normalized_offer(conn, offer_id)
+    capture = conn.execute(
+        select(slice_offer_captures)
+        .join(fetch_runs, fetch_runs.c.run_id == slice_offer_captures.c.fetch_run_id)
+        .where(
+            slice_offer_captures.c.offer_id == offer_id,
+            fetch_runs.c.finished_at <= evaluated_at,
         )
-    ).one()
-    source_row = conn.execute(
-        select(rate_sources).where(rate_sources.c.source_id == offer.source_id)
-    ).one()
-    approval_rows = conn.execute(
+        .order_by(fetch_runs.c.finished_at.desc(), fetch_runs.c.run_id.desc())
+    ).first()
+    offer = registered if capture is None else NormalizedOffer.model_validate(capture.offer_json)
+    if (offer.offer_id, offer.source_id, offer.product_id, offer.institution_charter) != (
+        registered.offer_id,
+        registered.source_id,
+        registered.product_id,
+        registered.institution_charter,
+    ):
+        raise ValueError("stored observation is not bound to the registered offer")
+    source = _source(
+        conn.execute(select(rate_sources).where(rate_sources.c.source_id == offer.source_id)).one()
+    )
+    institution = _institution(
+        conn.execute(
+            select(institutions).where(institutions.c.charter_number == offer.institution_charter)
+        ).one()
+    )
+    product = _product(
+        conn.execute(select(products).where(products.c.product_id == offer.product_id)).one()
+    )
+    relationship = _relationship(
+        conn.execute(
+            select(institution_source_relationships).where(
+                institution_source_relationships.c.institution_charter == offer.institution_charter,
+                institution_source_relationships.c.source_id == offer.source_id,
+                institution_source_relationships.c.product_id == offer.product_id,
+            )
+        ).one()
+    )
+    approval_row = conn.execute(
         select(source_approvals)
-        .where(source_approvals.c.source_id == offer.source_id)
-        .order_by(source_approvals.c.decided_at.desc(), source_approvals.c.approval_id.desc())
-    ).all()
-    approval = _approval(approval_rows[0]) if approval_rows else None
+        .where(
+            source_approvals.c.source_id == source.source_id,
+            source_approvals.c.decided_at <= evaluated_at,
+        )
+        .order_by(
+            source_approvals.c.decided_at.desc(),
+            source_approvals.c.decision.desc(),
+            source_approvals.c.approval_id.desc(),
+        )
+    ).first()
+    approval = None if approval_row is None else _approval(approval_row)
     run_rows = conn.execute(
-        select(fetch_runs).where(fetch_runs.c.source_id == offer.source_id)
+        select(fetch_runs).where(
+            fetch_runs.c.source_id == source.source_id, fetch_runs.c.finished_at <= evaluated_at
+        )
     ).all()
-    observation_rows = conn.execute(
+    observations = conn.execute(
         select(artifact_observations).where(
-            artifact_observations.c.fetch_run_id.in_([row.run_id for row in run_rows] or [""])
+            artifact_observations.c.fetch_run_id.in_([row.run_id for row in run_rows])
         )
     ).all()
     ids_by_run: dict[str, list[str]] = {}
-    for observation in observation_rows:
-        ids_by_run.setdefault(str(observation.fetch_run_id), []).append(
-            str(observation.artifact_id)
+    for item in observations:
+        ids_by_run.setdefault(item.fetch_run_id, []).append(item.artifact_id)
+    runs = tuple(_run(row, tuple(set(ids_by_run.get(row.run_id, ())))) for row in run_rows)
+    cited = {item.artifact_id for item in offer.iter_provenance()}
+    matching = [
+        item
+        for item in observations
+        if item.source_url == source.url
+        and item.artifact_id in cited
+        and item.fetched_at == offer.observed_at
+        and (capture is None or capture.fetch_run_id == item.fetch_run_id)
+    ]
+    basis = next(
+        (run for run in runs if len(matching) == 1 and run.run_id == matching[0].fetch_run_id), None
+    )
+    verified: tuple[RawArtifact, ...] = ()
+    body: bytes | None = None
+    comparable = False
+    if basis is not None and not any(
+        item.source_url == source.url
+        and item.http_status == 200
+        and item.fetched_at > offer.observed_at
+        for item in observations
+    ):
+        item = matching[0]
+        artifact = RawArtifact(
+            schema_version=item.schema_version,
+            artifact_id=item.artifact_id,
+            media_type=item.media_type,
+            source_url=item.source_url,
+            fetched_at=item.fetched_at,
+            http_status=item.http_status,
+            byte_length=blob_length(conn, item.artifact_id),
+            fetch_run_id=item.fetch_run_id,
         )
-    runs = tuple(_run(row, tuple(ids_by_run.get(str(row.run_id), ()))) for row in run_rows)
-    succeeded = [run for run in runs if run.status is RunStatus.SUCCEEDED]
-    basis = min(succeeded, key=lambda run: run.started_at) if succeeded else None
+        try:
+            raw = store.read(artifact)
+            if store.get_observation(artifact.fetch_run_id, artifact.source_url) != artifact:
+                raise ValueError("stored observation differs from the database")
+            if cited != {artifact.artifact_id}:
+                raise ValueError("slice claims must cite the single source artifact")
+            from cu_rates.pipeline.slice import verify_offer_bytes
+
+            comparable = verify_offer_bytes(source, offer, raw, artifact)
+            body, verified = raw, (artifact,)
+        except (ArtifactStoreError, ValueError, OSError):
+            pass
+
     profile = None
     if basis is not None:
-        profile_row = conn.execute(
+        row = conn.execute(
             select(fetch_profiles).where(fetch_profiles.c.profile_id == basis.profile_id)
         ).one_or_none()
-        if profile_row is not None:
+        if row is not None:
             profile = FetchProfile(
-                schema_version=profile_row.schema_version,
-                profile_id=profile_row.profile_id,
-                source_id=profile_row.source_id,
-                method=profile_row.method,
-                min_interval_seconds=profile_row.min_interval_seconds,
-                timeout_seconds=profile_row.timeout_seconds,
+                schema_version=row.schema_version,
+                profile_id=row.profile_id,
+                source_id=row.source_id,
+                method=row.method,
+                min_interval_seconds=row.min_interval_seconds,
+                timeout_seconds=row.timeout_seconds,
             )
-    artifacts = tuple(
-        RawArtifact(
-            schema_version=row.schema_version,
-            artifact_id=row.artifact_id,
-            media_type=row.media_type,
-            source_url=row.source_url,
-            fetched_at=row.fetched_at,
-            http_status=row.http_status,
-            byte_length=blob_length(conn, row.artifact_id),
-            fetch_run_id=row.fetch_run_id,
-        )
-        for row in observation_rows
-    )
     reobservations = tuple(
         NotModifiedObservation(
             schema_version=row.schema_version,
@@ -597,41 +812,75 @@ def load_publication_context(
         )
         for row in conn.execute(
             select(not_modified_observations).where(
-                not_modified_observations.c.source_id == offer.source_id
+                not_modified_observations.c.source_id == source.source_id,
+                not_modified_observations.c.observed_at <= evaluated_at,
             )
         ).all()
     )
-    fingerprints = tuple(
-        _fingerprint(row)
-        for row in conn.execute(
-            select(source_fingerprints).where(source_fingerprints.c.source_id == offer.source_id)
-        ).all()
-    )
-    cited = {item.artifact_id for item in offer.iter_provenance()}
-    claimed = [item for item in reobservations if item.original_artifact_id in cited]
-    original_observed = offer.observed_at
-    if claimed and offer.valid_until is not None:
-        newest = max(claimed, key=lambda item: item.observed_at)
-        span = offer.valid_until - original_observed
-        if span <= _FRESHNESS:
-            offer = offer.model_copy(
-                update={
-                    "observed_at": newest.observed_at,
-                    "valid_until": newest.observed_at + span,
-                }
-            )
-    validations = tuple(
-        result
-        for result in (
-            _validation(row)
-            for row in conn.execute(
-                select(validation_results).where(validation_results.c.offer_id == offer_id)
-            ).all()
+    prior = _prior(conn, offer.offer_id, evaluated_at)
+    current_review = _subject_review(conn, "offer", offer_id, evaluated_at)
+    if current_review is not None and not current_review.approved:
+        offer = offer.model_copy(update={"status": OfferStatus.QUARANTINED, "published_at": None})
+    elif registered.status in {
+        OfferStatus.QUARANTINED,
+        OfferStatus.WITHDRAWN,
+        OfferStatus.SUPERSEDED,
+    }:
+        offer = offer.model_copy(update={"status": registered.status, "published_at": None})
+    if (
+        basis is not None
+        and verified
+        and profile is not None
+        and approval is not None
+        and prior is not None
+        and prior.review is not None
+        and prior.review.approved
+        and prior.review.reviewed_evidence_sha256 == offer_evidence_sha256(offer)
+        and prior.snapshot.fingerprints == offer_fingerprints(offer)
+        and offer.valid_until is not None
+    ):
+        span = offer.valid_until - offer.observed_at
+        if timedelta(0) < span <= _FRESHNESS:
+            for when in sorted({item.observed_at for item in reobservations}, reverse=True):
+                claims = [
+                    item
+                    for item in reobservations
+                    if item.observed_at == when and item.original_artifact_id in cited
+                ]
+                if (
+                    when > offer.observed_at
+                    and claims
+                    and all(
+                        _refresh_allowed(item, verified[0], basis, profile, approval)
+                        for item in claims
+                    )
+                ):
+                    offer = offer.model_copy(
+                        update={"observed_at": when, "valid_until": when + span}
+                    )
+                    break
+    latest: dict[str, ValidationResult] = {}
+    current = offer_fingerprints(offer)
+    for row in conn.execute(
+        select(validation_results)
+        .where(
+            validation_results.c.offer_id == offer_id,
+            validation_results.c.evaluated_at >= offer.observed_at,
+            validation_results.c.evaluated_at <= evaluated_at,
         )
-        if result.evaluated_at >= offer.observed_at
-    )
+        .order_by(
+            validation_results.c.evaluated_at.desc(),
+            validation_results.c.passed.asc(),
+            validation_results.c.validation_id.desc(),
+        )
+    ).all():
+        result = _validation(row)
+        if result.fingerprints == current:
+            latest.setdefault(result.rule_id, result)
     policy_row = conn.execute(
-        select(validation_policies).order_by(validation_policies.c.approved_at.desc())
+        select(validation_policies)
+        .where(validation_policies.c.approved_at <= evaluated_at)
+        .order_by(validation_policies.c.approved_at.desc(), validation_policies.c.policy_id.desc())
     ).first()
     policy = (
         None
@@ -645,37 +894,103 @@ def load_publication_context(
             approved_at=policy_row.approved_at,
         )
     )
-    product_review = _subject_review(conn, "product", offer.product_id)
-    statements = _statements(conn, offer.offer_id)
-    conditions = _conditions(conn, offer.offer_id)
-    withdrawals = _withdrawals(conn)
-    prior = _prior(conn, offer, original_observed)
-    context = PublicationContext.model_validate(
-        {
-            "institution": _institution(institution_row),
-            "product": _product(product_row),
-            "relationship": _relationship(relationship_row),
-            "source": _source(source_row),
-            "source_approval": approval,
-            "validation_policy": policy,
-            "approved_parsers": ()
+    if (
+        offer.status is OfferStatus.CANDIDATE
+        and policy is not None
+        and set(policy.required_rules) <= latest.keys()
+        and all(item.passed for item in latest.values())
+    ):
+        # Preflight only: the domain gate accepts approved-shaped offers. This projection
+        # is never persisted and is not human approval or permission to write a snapshot.
+        offer = offer.model_copy(update={"status": OfferStatus.APPROVED})
+    layouts = set()
+    statements: tuple[VerifiedScenarioStatement, ...] = ()
+    conditions: tuple[VerifiedScenarioCondition, ...] = ()
+    if basis is not None and verified and body is not None:
+        artifact = verified[0]
+        layout = layout_sha256(body)
+        layouts = {
+            _fingerprint(row)
+            for row in conn.execute(
+                select(source_fingerprints).where(
+                    source_fingerprints.c.source_id == source.source_id,
+                    source_fingerprints.c.fetch_run_id == basis.run_id,
+                    source_fingerprints.c.artifact_id == artifact.artifact_id,
+                    source_fingerprints.c.structure_sha256 == layout,
+                )
+            ).all()
+        }
+        if comparable:
+            statements = tuple(
+                proof for proof in _statements(conn, offer_id) if proof.fetch_run_id == basis.run_id
+            )
+        conditions = tuple(
+            proof
+            for proof in _conditions(conn, offer_id)
+            if proof.fetch_run_id == basis.run_id and proof.condition in offer.conditions
+        )
+    return TrustedView(
+        offer,
+        PublicationContext(
+            institution=institution,
+            product=product,
+            relationship=relationship,
+            source=source,
+            source_approval=approval,
+            validation_policy=policy,
+            approved_parsers=()
             if approval is None or approval.adapter is None
             else (approval.adapter,),
-            "known_artifacts": artifacts,
-            "fetch_runs": runs,
-            "reobservations": reobservations,
-            "approved_profile": profile,
-            "source_fingerprints": fingerprints,
-            "verified_scenario_statements": statements,
-            "verified_scenario_conditions": conditions,
-            "validations": validations,
-            "prior": prior,
-            "product_review": product_review,
-            "withdrawals": withdrawals,
-            "evaluated_at": evaluated_at,
-        }
+            known_artifacts=verified,
+            fetch_runs=runs,
+            reobservations=reobservations,
+            approved_profile=profile,
+            source_fingerprints=tuple(layouts) if len(layouts) == 1 else (),
+            verified_scenario_statements=statements,
+            verified_scenario_conditions=conditions,
+            validations=tuple(latest[key] for key in sorted(latest)),
+            prior=prior,
+            product_review=_subject_review(conn, "product", offer.product_id, evaluated_at),
+            corrections=_corrections(conn, offer_id, evaluated_at, store),
+            withdrawals=_withdrawals(conn),
+            evaluated_at=evaluated_at,
+        ),
+        current_review,
     )
-    return TrustedView(offer, context)
+
+
+def _refresh_allowed(
+    item: NotModifiedObservation,
+    artifact: RawArtifact,
+    run: FetchRun,
+    profile: FetchProfile,
+    approval: SourceApproval,
+) -> bool:
+    """Only an identical, strong ETag on the exact approved capture can advance time."""
+    validator = run.conditional_validator
+    if validator is None or item.validator != validator:
+        return False
+    if validator.kind == "etag" and not is_strong_etag(validator.value):
+        return False
+    if validator.kind != "etag":
+        return False
+    return (
+        approval.approved
+        and approval.source_url == artifact.source_url
+        and run.status is RunStatus.SUCCEEDED
+        and artifact.http_status == 200
+        and item.original_run_id == run.run_id
+        and item.original_artifact_id == artifact.artifact_id
+        and item.source_id == run.source_id == profile.source_id == approval.source_id
+        and item.profile_id == run.profile_id == profile.profile_id
+        and item.profile_sha256
+        == run.profile_sha256
+        == approval.approved_profile_sha256
+        == profile_sha256(profile)
+        and approval.decided_at <= run.started_at <= run.finished_at <= item.started_at
+        and run.started_at <= artifact.fetched_at <= run.finished_at
+        and item.response_etag == validator.value
+    )
 
 
 def blob_length(conn: Connection, artifact_id: str) -> int:
@@ -787,18 +1102,70 @@ def _validation(row: Any) -> ValidationResult:
     )
 
 
-def _subject_review(conn: Connection, subject: str, subject_id: str) -> ReviewDecision | None:
+def _subject_review(
+    conn: Connection, subject: str, subject_id: str, evaluated_at: UtcDatetime
+) -> ReviewDecision | None:
     row = conn.execute(
         select(review_decisions.c.review_id)
         .where(
             review_decisions.c.subject == subject,
             review_decisions.c.subject_id == subject_id,
+            review_decisions.c.decided_at <= evaluated_at,
         )
-        .order_by(review_decisions.c.decided_at.desc())
+        .order_by(
+            review_decisions.c.decided_at.desc(),
+            review_decisions.c.verdict.desc(),
+            review_decisions.c.review_id.desc(),
+        )
     ).first()
     if row is None:
         return None
     return load_review_decision(conn, str(row.review_id))
+
+
+def _corrections(
+    conn: Connection, offer_id: str, evaluated_at: UtcDatetime, store: ArtifactStore
+) -> tuple[Correction, ...]:
+    results: list[Correction] = []
+    for row in conn.execute(
+        select(corrections).where(
+            corrections.c.offer_id == offer_id, corrections.c.corrected_at <= evaluated_at
+        )
+    ).all():
+        ids = set(
+            conn.execute(
+                select(correction_evidence.c.provenance_id).where(
+                    correction_evidence.c.correction_id == row.correction_id
+                )
+            ).scalars()
+        )
+        evidence = tuple(_load_provenance(conn, ids)[key] for key in sorted(ids))
+        try:
+            for item in evidence:
+                verify_located_claim(store.read_body(item.artifact_id), item)
+        except (ArtifactStoreError, OSError, ValueError):
+            # Keep the correction in force even if its supporting bytes are unavailable.
+            evidence = ()
+        results.append(
+            Correction(
+                schema_version=row.schema_version,
+                correction_id=row.correction_id,
+                offer_id=offer_id,
+                field_path=row.field_path,
+                previous_value=row.previous_value,
+                corrected_value=row.corrected_value,
+                actor=row.actor,
+                corrected_at=row.corrected_at,
+                reason=row.reason,
+                evidence=evidence,
+                corrected_fingerprints=(
+                    None
+                    if row.fingerprints_json is None
+                    else OfferFingerprints.model_validate(row.fingerprints_json)
+                ),
+            )
+        )
+    return tuple(results)
 
 
 def _statements(conn: Connection, offer_id: str) -> tuple[VerifiedScenarioStatement, ...]:
@@ -858,44 +1225,53 @@ def _withdrawals(conn: Connection) -> tuple[WithdrawalEntry, ...]:
     return tuple(entries)
 
 
-def _prior(
-    conn: Connection, offer: NormalizedOffer, original_observed: datetime
-) -> PriorPublication | None:
-    fingerprints = offer_fingerprints(offer)
-    rows = conn.execute(
+def _prior(conn: Connection, offer_id: str, evaluated_at: UtcDatetime) -> PriorPublication | None:
+    row = conn.execute(
         select(snapshot_entries, published_snapshots)
         .join(
-            published_snapshots,
-            published_snapshots.c.snapshot_id == snapshot_entries.c.snapshot_id,
+            published_snapshots, published_snapshots.c.snapshot_id == snapshot_entries.c.snapshot_id
         )
-        .where(snapshot_entries.c.offer_id == offer.offer_id)
-        .order_by(published_snapshots.c.published_at.desc())
-    ).all()
-    for row in rows:
-        if (
-            row.structural_sha256 != fingerprints.structural
-            or row.value_sha256 != fingerprints.value
-        ):
-            continue
-        review_row = conn.execute(
-            select(snapshot_reviews.c.review_id).where(
-                snapshot_reviews.c.snapshot_id == row.snapshot_id
-            )
-        ).first()
-        review = (
-            None if review_row is None else load_review_decision(conn, str(review_row.review_id))
+        .where(
+            snapshot_entries.c.offer_id == offer_id,
+            published_snapshots.c.published_at <= evaluated_at,
         )
-        snapshot = _snapshot(conn, str(row.snapshot_id))
-        try:
-            return PriorPublication(
-                snapshot=OfferSnapshot.from_offer(offer),
-                published=snapshot,
-                review=review,
-                last_value_change_at=original_observed,
-            )
-        except ValueError:
-            return None
-    return None
+        .order_by(
+            published_snapshots.c.published_at.desc(), published_snapshots.c.snapshot_id.desc()
+        )
+    ).first()
+    if row is None:
+        return None
+    historical = conn.execute(
+        select(slice_snapshot_baselines).where(
+            slice_snapshot_baselines.c.snapshot_id == row.snapshot_id,
+            slice_snapshot_baselines.c.offer_id == offer_id,
+        )
+    ).one_or_none()
+    if historical is None:
+        return None
+    snapshot = _snapshot(conn, row.snapshot_id)
+    baseline = OfferSnapshot.model_validate(historical.baseline_json)
+    reviewed = [
+        found
+        for review_id in snapshot.review_ids
+        if (found := load_review_decision(conn, review_id)).subject_id == offer_id
+        and found.reviewed_fingerprints == baseline.fingerprints
+        and found.decided_at <= snapshot.published_at
+    ]
+    review = max(
+        reviewed,
+        key=lambda item: (item.decided_at, not item.approved, item.review_id),
+        default=None,
+    )
+    latest = _subject_review(conn, "offer", offer_id, evaluated_at)
+    if latest is not None and not latest.approved:
+        review = None
+    return PriorPublication(
+        snapshot=baseline,
+        published=snapshot,
+        review=review,
+        last_value_change_at=historical.last_value_change_at,
+    )
 
 
 def _snapshot(conn: Connection, snapshot_id: str) -> PublishedSnapshot:

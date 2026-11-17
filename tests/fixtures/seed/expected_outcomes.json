@@ -51,6 +51,55 @@
       ]
     },
     {
+      "case_id": "athol-style-dated",
+      "fixture": "athol_style_mortgage_dated.html",
+      "source_url": "https://athol-style.example/mortgage-rates",
+      "media_type": "text/html; charset=utf-8",
+      "http_status": 200,
+      "fetch_run_id": "t014-athol-style-dated",
+      "artifact_id": "61e8fd3cb1aee1ce5047ea5f30ebf79056a70574f974c737174e1513c8a94691",
+      "byte_length": 1736,
+      "effective_at": "2026-11-16T14:00:00Z",
+      "page_kind": "static_mortgage_rate_table",
+      "rows": [
+        {
+          "row_id": "purchase-30-year",
+          "product_family": "mortgage",
+          "purpose": "purchase",
+          "term_months": 360,
+          "note_rate": "6.375",
+          "apr": "6.441",
+          "points": "0.000",
+          "canonical_scenario": "purchase_30y_fixed",
+          "ranking": "assumptions_match",
+          "ranking_reason": "Stated assumptions match the canonical 30-year fixed purchase scenario, including a 360-month term."
+        },
+        {
+          "row_id": "purchase-15-year",
+          "product_family": "mortgage",
+          "purpose": "purchase",
+          "term_months": 180,
+          "note_rate": "5.625",
+          "apr": "5.710",
+          "points": "0.000",
+          "canonical_scenario": "purchase_30y_fixed",
+          "ranking": "must_not_rank",
+          "ranking_reason": "The row states a note rate and an APR, but the term is 180 months. The canonical purchase scenario is 360 months, so this row must not rank."
+        }
+      ],
+      "evidence_phrases": [
+        "2026-11-16T14:00:00Z",
+        "id=\"purchase-30-year\"",
+        "6.375%",
+        "6.441%",
+        "Term 30 years (360 months).",
+        "id=\"purchase-15-year\"",
+        "5.625%",
+        "5.710%",
+        "Term 15 years (180 months)."
+      ]
+    },
+    {
       "case_id": "stoughton-style",
       "fixture": "stoughton_style_consumer_loans.html",
       "source_url": "https://stoughton-style.example/auto-and-personal-loans",
