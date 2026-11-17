@@ -1,6 +1,7 @@
 """Show previous website checks missing injected defects, then corrected checks catching them."""
 
 from tests.site_audit import (
+    FORBIDDEN_RANKING_WORDS,
     LEGACY_RATE_FIGURE,
     RATE_FIGURE,
     RATE_FIGURE_EXAMPLES,
@@ -10,6 +11,7 @@ from tests.site_audit import (
     csp_problems,
     database_findings,
     executable_inline_scripts,
+    forbidden_ranking_problems,
     header_request_urls,
     legacy_asset_url_allowed,
     legacy_citation_ok,
@@ -134,3 +136,361 @@ def test_positive_rate_examples_are_the_detector_used_for_pages() -> None:
     """Ordinary rate figures are the examples the page scans must reject."""
     for sample in RATE_FIGURE_EXAMPLES:
         assert RATE_FIGURE.fullmatch(sample)
+
+
+def test_forbidden_ranking_words_guard_detects_ranking_claims() -> None:
+    """Guard catches forbidden ranking wording and permits neutral comparison text."""
+    for word in FORBIDDEN_RANKING_WORDS:
+        sample = f"Discover our {word} offers this month"
+        problems = forbidden_ranking_problems(sample)
+        assert problems == [f"forbidden ranking word '{word}'"]
+
+    multiple = "We show the best and cheapest top options recommended for you"
+    assert forbidden_ranking_problems(multiple) == [
+        "forbidden ranking word 'best'",
+        "forbidden ranking word 'cheapest'",
+        "forbidden ranking word 'recommended'",
+        "forbidden ranking word 'top'",
+    ]
+
+    clean = "Compare publicly advertised terms sorted by institution name or observed date"
+    assert forbidden_ranking_problems(clean) == []
+
+    # Superlatives and ranking phrases in titles, headings, alt text and body
+    assert forbidden_ranking_problems("Find the lowest rates today") == [
+        "forbidden ranking word 'lowest'"
+    ]
+    assert forbidden_ranking_problems("<title>The #1 Credit Union in MA</title>") == [
+        "forbidden ranking word '#1'"
+    ]
+    assert forbidden_ranking_problems("<h1>Cheapest mortgage options</h1>") == [
+        "forbidden ranking word 'cheapest'"
+    ]
+    assert forbidden_ranking_problems('<img src="banner.png" alt="our top recommended picks">') == [
+        "forbidden ranking word 'recommended'",
+        "forbidden ranking word 'top'",
+    ]
+
+
+def test_database_findings_narrows_snapshot_sqlite_to_readonly() -> None:
+    """Snapshot module SQLite exception forbids write methods and statements."""
+    from tests.site_audit import database_findings
+
+    clean_sources = {
+        "cu_rates.web": "import cu_rates.snapshot.reader",
+        "cu_rates.snapshot.reader": (
+            "import sqlite3\n"
+            "conn = sqlite3.connect('file:pub.sqlite?mode=ro', uri=True)\n"
+            "conn.execute('SELECT * FROM info')"
+        ),
+    }
+    assert database_findings(clean_sources, ["cu_rates.web"]) == []
+
+    commit_sources = {
+        "cu_rates.web": "import cu_rates.snapshot.reader",
+        "cu_rates.snapshot.reader": (
+            "import sqlite3\n"
+            "conn = sqlite3.connect('file:pub.sqlite?mode=ro', uri=True)\n"
+            "conn.commit()"
+        ),
+    }
+    findings = database_findings(commit_sources, ["cu_rates.web"])
+    assert any("sqlite write method" in f for f in findings)
+
+    insert_sources = {
+        "cu_rates.web": "import cu_rates.snapshot.reader",
+        "cu_rates.snapshot.reader": (
+            "import sqlite3\n"
+            "conn = sqlite3.connect('file:pub.sqlite?mode=ro', uri=True)\n"
+            "conn.execute('INSERT INTO test VALUES (1)')"
+        ),
+    }
+    findings = database_findings(insert_sources, ["cu_rates.web"])
+    assert any("sqlite write statement" in f for f in findings)
+
+
+def test_forbidden_ranking_words_split_markup_and_entities() -> None:
+    """Split markup and entities cannot bypass forbidden ranking word detection."""
+    from tests.site_audit import forbidden_ranking_problems
+
+    # Split markup words
+    assert "forbidden ranking word 'lowest'" in forbidden_ranking_problems("<b>low</b>est rate")
+    assert "forbidden ranking word 'best'" in forbidden_ranking_problems("The <i>be</i>st lender")
+    assert "forbidden ranking word '#1'" in forbidden_ranking_problems("Rated <b>#</b>1 CU")
+
+    # Decoded entity checks
+    assert "forbidden ranking word '#1'" in forbidden_ranking_problems("We are &#35;1 in MA")
+    assert "forbidden ranking word '#1'" in forbidden_ranking_problems("Rated &num;1 overall")
+    assert "forbidden ranking word 'lowest'" in forbidden_ranking_problems("low&#101;st rates")
+
+    # Clean text with no forbidden words passes
+    assert forbidden_ranking_problems("<p>Compare <b>advertised</b> mortgage terms</p>") == []
+
+
+def test_database_findings_forbids_variable_writes_mutating_pragmas_and_writable_connections() -> (
+    None
+):
+    """AST database scan catches variable SQL writes, mutating PRAGMAs,
+    executescript, and writable connections.
+    """
+    from tests.site_audit import database_findings
+
+    # Variable-built write statement
+    var_write_sources = {
+        "cu_rates.web": "import cu_rates.snapshot.reader",
+        "cu_rates.snapshot.reader": (
+            "import sqlite3\n"
+            "conn = sqlite3.connect('file:pub.sqlite?mode=ro', uri=True)\n"
+            "sql = 'INSERT INTO snapshot VALUES (1)'\n"
+            "conn.execute(sql)"
+        ),
+    }
+    findings = database_findings(var_write_sources, ["cu_rates.web"])
+    assert any("sqlite write statement" in f for f in findings)
+
+    # Mutating PRAGMA
+    pragma_sources = {
+        "cu_rates.web": "import cu_rates.snapshot.reader",
+        "cu_rates.snapshot.reader": (
+            "import sqlite3\n"
+            "conn = sqlite3.connect('file:pub.sqlite?mode=ro', uri=True)\n"
+            "conn.execute('PRAGMA journal_mode=WAL')"
+        ),
+    }
+    findings = database_findings(pragma_sources, ["cu_rates.web"])
+    assert any("sqlite mutating pragma" in f for f in findings)
+
+    # executescript
+    execscript_sources = {
+        "cu_rates.web": "import cu_rates.snapshot.reader",
+        "cu_rates.snapshot.reader": (
+            "import sqlite3\n"
+            "conn = sqlite3.connect('file:pub.sqlite?mode=ro', uri=True)\n"
+            "conn.executescript('SELECT 1;')"
+        ),
+    }
+    findings = database_findings(execscript_sources, ["cu_rates.web"])
+    assert any("sqlite forbidden executescript" in f for f in findings)
+
+    # Writable connection without mode=ro
+    writable_sources = {
+        "cu_rates.web": "import cu_rates.snapshot.reader",
+        "cu_rates.snapshot.reader": (
+            "import sqlite3\nconn = sqlite3.connect('pub.sqlite')\nconn.execute('SELECT 1')"
+        ),
+    }
+    findings = database_findings(writable_sources, ["cu_rates.web"])
+    assert any("sqlite writable connection" in f for f in findings)
+
+
+def test_sqlite_writable_connection_negative_controls() -> None:
+    """Negative controls rejecting uri=False, omitted uri=True, fragment mode=ro, and aliases."""
+    from tests.site_audit import database_findings
+
+    # 1. uri=False with mode=ro in URI string is rejected
+    uri_false_src = {
+        "cu_rates.web": "import cu_rates.snapshot.reader",
+        "cu_rates.snapshot.reader": (
+            "import sqlite3\n"
+            "conn = sqlite3.connect('file:pub.sqlite?mode=ro', uri=False)\n"
+            "conn.execute('SELECT 1')"
+        ),
+    }
+    findings = database_findings(uri_false_src, ["cu_rates.web"])
+    assert any("sqlite writable connection" in f for f in findings)
+
+    # 2. Omitted uri=True (default uri=False) is rejected
+    omitted_uri_src = {
+        "cu_rates.web": "import cu_rates.snapshot.reader",
+        "cu_rates.snapshot.reader": (
+            "import sqlite3\n"
+            "conn = sqlite3.connect('file:pub.sqlite?mode=ro')\n"
+            "conn.execute('SELECT 1')"
+        ),
+    }
+    findings = database_findings(omitted_uri_src, ["cu_rates.web"])
+    assert any("sqlite writable connection" in f for f in findings)
+
+    # 3. Fragment-only mode=ro (#mode=ro) is rejected
+    fragment_ro_src = {
+        "cu_rates.web": "import cu_rates.snapshot.reader",
+        "cu_rates.snapshot.reader": (
+            "import sqlite3\n"
+            "conn = sqlite3.connect('file:pub.sqlite#mode=ro', uri=True)\n"
+            "conn.execute('SELECT 1')"
+        ),
+    }
+    findings = database_findings(fragment_ro_src, ["cu_rates.web"])
+    assert any("sqlite writable connection" in f for f in findings)
+
+    # 4. Aliased connect via import sqlite3 as x is rejected
+    alias_x_src = {
+        "cu_rates.web": "import cu_rates.snapshot.reader",
+        "cu_rates.snapshot.reader": (
+            "import sqlite3 as x\nconn = x.connect('pub.sqlite')\nconn.execute('SELECT 1')"
+        ),
+    }
+    findings = database_findings(alias_x_src, ["cu_rates.web"])
+    assert any("sqlite writable connection 'x.connect'" in f for f in findings)
+
+    # 5. Aliased connect via from sqlite3 import connect as c is rejected
+    alias_c_src = {
+        "cu_rates.web": "import cu_rates.snapshot.reader",
+        "cu_rates.snapshot.reader": (
+            "from sqlite3 import connect as c\nconn = c('pub.sqlite')\nconn.execute('SELECT 1')"
+        ),
+    }
+    findings = database_findings(alias_c_src, ["cu_rates.web"])
+    assert any("sqlite writable connection 'c'" in f for f in findings)
+
+    # 6. Direct imported connect without uri=True / mode=ro is rejected
+    import_connect_src = {
+        "cu_rates.web": "import cu_rates.snapshot.reader",
+        "cu_rates.snapshot.reader": (
+            "from sqlite3 import connect\nconn = connect('pub.sqlite')\nconn.execute('SELECT 1')"
+        ),
+    }
+    findings = database_findings(import_connect_src, ["cu_rates.web"])
+    assert any("sqlite writable connection 'connect'" in f for f in findings)
+
+    # 7. A PRAGMA query_only on a plain connection is NOT proof of read-only access
+    #    (the pragma can sit in unreachable code), so the audit still rejects it.
+    pragma_ro_src = {
+        "cu_rates.web": "import cu_rates.snapshot.reader",
+        "cu_rates.snapshot.reader": (
+            "import sqlite3\n"
+            "conn = sqlite3.connect('published.sqlite')\n"
+            "conn.execute('PRAGMA query_only=ON')\n"
+            "conn.execute('SELECT 1')"
+        ),
+    }
+    findings = database_findings(pragma_ro_src, ["cu_rates.web"])
+    assert any("sqlite writable connection 'sqlite3.connect'" in f for f in findings)
+
+    # 8. URI query parsing: a fragment or a filename containing mode=ro is not read-only
+    for bad in ("file:pub.sqlite#mode=ro", "file:x?notmode=ro", "file:mode=ro.sqlite"):
+        bad_src = {
+            "cu_rates.web": "import cu_rates.snapshot.reader",
+            "cu_rates.snapshot.reader": (
+                "import sqlite3\n"
+                f"conn = sqlite3.connect({bad!r}, uri=True)\n"
+                "conn.execute('SELECT 1')"
+            ),
+        }
+        findings = database_findings(bad_src, ["cu_rates.web"])
+        assert any("sqlite writable connection" in f for f in findings), bad
+    good_src = {
+        "cu_rates.web": "import cu_rates.snapshot.reader",
+        "cu_rates.snapshot.reader": (
+            "import sqlite3\n"
+            "conn = sqlite3.connect('file:pub.sqlite?mode=ro', uri=True)\n"
+            "conn.execute('SELECT 1')"
+        ),
+    }
+    assert database_findings(good_src, ["cu_rates.web"]) == []
+
+
+def test_sqlite_sql_and_pragma_negative_controls() -> None:
+    """Negative controls: variable SQL, f-strings and mutating PRAGMAs are rejected."""
+    from tests.site_audit import database_findings
+
+    # 1. Unresolved variable SQL passed to execute is rejected
+    unresolved_var_src = {
+        "cu_rates.web": "import cu_rates.snapshot.reader",
+        "cu_rates.snapshot.reader": (
+            "import sqlite3\n"
+            "conn = sqlite3.connect('file:pub.sqlite?mode=ro', uri=True)\n"
+            "conn.execute(dynamic_sql)"
+        ),
+    }
+    findings = database_findings(unresolved_var_src, ["cu_rates.web"])
+    assert any("sqlite forbidden non-literal SQL 'dynamic_sql'" in f for f in findings)
+
+    # 2. f-string SQL passed to execute is rejected
+    fstring_src = {
+        "cu_rates.web": "import cu_rates.snapshot.reader",
+        "cu_rates.snapshot.reader": (
+            "import sqlite3\n"
+            "conn = sqlite3.connect('file:pub.sqlite?mode=ro', uri=True)\n"
+            "table = 'snapshot'\n"
+            "conn.execute(f'SELECT * FROM {table}')"
+        ),
+    }
+    findings = database_findings(fstring_src, ["cu_rates.web"])
+    assert any("sqlite forbidden non-literal SQL" in f for f in findings)
+
+    # 3. Concatenated non-allowlisted SQL is rejected
+    concat_src = {
+        "cu_rates.web": "import cu_rates.snapshot.reader",
+        "cu_rates.snapshot.reader": (
+            "import sqlite3\n"
+            "conn = sqlite3.connect('file:pub.sqlite?mode=ro', uri=True)\n"
+            "conn.execute('DELETE FROM ' + 'public_offers')"
+        ),
+    }
+    findings = database_findings(concat_src, ["cu_rates.web"])
+    assert any("sqlite write statement" in f for f in findings)
+
+    # 4. Annotated SQL assignment with write statement is detected and rejected
+    annotated_src = {
+        "cu_rates.web": "import cu_rates.snapshot.reader",
+        "cu_rates.snapshot.reader": (
+            "import sqlite3\n"
+            "conn = sqlite3.connect('file:pub.sqlite?mode=ro', uri=True)\n"
+            "sql: str = 'INSERT INTO snapshot VALUES (1)'\n"
+            "conn.execute(sql)"
+        ),
+    }
+    findings = database_findings(annotated_src, ["cu_rates.web"])
+    assert any("sqlite write statement" in f for f in findings)
+
+    # 5. Bare mutating PRAGMA without '=' (writable_schema) is rejected
+    bare_writable_src = {
+        "cu_rates.web": "import cu_rates.snapshot.reader",
+        "cu_rates.snapshot.reader": (
+            "import sqlite3\n"
+            "conn = sqlite3.connect('file:pub.sqlite?mode=ro', uri=True)\n"
+            "conn.execute('PRAGMA writable_schema')"
+        ),
+    }
+    findings = database_findings(bare_writable_src, ["cu_rates.web"])
+    assert any("sqlite mutating pragma" in f for f in findings)
+
+    # 6. Bare mutating PRAGMA (synchronous) is rejected
+    bare_sync_src = {
+        "cu_rates.web": "import cu_rates.snapshot.reader",
+        "cu_rates.snapshot.reader": (
+            "import sqlite3\n"
+            "conn = sqlite3.connect('file:pub.sqlite?mode=ro', uri=True)\n"
+            "conn.execute('PRAGMA synchronous')"
+        ),
+    }
+    findings = database_findings(bare_sync_src, ["cu_rates.web"])
+    assert any("sqlite mutating pragma" in f for f in findings)
+
+    # 7. Mutating PRAGMA with '=' (user_version=2) is rejected
+    mutating_user_ver_src = {
+        "cu_rates.web": "import cu_rates.snapshot.reader",
+        "cu_rates.snapshot.reader": (
+            "import sqlite3\n"
+            "conn = sqlite3.connect('file:pub.sqlite?mode=ro', uri=True)\n"
+            "conn.execute('PRAGMA user_version=2')"
+        ),
+    }
+    findings = database_findings(mutating_user_ver_src, ["cu_rates.web"])
+    assert any("sqlite mutating pragma" in f for f in findings)
+
+    # 8. Safe read-only introspection PRAGMAs pass without error
+    introspection_src = {
+        "cu_rates.web": "import cu_rates.snapshot.reader",
+        "cu_rates.snapshot.reader": (
+            "import sqlite3\n"
+            "conn = sqlite3.connect('file:pub.sqlite?mode=ro', uri=True)\n"
+            "conn.execute('PRAGMA user_version')\n"
+            "conn.execute('PRAGMA journal_mode')\n"
+            "conn.execute('PRAGMA quick_check')\n"
+            "conn.execute('SELECT 1')"
+        ),
+    }
+    findings = database_findings(introspection_src, ["cu_rates.web"])
+    assert findings == []
