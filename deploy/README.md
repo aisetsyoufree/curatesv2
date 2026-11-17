@@ -37,6 +37,7 @@ All persistent data, code, virtual environments, and evidence artifacts reside u
 /var/lib/cu-rates/
 ├── app/                  # Application code repository clone
 ├── venv/                 # uv-managed Python 3.12 virtual environment (deploy group)
+├── .cache/               # uv package cache directory (mode 0755)
 ├── snapshots/            # Public snapshot directory (read-only for web process)
 │   ├── pointer.json      # Atomic JSON pointer to current active snapshot version
 │   ├── denylist.json     # Emergency withdrawal denylist
@@ -52,10 +53,13 @@ All persistent data, code, virtual environments, and evidence artifacts reside u
 /run/cu-rates-worker/     # Ephemeral worker runtime tmpfs directory (mode 0750)
 ```
 
+### Hardcoded Unit Paths & CU_RATES_ROOT Scope
+> **Notice on Hardcoded Unit Paths:** The systemd unit files (`cu-rates-web.service`, `cu-rates-worker.service`, `cu-rates-worker.timer`) assume the hardcoded production root path `/var/lib/cu-rates`. The environment variable `CU_RATES_ROOT` is supported by `deploy/install.sh` solely for installer testing, custom staging, and sandbox validation; it does NOT rewrite or template the hardcoded unit paths in `/etc/systemd/system/`. Deployments intending to use an alternate root path must update the unit files accordingly.
+
 ### Architectural Isolation Principles (`MASTER.md` §6, §7)
-- **Separation of Web and Worker:** The web service process (`cu-rates-web.service`) **NEVER opens or references the worker database** (`/var/lib/cu-rates/data`). The web process reads only verified public snapshots (`/var/lib/cu-rates/snapshots/`) and static application code. Inaccessible paths are enforced in systemd (`InaccessiblePaths=/var/lib/cu-rates/data /var/lib/cu-rates/artifacts /var/lib/cu-rates/backups`) and `StateDirectory` is omitted from the web unit so it cannot write application data.
+- **Separation of Web and Worker:** The web service process (`cu-rates-web.service`) **NEVER opens or references the worker database** (`/var/lib/cu-rates/data`). The web process reads only verified public snapshots (`/var/lib/cu-rates/snapshots/`) and static application code. Inaccessible paths are enforced in systemd (`InaccessiblePaths=/var/lib/cu-rates/data /var/lib/cu-rates/artifacts /var/lib/cu-rates/backups`). `StateDirectory` is omitted from both web and worker service units so systemd does not grant broad write access to `/var/lib/cu-rates`; the worker unit explicitly restricts writes to `ReadWritePaths=/var/lib/cu-rates/data /var/lib/cu-rates/artifacts /var/lib/cu-rates/snapshots`.
 - **Unprivileged Execution:** All services execute as the dedicated system user `cu-rates` (group `cu-rates`) with no interactive shell (`/usr/sbin/nologin`).
-- **Hardened Sandboxing:** Systemd units enforce `ProtectSystem=strict`, `ProtectHome=true`, `PrivateTmp=true`, `NoNewPrivileges=true`, `PrivateDevices=true`, `ProtectClock=true`, `ProtectHostname=true`, `ProtectProc=invisible`, `ProcSubset=pid`, `CapabilityBoundingSet=` (empty), `AmbientCapabilities=` (empty), `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`, `SystemCallArchitectures=native`, `SystemCallFilter=@system-service`, `UMask=0077`, kernel tunables protection, strict `ReadWritePaths`, and resource quotas (`MemoryMax`, `TasksMax`, `CPUQuota`).
+- **Hardened Sandboxing:** Systemd units enforce `ProtectSystem=strict`, `ProtectHome=true`, `PrivateTmp=true`, `NoNewPrivileges=true`, `PrivateDevices=true`, `ProtectClock=true`, `ProtectHostname=true`, `ProtectProc=invisible`, `ProcSubset=pid`, `CapabilityBoundingSet=` (empty), `AmbientCapabilities=` (empty), `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`, `SystemCallArchitectures=native`, `SystemCallFilter=@system-service`, `UMask=0077`, kernel tunables protection, strict `ReadWritePaths`, and resource quotas (`MemoryMax`, `TasksMax`, `CPUQuota`). Private temporary files are protected with `PrivateTmp=true`; `/tmp` is omitted from `ReadWritePaths`.
 
 ---
 
@@ -64,39 +68,39 @@ All persistent data, code, virtual environments, and evidence artifacts reside u
 The deployment bundle provides an idempotent installer `deploy/install.sh`.  
 It defaults to `--dry-run` and refuses to make changes unless `--apply` is passed.
 
-### Step 1: Clone Repository
-Clone the repository to the NVMe root location:
+### Step 1: Preview Installation (Dry-Run)
+Inspect the planned actions on an empty root before applying modifications:
 ```bash
-sudo git clone https://github.com/aisetsyoufree/curatesv2.git /var/lib/cu-rates/app
-cd /var/lib/cu-rates/app
+sudo bash deploy/install.sh --dry-run
 ```
 
-### Step 2: Preview Installation (Dry-Run)
-Inspect the planned actions without modifying the system (pass `--adopt` because Step 1 cloned into `/var/lib/cu-rates/app`, creating a non-empty root):
+### Step 2: Apply Filesystem and Service Setup
+Execute idempotent provisioning on the empty `/var/lib/cu-rates` root first to create the directory layout and systemd units:
 ```bash
-sudo bash deploy/install.sh --dry-run --adopt
+sudo bash deploy/install.sh --apply
 ```
-
-### Step 3: Apply Filesystem and Service Setup
-Execute idempotent provisioning adopting the existing repository tree:
-```bash
-sudo bash deploy/install.sh --apply --adopt
-```
-*(Passing `--adopt` instructs `install.sh` to safely adopt `/var/lib/cu-rates` and its existing `/var/lib/cu-rates/app` clone without failing on the non-empty root guard).*
+*(If `/var/lib/cu-rates` already exists and is non-empty from a previous deployment, pass `--adopt` to proceed safely without recursive chown).*
 
 This step:
 - Creates the unprivileged `cu-rates` user and group.
-- Creates the layout under `/var/lib/cu-rates` with safe ownership and permissions (chowning only what is created; never running `chown -R` on existing directories).
+- Creates the layout under `/var/lib/cu-rates` (including `/var/lib/cu-rates/app` and `/var/lib/cu-rates/.cache`) with safe ownership and permissions (`cu-rates:cu-rates`), chowning only what is created; it never runs `chown -R` on existing directories.
 - Copies `deploy/env.example` to `/etc/cu-rates/cu-rates.env` (mode 0600) if not present.
 - Installs `cu-rates-web.service`, `cu-rates-worker.service`, and `cu-rates-worker.timer` into `/etc/systemd/system/`.
 - Enables `cu-rates-web.service` on boot.
 - **Explicitly ensures `cu-rates-worker.service` and `cu-rates-worker.timer` remain DISABLED per Decision D-15.**
 
+### Step 3: Clone Repository as Service User
+Clone the application repository into the pre-created `/var/lib/cu-rates/app` directory AS the dedicated `cu-rates` service user (avoiding root ownership and git dubious ownership issues):
+```bash
+sudo -u cu-rates git clone https://github.com/aisetsyoufree/curatesv2.git /var/lib/cu-rates/app
+cd /var/lib/cu-rates/app
+```
+
 ### Step 4: Provision Virtual Environment
-Install production dependencies including Gunicorn into the isolated venv at `/var/lib/cu-rates/venv`:
+Install production dependencies including Gunicorn into the isolated venv at `/var/lib/cu-rates/venv` as the `cu-rates` service user, setting `UV_PROJECT_ENVIRONMENT` and a writable `UV_CACHE_DIR` inside the state dir:
 ```bash
 cd /var/lib/cu-rates/app
-sudo -u cu-rates UV_PROJECT_ENVIRONMENT=/var/lib/cu-rates/venv uv sync --locked --no-dev --group deploy
+sudo -u cu-rates UV_PROJECT_ENVIRONMENT=/var/lib/cu-rates/venv UV_CACHE_DIR=/var/lib/cu-rates/.cache/uv uv sync --locked --no-dev --group deploy
 ```
 
 ### Step 5: Configure Environment
@@ -148,7 +152,7 @@ Upgrades preserve operational state and snapshot data.
 
 2. **Update Virtual Environment:**
    ```bash
-   sudo -u cu-rates UV_PROJECT_ENVIRONMENT=/var/lib/cu-rates/venv uv sync --locked --no-dev --group deploy
+   sudo -u cu-rates UV_PROJECT_ENVIRONMENT=/var/lib/cu-rates/venv UV_CACHE_DIR=/var/lib/cu-rates/.cache/uv uv sync --locked --no-dev --group deploy
    ```
 
 3. **Reload Systemd Units (if changed):**
@@ -181,17 +185,23 @@ To roll back application code to a prior commit:
 ```bash
 cd /var/lib/cu-rates/app
 sudo -u cu-rates git checkout <previous-tag-or-sha>
-sudo -u cu-rates UV_PROJECT_ENVIRONMENT=/var/lib/cu-rates/venv uv sync --locked --no-dev --group deploy
+sudo -u cu-rates UV_PROJECT_ENVIRONMENT=/var/lib/cu-rates/venv UV_CACHE_DIR=/var/lib/cu-rates/.cache/uv uv sync --locked --no-dev --group deploy
 sudo systemctl restart cu-rates-web.service
 ```
 
-### Snapshot Rollback
-Public snapshot publication uses atomic pointer swaps (`MASTER.md` §6):
+### Snapshot Rollback (Not yet effective)
+> **STATUS: NOT WIRED / NOT YET EFFECTIVE**  
+> Public snapshot rollback via atomic pointer swaps (`MASTER.md` §6) is **not yet wired** in the web application (`src/cu_rates/web` never opens `pointer.json`). Wiring dynamic snapshot switching requires the web app to integrate `SnapshotReader` in a later task. Until wired, updating `pointer.json` has no effect on served traffic without manual app reconfiguration and restart.
+
+Target procedure once wired:
 1. To roll back to a previous snapshot, update `/var/lib/cu-rates/snapshots/pointer.json` with the previous `snapshot_id` and hash.
 2. The web application dynamically re-reads the snapshot version on request without requiring a service restart.
 
-### Emergency Withdrawal Denylist
-To instantly withdraw an offer, institution, product, or snapshot:
+### Emergency Withdrawal Denylist (Not yet effective)
+> **STATUS: NOT WIRED / NOT YET EFFECTIVE**  
+> Emergency withdrawal denylisting (`MASTER.md` §5, §6) is **not yet wired** in the web application (`src/cu_rates/web` never opens `denylist.json`). Dropping denied rows dynamically requires the web app to integrate `SnapshotReader` denylist filtering in a later task. Until wired, editing `denylist.json` has no effect on served traffic.
+
+Target procedure once wired:
 1. Append the target ID to `/var/lib/cu-rates/snapshots/denylist.json` (`MASTER.md` §5, §6).
 2. The web layer filters denied entities on the next incoming request with zero delay.
 

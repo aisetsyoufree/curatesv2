@@ -108,8 +108,16 @@ def test_systemd_hardening_and_resource_limits() -> None:
 
     worker_parsed = parse_systemd_unit(SYSTEMD_DIR / "cu-rates-worker.service")
     worker_sec = worker_parsed.get("Service", {})
-    assert worker_sec["StateDirectory"] == ["cu-rates"]
+    assert "StateDirectory" not in worker_sec, (
+        "cu-rates-worker.service must not define StateDirectory"
+    )
     assert worker_sec["Restart"] == ["no"], "cu-rates-worker.service must have Restart=no"
+    worker_rw = set(" ".join(worker_sec.get("ReadWritePaths", [])).split())
+    assert worker_rw == {
+        "/var/lib/cu-rates/data",
+        "/var/lib/cu-rates/artifacts",
+        "/var/lib/cu-rates/snapshots",
+    }, f"worker ReadWritePaths must be exactly data, artifacts, and snapshots, got {worker_rw}"
 
 
 def test_loopback_only_binding() -> None:
@@ -229,8 +237,9 @@ def test_execstart_binary_paths_match_readme_venv() -> None:
     documented_venv = match.group(1)
     assert documented_venv == "/var/lib/cu-rates/venv"
     assert (
-        "UV_PROJECT_ENVIRONMENT=/var/lib/cu-rates/venv uv sync --locked --no-dev --group deploy"
-        in (readme_content)
+        "UV_PROJECT_ENVIRONMENT=/var/lib/cu-rates/venv"
+        " UV_CACHE_DIR=/var/lib/cu-rates/.cache/uv uv sync --locked --no-dev --group deploy"
+        in readme_content
     )
 
     # Verify each systemd service unit's ExecStart binary is under documented venv
@@ -367,41 +376,106 @@ def test_install_script_refuses_non_empty_root(tmp_path: Path) -> None:
 
 
 def test_documented_runbook_order_against_install_checks(tmp_path: Path) -> None:
-    """Verify that documented runbook order (clone then install --adopt) passes checks."""
+    """Verify documented runbook order and that install.sh creates app/ owned by cu-rates."""
     readme = (DEPLOY_DIR / "README.md").read_text(encoding="utf-8")
 
-    # Assert that README documents --adopt for Step 2 and Step 3
-    assert "install.sh --dry-run --adopt" in readme, "README must document --adopt for dry-run"
-    assert "install.sh --apply --adopt" in readme, "README must document --adopt for apply"
+    # Documented order assertions:
+    # 1. install.sh --apply runs on empty root
+    # 2. git clone runs as cu-rates into pre-created app/
+    # 3. uv sync runs as cu-rates with UV_CACHE_DIR and UV_PROJECT_ENVIRONMENT
+    apply_step = "sudo bash deploy/install.sh --apply"
+    clone_step = (
+        "sudo -u cu-rates git clone https://github.com/aisetsyoufree/curatesv2.git"
+        " /var/lib/cu-rates/app"
+    )
+    sync_step = (
+        "sudo -u cu-rates UV_PROJECT_ENVIRONMENT=/var/lib/cu-rates/venv"
+        " UV_CACHE_DIR=/var/lib/cu-rates/.cache/uv uv sync --locked --no-dev --group deploy"
+    )
 
-    # Simulate Step 1: clone creates app subdirectory inside CU_RATES_ROOT
-    simulated_root = tmp_path / "var-lib-cu-rates"
-    simulated_app = simulated_root / "app"
-    simulated_app.mkdir(parents=True)
-    (simulated_app / "README.md").write_text("simulated repo", encoding="utf-8")
+    assert apply_step in readme, "README must document install.sh --apply step"
+    assert clone_step in readme, "README must document git clone as cu-rates user into app/"
+    assert sync_step in readme, "README must document uv sync with UV_CACHE_DIR"
+
+    apply_idx = readme.index(apply_step)
+    clone_idx = readme.index(clone_step)
+    sync_idx = readme.index(sync_step)
+    assert apply_idx < clone_idx < sync_idx, (
+        f"Documented order must be install.sh ({apply_idx})"
+        f" -> clone ({clone_idx}) -> uv sync ({sync_idx})"
+    )
 
     install_sh = DEPLOY_DIR / "install.sh"
-    env = {**os.environ, "CU_RATES_ROOT": str(simulated_root)}
+    test_root = tmp_path / "empty-root"
 
-    # Without --adopt, running install.sh against the cloned root must fail
-    res_fail = subprocess.run(
+    # Assert install.sh --dry-run plans creating app/ and setting ownership to cu-rates:cu-rates
+    res_dry = subprocess.run(
         ["bash", str(install_sh), "--dry-run"],
         capture_output=True,
         text=True,
-        env=env,
+        env={**os.environ, "CU_RATES_ROOT": str(test_root)},
     )
-    assert res_fail.returncode != 0
-    assert "--adopt" in res_fail.stderr
+    assert res_dry.returncode == 0
+    assert f"Would create directory '{test_root}/app'" in res_dry.stdout
+    assert (
+        f"Would set ownership of created directory '{test_root}/app' to cu-rates:cu-rates"
+        in res_dry.stdout
+    )
 
-    # With the documented --adopt flag, running install.sh must succeed
-    res_adopt = subprocess.run(
-        ["bash", str(install_sh), "--dry-run", "--adopt"],
+    # Assert install.sh --apply executes mkdir and chown cu-rates:cu-rates on app/ using fake-PATH
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    log_file = tmp_path / "actions.log"
+
+    (fake_bin / "id").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (fake_bin / "id").chmod(0o755)
+
+    (fake_bin / "useradd").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (fake_bin / "useradd").chmod(0o755)
+
+    (fake_bin / "systemctl").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (fake_bin / "systemctl").chmod(0o755)
+
+    (fake_bin / "install").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (fake_bin / "install").chmod(0o755)
+
+    (fake_bin / "chmod").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (fake_bin / "chmod").chmod(0o755)
+
+    mkdir_script = """#!/bin/sh
+case "$*" in
+    *"/etc"*|*"/run"*) exit 0 ;;
+    *) exec /bin/mkdir "$@" ;;
+esac
+"""
+    (fake_bin / "mkdir").write_text(mkdir_script, encoding="utf-8")
+    (fake_bin / "mkdir").chmod(0o755)
+
+    chown_script = f"""#!/bin/sh
+echo "chown $@" >> "{log_file}"
+exit 0
+"""
+    (fake_bin / "chown").write_text(chown_script, encoding="utf-8")
+    (fake_bin / "chown").chmod(0o755)
+
+    env_apply = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+        "CU_RATES_ROOT": str(test_root),
+    }
+
+    res_apply = subprocess.run(
+        ["bash", str(install_sh), "--apply"],
         capture_output=True,
         text=True,
-        env=env,
+        env=env_apply,
     )
-    assert res_adopt.returncode == 0
-    assert "[DRY-RUN]" in res_adopt.stdout
+    assert res_apply.returncode == 0, f"install.sh --apply failed: {res_apply.stderr}"
+    assert log_file.is_file(), "Fake chown was never invoked"
+    chown_logs = log_file.read_text(encoding="utf-8")
+    assert f"chown cu-rates:cu-rates {test_root}/app" in chown_logs, (
+        f"install.sh --apply did not chown app/ to cu-rates:cu-rates. Logs:\n{chown_logs}"
+    )
 
 
 def test_install_script_no_hidden_failures_or_recursive_chown() -> None:
@@ -566,3 +640,47 @@ def test_deploy_readme_runbook_completeness() -> None:
 
     for section in required_sections:
         assert section in readme, f"README.md missing section: {section}"
+
+
+def test_rollback_and_denylist_disclosed_as_not_yet_effective() -> None:
+    """Verify README discloses rollback and denylist controls are not yet wired."""
+    readme = (DEPLOY_DIR / "README.md").read_text(encoding="utf-8")
+
+    # Snapshot rollback section must disclose that it is not yet effective / wired
+    assert "Snapshot Rollback (Not yet effective)" in readme
+    assert "not yet wired" in readme
+    assert "SnapshotReader" in readme
+    assert "src/cu_rates/web" in readme
+
+    # Emergency withdrawal denylist section must disclose that it is not yet effective / wired
+    assert "Emergency Withdrawal Denylist (Not yet effective)" in readme
+    assert "pointer.json" in readme
+    assert "denylist.json" in readme
+
+
+def test_units_omit_tmp_from_readwritepaths_with_privatetmp() -> None:
+    """Verify that neither service unit lists /tmp in ReadWritePaths when PrivateTmp=true."""
+    service_files = [
+        SYSTEMD_DIR / "cu-rates-web.service",
+        SYSTEMD_DIR / "cu-rates-worker.service",
+    ]
+    for sf in service_files:
+        parsed = parse_systemd_unit(sf)
+        sec = parsed.get("Service", {})
+        assert sec.get("PrivateTmp") == ["true"], f"{sf.name} must have PrivateTmp=true"
+        rw_entries = sec.get("ReadWritePaths", [])
+        rw_paths = [p for entry in rw_entries for p in entry.split()]
+        assert "/tmp" not in rw_paths, f"{sf.name} must not list /tmp in ReadWritePaths"
+
+
+def test_readme_discloses_cu_rates_root_scope_and_hardcoded_unit_paths() -> None:
+    """Verify README documents unit paths assume /var/lib/cu-rates and CU_RATES_ROOT scope."""
+    readme = (DEPLOY_DIR / "README.md").read_text(encoding="utf-8")
+
+    assert "CU_RATES_ROOT" in readme
+    assert "/var/lib/cu-rates" in readme
+    assert "assume the hardcoded production root path `/var/lib/cu-rates`" in readme
+    assert (
+        "`CU_RATES_ROOT` is supported by `deploy/install.sh` solely for installer testing" in readme
+    )
+    assert "does NOT rewrite or template the hardcoded unit paths" in readme

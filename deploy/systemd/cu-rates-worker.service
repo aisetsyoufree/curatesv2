@@ -17,7 +17,6 @@ Restart=no
 
 RuntimeDirectory=cu-rates-worker
 RuntimeDirectoryMode=0750
-StateDirectory=cu-rates
 LogsDirectory=cu-rates
 UMask=0077
 
@@ -45,7 +44,7 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 
 # Filesystem Access: Worker writes to operational data, artifacts, and snapshots.
-ReadWritePaths=/var/lib/cu-rates/data /var/lib/cu-rates/artifacts /var/lib/cu-rates/snapshots /run/cu-rates-worker /tmp
+ReadWritePaths=/var/lib/cu-rates/data /var/lib/cu-rates/artifacts /var/lib/cu-rates/snapshots
 ReadOnlyPaths=/var/lib/cu-rates/app
 
 # Resource Limits (Raspberry Pi 5 with 16 GB RAM)
