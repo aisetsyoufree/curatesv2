@@ -134,14 +134,32 @@ class _Run:
     def __init__(self, total: float) -> None:
         self._deadline = time.monotonic() + total
         self._lock = threading.Lock()
-        self._sockets: list[socket.socket] = []
+        # Serialises teardown: whoever holds it severs every socket still tracked, so a later
+        # closer blocks until the earlier one is done. Never held across anything but _sever.
+        self._teardown_lock = threading.Lock()
+        self._sockets: list[socket.socket] = []  # a socket leaves only once it is severed
         self._state = self._OPEN  # guarded by _lock; never returns to open
         self.pool: httpcore.ConnectionPool | None = None
-        self._timer = threading.Timer(total, self._expire)
-        self._timer.daemon = True
+        self._timer: threading.Timer | None = None  # guarded by _lock
 
     def start(self) -> None:
-        self._timer.start()
+        self._arm()
+
+    def _arm(self) -> None:
+        """Schedule the watchdog for what is left of the absolute deadline, right now."""
+        with self._lock:
+            if self._state != self._OPEN:
+                return
+            timer = threading.Timer(max(self.remaining(), 0.0), self._fire)
+            timer.daemon = True
+            self._timer = timer
+            timer.start()
+
+    def _fire(self) -> None:
+        if self._state == self._OPEN and self.remaining() > 0:
+            self._arm()  # woke early: wait out the rest of the single deadline
+            return
+        self._expire()
 
     def remaining(self) -> float:
         return self._deadline - time.monotonic()
@@ -180,40 +198,45 @@ class _Run:
         with self._lock:
             if self._state == self._OPEN and self.remaining() > 0 and raw in self._sockets:
                 index = self._sockets.index(raw)
-                try:
-                    secured = wrap(raw)
-                except BaseException:
-                    self._sockets.pop(index)
-                    raise
+                # If wrapping fails, ``raw`` stays tracked; the caller severs it, then forgets.
+                secured = wrap(raw)
                 self._sockets[index] = secured
                 return secured
-            with contextlib.suppress(ValueError):
-                self._sockets.remove(raw)
         _sever(raw)
+        self.forget(raw)
         raise httpcore.ConnectTimeout("total time limit exceeded")
 
-    def _seal(self, state: str) -> list[socket.socket]:
-        """Atomically move out of open (once) and take ownership of every tracked socket."""
-        with self._lock:
-            if self._state == self._OPEN or state == self._CLOSED:
-                self._state = state
-            sockets, self._sockets = self._sockets, []
-        return sockets
-
     def forget(self, sock: socket.socket) -> None:
+        """Stop tracking a socket. Call only after it has been severed."""
         with self._lock, contextlib.suppress(ValueError):
             self._sockets.remove(sock)
 
+    def _teardown(self, state: str) -> None:
+        """Seal the run, then sever every tracked socket; return only once none remains.
+
+        Every closer (watchdog, abort, finish, transport close) runs this. Sockets stay
+        tracked until severed, and concurrent callers queue on the teardown lock, so no
+        caller can return while another is still mid-way through closing a socket.
+        """
+        with self._teardown_lock:
+            with self._lock:
+                if self._state == self._OPEN or state == self._CLOSED:
+                    self._state = state
+                pending = list(self._sockets)
+            for sock in pending:
+                _sever(sock)
+                self.forget(sock)
+
     def _expire(self) -> None:
-        for sock in self._seal(self._ABORTED):
-            _sever(sock)
+        self._teardown(self._ABORTED)
 
     def abort(self) -> None:
-        """Seal the run, then stop the watchdog, sever every socket, and close the pool."""
-        sockets = self._seal(self._CLOSED)
-        self._timer.cancel()  # only after the state is final: later registrations all fail
-        for sock in sockets:
-            _sever(sock)
+        """Seal the run, sever every socket, stop the watchdog, and close the pool."""
+        self._teardown(self._CLOSED)
+        with self._lock:
+            timer = self._timer  # state is final, so nothing can arm a newer one
+        if timer is not None:
+            timer.cancel()
         if self.pool is not None:
             self.pool.close()
 
@@ -250,14 +273,14 @@ class _PinnedStream(httpcore.NetworkStream):
             raise httpcore.WriteError(str(exc)) from exc
 
     def close(self) -> None:
-        self._backend.run.forget(self._sock)
         _sever(self._sock)
+        self._backend.run.forget(self._sock)  # only after it is closed: a closer must see it
 
     def _drop(self, secured: socket.socket | None) -> None:
         for sock in (secured, self._sock):
             if sock is not None:
-                self._backend.run.forget(sock)
                 _sever(sock)
+                self._backend.run.forget(sock)
 
     def start_tls(
         self,
@@ -366,20 +389,20 @@ class _PinnedBackend(httpcore.NetworkBackend):
                 sock.connect((str(address), port))
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             except TimeoutError as exc:
-                self.run.forget(sock)
                 _sever(sock)
+                self.run.forget(sock)
                 failure = httpcore.ConnectTimeout(str(exc))
                 if self.run.expired:
                     break
                 continue
             except OSError as exc:
-                self.run.forget(sock)
                 _sever(sock)
+                self.run.forget(sock)
                 failure = httpcore.ConnectError(str(exc))
                 continue
             except BaseException:
-                self.run.forget(sock)
                 _sever(sock)
+                self.run.forget(sock)
                 raise
             return self.accept(_PinnedStream(sock, self))
         raise failure if failure is not None else PinViolation("no pinned address")
@@ -519,9 +542,13 @@ class PinnedTransport(httpx.BaseTransport):
         self._closed = False  # guarded by _runs_lock
 
     def _finish(self, run: _Run) -> None:
-        with self._runs_lock:
-            self._runs.discard(run)
-        run.abort()
+        # The run stays tracked until its teardown has completed, so a concurrent close()
+        # still finds it and waits for that teardown instead of returning early.
+        try:
+            run.abort()
+        finally:
+            with self._runs_lock:
+                self._runs.discard(run)
 
     def close(self) -> None:
         """Seal the transport and sever every outstanding request, streaming bodies included."""

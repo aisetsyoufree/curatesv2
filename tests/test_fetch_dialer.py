@@ -436,6 +436,135 @@ def test_tls_wrap_after_the_run_is_sealed_never_wraps_and_closes_the_raw_socket(
     assert not wrapped and raw.fileno() == -1
 
 
+def test_start_tls_never_closes_an_unrelated_descriptor_when_an_abort_lands_mid_wrap(
+    lab: Lab, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Production path: abort fires between the descriptor handover and detach of the wrap."""
+    server = lab.serve(lambda conn, path: reply(conn))
+    transport = lab.transport(server)
+    state: dict[str, Any] = {}
+    real_detach = socket.socket.detach
+
+    def detach(self: socket.socket) -> int:
+        if threading.current_thread() is threading.main_thread() and "bystander" not in state:
+            (run,) = transport._runs
+            raw_fd = self.fileno()
+            aborter = threading.Thread(target=run.abort)
+            aborter.start()
+            aborter.join(timeout=0.3)  # an unsafe wrap lets the abort finish; a safe one blocks
+            filler: list[socket.socket] = []
+            bystander = socket.socket()
+            if not aborter.is_alive():
+                # The raw descriptor was freed under the wrapper: make a bystander reuse it.
+                while bystander.fileno() != raw_fd and len(filler) < 4096:
+                    filler.append(bystander)
+                    bystander = socket.socket()
+            for extra in filler:
+                extra.close()
+            state.update(bystander=bystander, aborter=aborter)
+        return real_detach(self)
+
+    monkeypatch.setattr(socket.socket, "detach", detach, raising=False)
+    with pytest.raises(httpx.HTTPError):
+        transport.handle_request(httpx.Request("GET", url_for(server)))
+    state["aborter"].join()
+    bystander = state["bystander"]
+    try:
+        bystander.getsockname()  # EBADF if the wrapper closed the reused descriptor number
+    finally:
+        bystander.close()
+
+
+def test_the_watchdog_is_scheduled_from_the_absolute_deadline() -> None:
+    run = fetch_dialer._Run(0.3)
+    started = time.monotonic()
+    time.sleep(0.2)  # slow setup between building the run and starting it
+    run.start()
+    sock = socket.socket()
+    run.register(sock)
+    time.sleep(0.4 - (time.monotonic() - started))  # deadline (0.3) plus a 0.1 s bound
+    assert sock.fileno() == -1
+    run.abort()
+
+
+def test_an_early_watchdog_wakeup_rechecks_the_deadline_and_rearms() -> None:
+    run = fetch_dialer._Run(60)
+    run.start()
+    sock = socket.socket()
+    run.register(sock)
+    run._fire()  # woke early: nothing may be severed while time remains
+    assert sock.fileno() != -1 and run._state == run._OPEN
+    run.abort()
+    assert sock.fileno() == -1
+
+
+def slow_sever(monkeypatch: pytest.MonkeyPatch) -> threading.Event:
+    """Make every sever linger after announcing itself, so a second closer can race it."""
+    began = threading.Event()
+    real = fetch_dialer._sever
+
+    def slow(sock: socket.socket) -> None:
+        began.set()
+        time.sleep(0.3)
+        real(sock)
+
+    monkeypatch.setattr(fetch_dialer, "_sever", slow)
+    return began
+
+
+def test_abort_waits_for_a_watchdog_that_is_mid_teardown(monkeypatch: pytest.MonkeyPatch) -> None:
+    run = fetch_dialer._Run(60)
+    sock = socket.socket()
+    run.register(sock)
+    began = slow_sever(monkeypatch)
+    watchdog = threading.Thread(target=run._expire)
+    watchdog.start()
+    assert began.wait(timeout=2)
+    run.abort()
+    assert sock.fileno() == -1 and not run._sockets  # nothing left open when abort returns
+    watchdog.join()
+
+
+def streaming_transport(lab: Lab) -> tuple[PinnedTransport, httpx.Response, list[socket.socket]]:
+    def stall(conn: ssl.SSLSocket, path: str) -> None:
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n")
+        time.sleep(3)
+
+    server = lab.serve(stall)
+    transport = lab.transport(server, read_timeout=20, total_timeout=30)
+    response = transport.handle_request(httpx.Request("GET", url_for(server)))
+    (run,) = transport._runs
+    socks = list(run._sockets)
+    assert socks
+    return transport, response, socks
+
+
+def test_a_second_transport_close_waits_for_the_first_to_finish_closing(
+    lab: Lab, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transport, _response, socks = streaming_transport(lab)
+    began = slow_sever(monkeypatch)
+    first = threading.Thread(target=transport.close)
+    first.start()
+    assert began.wait(timeout=2)
+    transport.close()
+    assert all(s.fileno() == -1 for s in socks) and not transport._runs
+    first.join()
+
+
+def test_transport_close_waits_for_a_response_close_that_is_mid_teardown(
+    lab: Lab, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transport, response, socks = streaming_transport(lab)
+    began = slow_sever(monkeypatch)
+    closer = threading.Thread(target=response.close)
+    closer.start()
+    assert began.wait(timeout=2)
+    transport.close()
+    assert all(s.fileno() == -1 for s in socks)
+    closer.join()
+
+
 def test_request_racing_transport_close_is_refused_and_sends_nothing(
     lab: Lab, monkeypatch: pytest.MonkeyPatch
 ) -> None:
