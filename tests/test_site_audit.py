@@ -1,6 +1,7 @@
 """Show previous website checks missing injected defects, then corrected checks catching them."""
 
 from tests.site_audit import (
+    FORBIDDEN_RANKING_WORDS,
     LEGACY_RATE_FIGURE,
     RATE_FIGURE,
     RATE_FIGURE_EXAMPLES,
@@ -10,6 +11,7 @@ from tests.site_audit import (
     csp_problems,
     database_findings,
     executable_inline_scripts,
+    forbidden_ranking_problems,
     header_request_urls,
     legacy_asset_url_allowed,
     legacy_citation_ok,
@@ -134,3 +136,22 @@ def test_positive_rate_examples_are_the_detector_used_for_pages() -> None:
     """Ordinary rate figures are the examples the page scans must reject."""
     for sample in RATE_FIGURE_EXAMPLES:
         assert RATE_FIGURE.fullmatch(sample)
+
+
+def test_forbidden_ranking_words_guard_detects_ranking_claims() -> None:
+    """Guard catches forbidden ranking wording and permits neutral comparison text."""
+    for word in FORBIDDEN_RANKING_WORDS:
+        sample = f"Discover our {word} offers this month"
+        problems = forbidden_ranking_problems(sample)
+        assert problems == [f"forbidden ranking word '{word}'"]
+
+    multiple = "We show the best and cheapest top options recommended for you"
+    assert forbidden_ranking_problems(multiple) == [
+        "forbidden ranking word 'best'",
+        "forbidden ranking word 'cheapest'",
+        "forbidden ranking word 'recommended'",
+        "forbidden ranking word 'top'",
+    ]
+
+    clean = "Compare publicly advertised terms sorted by institution name or lowest APR"
+    assert forbidden_ranking_problems(clean) == []

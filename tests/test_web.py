@@ -3,6 +3,7 @@
 import json
 import re
 import sqlite3
+from datetime import datetime, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
@@ -12,9 +13,24 @@ import pytest
 from flask import Flask
 from flask.testing import FlaskClient
 
+from cu_rates.contracts.audit import PublishedSnapshot, SnapshotEntry, snapshot_manifest_sha256
+from cu_rates.contracts.enums import (
+    CanonicalScenarioId,
+    ConditionKind,
+    MatchState,
+    OfferStatus,
+    RateType,
+    WithdrawalScope,
+)
+from cu_rates.contracts.fingerprints import offer_fingerprints
+from cu_rates.contracts.offers import OfferCondition, PurchaseMortgageDetails
+from cu_rates.contracts.publication import Placement
+from cu_rates.snapshot import Denylist
+from cu_rates.snapshot.builder import SnapshotCandidate, SnapshotPublisher
 from cu_rates.web import create_app
 from cu_rates.web.app import validate_canonical_origin
 from cu_rates.web.views import ARTICLES
+from tests.contracts import factories as make
 from tests.site_audit import (
     RATE_FIGURE,
     automatic_request_urls,
@@ -23,10 +39,12 @@ from tests.site_audit import (
     csp_problems,
     database_findings,
     executable_inline_scripts,
+    forbidden_ranking_problems,
     load_cu_rates_sources,
     publication_problems,
     script_request_urls,
 )
+from tests.test_validation import claim, draft
 
 VERIFIED_PAGES = ["/", "/methodology", "/privacy"]
 
@@ -49,9 +67,18 @@ class PageInspector(HTMLParser):
         self.current_link_text: list[str] = []
         self.images: list[dict[str, str]] = []
         self.resource_urls: list[tuple[str, str]] = []
+        self.headings: list[str] = []
+        self.tables: list[dict[str, str]] = []
+        self.table_captions: list[str] = []
+        self.current_caption: list[str] = []
+        self.in_caption = False
+        self.th_tags: list[dict[str, str]] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attr_dict = {k: v or "" for k, v in attrs}
+
+        if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            self.headings.append(tag)
 
         if tag == "html":
             self.html_lang = attr_dict.get("lang")
@@ -60,6 +87,13 @@ class PageInspector(HTMLParser):
         elif tag == "h1":
             self.in_h1 = True
             self.current_h1 = []
+        elif tag == "table":
+            self.tables.append(attr_dict)
+        elif tag == "caption":
+            self.in_caption = True
+            self.current_caption = []
+        elif tag == "th":
+            self.th_tags.append(attr_dict)
         elif tag in ("header", "main", "footer"):
             self.landmarks.append(tag)
             if tag == "main":
@@ -87,6 +121,9 @@ class PageInspector(HTMLParser):
         if tag == "h1":
             self.in_h1 = False
             self.h1_list.append("".join(self.current_h1).strip())
+        elif tag == "caption":
+            self.in_caption = False
+            self.table_captions.append("".join(self.current_caption).strip())
         elif tag == "a" and self.current_link_attrs is not None:
             self.links.append((self.current_link_attrs, "".join(self.current_link_text).strip()))
             self.current_link_attrs = None
@@ -95,6 +132,8 @@ class PageInspector(HTMLParser):
     def handle_data(self, data: str) -> None:
         if self.in_h1:
             self.current_h1.append(data)
+        if self.in_caption:
+            self.current_caption.append(data)
         if self.current_link_attrs is not None:
             self.current_link_text.append(data)
 
@@ -165,7 +204,7 @@ def test_404_page_and_noindex_rules(client: FlaskClient) -> None:
 
 def test_accessibility_landmarks_and_structure(client: FlaskClient) -> None:
     """Every page provides lang='en', landmarks, skip link, single h1, and labeled navs."""
-    test_paths = [*VERIFIED_PAGES, "/arbitrary-404-path"]
+    test_paths = [*VERIFIED_PAGES, "/compare", "/arbitrary-404-path"]
     for path in test_paths:
         resp = client.get(path)
         doc = parse_page(resp.get_data(as_text=True))
@@ -221,7 +260,7 @@ def test_educational_disclaimer_on_every_page(client: FlaskClient) -> None:
         "not a lender",
         "not personalized financial advice",
     ]
-    test_paths = [*VERIFIED_PAGES, "/missing-page"]
+    test_paths = [*VERIFIED_PAGES, "/compare", "/missing-page"]
     for path in test_paths:
         resp = client.get(path)
         text = resp.get_data(as_text=True).lower()
@@ -443,7 +482,15 @@ def test_rendered_pages_do_not_open_a_database(
     monkeypatch.setattr(builtins, "open", guarded_open)
     monkeypatch.setattr(pathlib.Path, "open", guarded_path_open)
     monkeypatch.setattr(sqlite3, "connect", refuse_connect)
-    for path in ("/", "/methodology", "/privacy", "/learn", "/learn/mortgage-basics", "/missing"):
+    for path in (
+        "/",
+        "/compare",
+        "/methodology",
+        "/privacy",
+        "/learn",
+        "/learn/mortgage-basics",
+        "/missing",
+    ):
         client.get(path)
 
 
@@ -451,6 +498,7 @@ def test_html_and_not_found_require_revalidation(client: FlaskClient) -> None:
     """HTML responses, including the 404 page, must be revalidated before reuse."""
     for path in (
         "/",
+        "/compare",
         "/methodology",
         "/privacy",
         "/learn",
@@ -546,6 +594,7 @@ def test_aria_current_matches_the_open_page(client: FlaskClient) -> None:
     """The main navigation marks only the page that is actually open."""
     expectations = {
         "/": "Home",
+        "/compare": "Compare",
         "/methodology": "Methodology",
         "/privacy": "Privacy",
     }
@@ -553,3 +602,458 @@ def test_aria_current_matches_the_open_page(client: FlaskClient) -> None:
         document = parse_page(client.get(path).get_data(as_text=True))
         current = [text for attrs, text in document.links if attrs.get("aria-current") == "page"]
         assert current == [label]
+
+
+def _make_candidate(
+    offer_id: str,
+    legal_name: str,
+    *,
+    note_rate_str: str | None = "6.125",
+    apr_str: str | None = "6.250",
+    points_str: str = "0",
+    term_months: int = 360,
+    validity: timedelta = timedelta(days=3),
+    conditions: tuple[Any, ...] = (),
+    scenario_id: CanonicalScenarioId = CanonicalScenarioId.PURCHASE_30Y_FIXED,
+    now: datetime = make.EVALUATED_AT,
+) -> SnapshotCandidate:
+    effective = make.T0 - timedelta(days=1)
+    date = claim("effective_at", effective.isoformat())
+
+    overrides: dict[str, Any] = {
+        "offer_id": offer_id,
+        "status": OfferStatus.APPROVED,
+        "effective_at": effective,
+        "observed_at": make.T0,
+        "valid_until": make.T0 + validity,
+        "scenario_id": scenario_id,
+        "points": make.points(points_str),
+        "supporting_evidence": (date.provenance, make.provenance("CAPTURE " + offer_id)),
+        "scenario_matches": make.purchase_offer().scenario_matches,
+        "details": PurchaseMortgageDetails(
+            term_months=term_months,
+            rate_type=RateType.FIXED,
+            lock_days=30,
+        ),
+        "conditions": conditions,
+    }
+    if note_rate_str is not None:
+        overrides["note_rate"] = make.rate(note_rate_str)
+    else:
+        overrides["note_rate"] = None
+    if apr_str is not None:
+        overrides["apr"] = make.rate(apr_str)
+    else:
+        overrides["apr"] = None
+
+    offer = draft(**overrides)
+    inst = make.institution(legal_name=legal_name)
+    ctx = make.context(offer, evaluated_at=now, institution=inst)
+    return SnapshotCandidate(offer=offer, context=ctx, candidates=(date,))
+
+
+def _build_test_snapshot(
+    tmp_path: Path,
+    candidates: list[SnapshotCandidate],
+    now: datetime = make.EVALUATED_AT,
+) -> tuple[SnapshotPublisher, Denylist]:
+    publisher = SnapshotPublisher(tmp_path / "fixture_snapshots")
+    denylist = Denylist(tmp_path / "independent" / "withdrawals.json")
+    denylist.initialize()
+
+    entries = []
+    for item in candidates:
+        fp = offer_fingerprints(item.offer)
+        entries.append(
+            SnapshotEntry(
+                offer_id=item.offer.offer_id,
+                structural_sha256=fp.structural,
+                value_sha256=fp.value,
+            )
+        )
+    ordered = tuple(sorted(entries, key=lambda entry: entry.offer_id))
+    manifest = PublishedSnapshot(
+        schema_version=make.SV,
+        snapshot_id="test-fixture-snap",
+        published_at=now,
+        published_by="test-runner",
+        entries=ordered,
+        manifest_sha256=snapshot_manifest_sha256(ordered),
+    )
+    publisher.build(manifest, candidates)
+    return publisher, denylist
+
+
+def test_compare_page_empty_state_and_noindex(client: FlaskClient) -> None:
+    """Empty or missing snapshot serves honest empty state, noindex, and canonical scenarios."""
+    resp = client.get("/compare")
+    assert resp.status_code == 200
+    assert "text/html" in resp.content_type
+
+    # Header and meta noindex
+    assert "noindex" in resp.headers.get("X-Robots-Tag", "")
+    html = resp.get_data(as_text=True)
+    doc = parse_page(html)
+    robots_meta = [m for m in doc.meta_tags if m.get("name") == "robots"]
+    assert len(robots_meta) == 1
+    assert "noindex" in robots_meta[0].get("content", "")
+
+    # Honest empty state copy
+    assert "No Verified Rates Published Yet" in html
+    assert "strict provenance" in html.lower()
+    assert "canonical comparison scenarios" in html.lower()
+
+    # Discloses all 4 canonical scenarios and their assumptions
+    assert "30-Year Fixed Mortgage — Home Purchase" in html
+    assert "30-Year Fixed Mortgage — Rate and Term Refinance" in html
+    assert "Fixed-Rate Home Equity Loan — 10-Year" in html
+    assert "Home Equity Line of Credit (HELOC)" in html
+    assert "$500,000" in html
+    assert "$400,000" in html
+    assert "80.000%" in html
+    assert "780" in html
+
+    # Excluded from sitemap when no verified data is published
+    sitemap = client.get("/sitemap.xml").get_data(as_text=True)
+    assert "/compare" not in sitemap
+
+    # Forbidden ranking words guard
+    assert forbidden_ranking_problems(html) == []
+
+    # Exactly one h1
+    assert len(doc.h1_list) == 1
+
+
+def test_compare_query_parameter_allow_list(client: FlaskClient) -> None:
+    """Unknown query parameters or values fail closed with HTTP 400."""
+    # Unknown parameter key
+    bad_param = client.get("/compare?tracking_code=abc123")
+    assert bad_param.status_code == 400
+
+    bad_extra = client.get("/compare?scenario=purchase_30y_fixed&extra=1")
+    assert bad_extra.status_code == 400
+
+    # Unknown scenario value
+    bad_scenario = client.get("/compare?scenario=jumbo_conforming")
+    assert bad_scenario.status_code == 400
+
+    # Unknown sort value (including forbidden ranking words)
+    bad_sort = client.get("/compare?sort=cheapest")
+    assert bad_sort.status_code == 400
+
+    bad_sort_best = client.get("/compare?sort=best")
+    assert bad_sort_best.status_code == 400
+
+    # Valid parameters pass with 200
+    valid_scenario = client.get("/compare?scenario=purchase_30y_fixed")
+    assert valid_scenario.status_code == 200
+    valid_html = valid_scenario.get_data(as_text=True)
+    assert "Active scenario:" in valid_html
+    assert "30-Year Fixed Purchase" in valid_html
+
+    valid_sort = client.get("/compare?sort=apr")
+    assert valid_sort.status_code == 200
+    valid_sort_html = valid_sort.get_data(as_text=True)
+    assert "Active sort:" in valid_sort_html
+    assert "APR (Lowest First)" in valid_sort_html
+
+
+def test_compare_fixture_snapshot_rendering_and_incomparable_separation(
+    tmp_path: Path,
+) -> None:
+    """Render rate comparison from a temporary fixture snapshot with full guarantees."""
+    now = make.EVALUATED_AT
+
+    # 1. Comparable Alpha CU
+    alpha = _make_candidate(
+        "offer-alpha",
+        "Alpha Federal Credit Union",
+        note_rate_str="6.125",
+        apr_str="6.250",
+        points_str="0",
+        term_months=360,
+        now=now,
+    )
+
+    # 2. Comparable Beta CU (higher APR)
+    beta = _make_candidate(
+        "offer-beta",
+        "Beta State Credit Union",
+        note_rate_str="6.375",
+        apr_str="6.500",
+        points_str="0",
+        term_months=360,
+        now=now,
+    )
+
+    # 3. Incomparable: note rate only, no APR (Decision D-05)
+    gamma_no_apr = _make_candidate(
+        "offer-gamma",
+        "Gamma Community Credit Union",
+        note_rate_str="5.990",
+        apr_str=None,
+        points_str="0",
+        term_months=360,
+        now=now,
+    )
+
+    # 4. Incomparable: conditional autopay discount
+    autopay_cond = OfferCondition(
+        condition_id="cond-autopay",
+        kind=ConditionKind.AUTOPAY,
+        description="autopay discount",
+        provenance=make.provenance("autopay discount"),
+        scenario_state=MatchState.CONFLICTS,
+    )
+    delta_autopay = _make_candidate(
+        "offer-delta",
+        "Delta Credit Union",
+        note_rate_str="6.050",
+        apr_str="6.150",
+        points_str="0",
+        term_months=360,
+        conditions=(autopay_cond,),
+        now=now,
+    )
+
+    # 5. Withdrawn / Stale on denylist
+    epsilon_withdrawn = _make_candidate(
+        "offer-epsilon",
+        "Epsilon Expired Credit Union",
+        note_rate_str="5.500",
+        apr_str="5.600",
+        now=now,
+    )
+
+    publisher, denylist = _build_test_snapshot(
+        tmp_path,
+        [alpha, beta, gamma_no_apr, delta_autopay, epsilon_withdrawn],
+        now=now,
+    )
+
+    # Withdraw epsilon on independent emergency denylist
+    denylist.withdraw(make.withdrawal(WithdrawalScope.OFFER, "offer-epsilon", withdrawn_at=make.T0))
+
+    fixture_app = create_app(
+        {
+            "TESTING": True,
+            "SNAPSHOT_ROOT": str(publisher.root),
+            "DENYLIST_PATH": str(denylist.path),
+            "SNAPSHOT_CLOCK": now,
+        }
+    )
+    client = fixture_app.test_client()
+
+    resp = client.get("/compare")
+    assert resp.status_code == 200
+    html = resp.get_data(as_text=True)
+
+    # When verified rates are published, noindex is NOT set on response
+    assert "noindex" not in resp.headers.get("X-Robots-Tag", "")
+
+    # And /compare IS included in sitemap.xml
+    sitemap = client.get("/sitemap.xml").get_data(as_text=True)
+    assert "/compare" in sitemap
+
+    # 1. Main Grid contains comparable offers: Alpha and Beta
+    assert "Alpha Federal Credit Union" in html
+    assert "Beta State Credit Union" in html
+    assert "6.125%" in html
+    assert "6.250%" in html
+    assert "6.375%" in html
+    assert "6.500%" in html
+    assert "30 years (360 mos)" in html
+    assert "Fixed-Rate Conforming Mortgage (Purchase)" in html
+
+    # Discloses scenario assumptions next to grid
+    assert "$500,000" in html
+    assert "$400,000" in html
+    assert "80.000%" in html
+    assert "780" in html
+
+    # 2. Incomparable / Incomplete section contains Gamma and Delta with plain reasons
+    assert "Incomparable or Incomplete Offers" in html
+    assert "Gamma Community Credit Union" in html
+    assert "Decision D-05" in html or "Lacks published APR disclosure" in html
+
+    assert "Delta Credit Union" in html
+    assert "Requires automatic payment discount" in html or "Conditional discount" in html
+
+    # 3. Withdrawn offer Epsilon MUST NOT appear anywhere on the page
+    assert "Epsilon Expired Credit Union" not in html
+    assert "offer-epsilon" not in html
+
+    # 4. Sorting behavior
+    # Default sort: institution alphabetical ascending (Alpha before Beta)
+    alpha_pos = html.index("Alpha Federal Credit Union")
+    beta_pos = html.index("Beta State Credit Union")
+    assert alpha_pos < beta_pos
+
+    # Sort by APR descending (Beta 6.500% before Alpha 6.250%)
+    apr_desc_resp = client.get("/compare?sort=apr_desc")
+    apr_desc_html = apr_desc_resp.get_data(as_text=True)
+    b_pos = apr_desc_html.index("Beta State Credit Union")
+    a_pos = apr_desc_html.index("Alpha Federal Credit Union")
+    assert b_pos < a_pos
+
+    # Sort by APR ascending (Alpha 6.250% before Beta 6.500%)
+    apr_asc_resp = client.get("/compare?sort=apr")
+    apr_asc_html = apr_asc_resp.get_data(as_text=True)
+    assert apr_asc_html.index("Alpha Federal Credit Union") < apr_asc_html.index(
+        "Beta State Credit Union"
+    )
+
+    # 5. Accessibility requirements
+    doc = parse_page(html)
+    assert len(doc.tables) >= 1
+    assert len(doc.table_captions) >= 1
+    for caption in doc.table_captions:
+        assert caption != ""
+    assert len(doc.th_tags) >= 8
+    for th in doc.th_tags:
+        assert th.get("scope") in ("col", "row")
+
+    # Heading hierarchy
+    assert len(doc.h1_list) == 1
+    assert doc.headings[0] == "h1"
+
+    # 6. Forbidden ranking words absent
+    assert forbidden_ranking_problems(html) == []
+
+
+def test_compare_freshness_degradation_and_expiry(tmp_path: Path) -> None:
+    """Offers degrade to browse-only after 72h and withdraw after 96h or valid_until."""
+    now = make.EVALUATED_AT
+    item = _make_candidate(
+        "offer-decay",
+        "Decay Federal Credit Union",
+        note_rate_str="6.125",
+        apr_str="6.250",
+        validity=timedelta(hours=90),
+        now=now,
+    )
+    publisher, denylist = _build_test_snapshot(tmp_path, [item], now=now)
+
+    # 1. Fresh read (< 72h): appears in main comparable grid
+    fresh_app = create_app(
+        {
+            "TESTING": True,
+            "SNAPSHOT_ROOT": str(publisher.root),
+            "DENYLIST_PATH": str(denylist.path),
+            "SNAPSHOT_CLOCK": make.T0 + timedelta(hours=24),
+        }
+    )
+    fresh_html = fresh_app.test_client().get("/compare").get_data(as_text=True)
+    assert "Decay Federal Credit Union" in fresh_html
+    assert "Incomparable or Incomplete Offers" not in fresh_html
+
+    # 2. Degraded read (> 72h, < 90h): degraded to BROWSE_ONLY and separated
+    degraded_app = create_app(
+        {
+            "TESTING": True,
+            "SNAPSHOT_ROOT": str(publisher.root),
+            "DENYLIST_PATH": str(denylist.path),
+            "SNAPSHOT_CLOCK": make.T0 + timedelta(hours=73),
+        }
+    )
+    degraded_html = degraded_app.test_client().get("/compare").get_data(as_text=True)
+    assert "Decay Federal Credit Union" in degraded_html
+    assert "Incomparable or Incomplete Offers" in degraded_html
+    assert "Degraded freshness (observed over 72 hours ago)" in degraded_html
+
+    # 3. Withdrawn / expired read (>= valid_until or > 96h): excluded completely from page
+    withdrawn_app = create_app(
+        {
+            "TESTING": True,
+            "SNAPSHOT_ROOT": str(publisher.root),
+            "DENYLIST_PATH": str(denylist.path),
+            "SNAPSHOT_CLOCK": make.T0 + timedelta(hours=90),
+        }
+    )
+    withdrawn_html = withdrawn_app.test_client().get("/compare").get_data(as_text=True)
+    assert "Decay Federal Credit Union" not in withdrawn_html
+    assert "No Verified Rates Published Yet" in withdrawn_html
+
+
+def test_guard_forbidden_ranking_words_catches_injected_claim_in_compare(
+    client: FlaskClient,
+) -> None:
+    """Guard catches injected forbidden ranking claim on the comparison page."""
+    clean_html = client.get("/compare").get_data(as_text=True)
+    assert forbidden_ranking_problems(clean_html) == []
+
+    # Injected defects must fail the guard
+    injected_best = clean_html.replace(
+        "Compare Residential Lending Terms", "Find the Best Loan Rates"
+    )
+    assert "forbidden ranking word 'best'" in forbidden_ranking_problems(injected_best)
+
+    injected_cheapest = clean_html.replace(
+        "All comparisons use declared canonical borrower scenarios",
+        "Browse the cheapest available mortgage options",
+    )
+    assert "forbidden ranking word 'cheapest'" in forbidden_ranking_problems(injected_cheapest)
+
+    injected_top = clean_html.replace(
+        "All comparisons use declared canonical borrower scenarios",
+        "See our top recommended lender rates",
+    )
+    problems = forbidden_ranking_problems(injected_top)
+    assert "forbidden ranking word 'top'" in problems
+    assert "forbidden ranking word 'recommended'" in problems
+
+
+def test_guard_incomparable_offers_never_classified_as_comparable() -> None:
+    """Offers without APR, with degraded freshness, or with conditions never enter main grid."""
+    from cu_rates.web.comparison import classify_and_format_offer
+
+    now = make.EVALUATED_AT
+    # 1. Missing APR offer
+    candidate_no_apr = _make_candidate(
+        "no-apr-guard", "Test CU", note_rate_str="6.000", apr_str=None, now=now
+    )
+    # Convert candidate's NormalizedOffer to PublicOffer-like inspection
+    from cu_rates.snapshot.builder import _public_projection
+
+    pub_no_apr = _public_projection(candidate_no_apr, Placement.BROWSE_ONLY, False)
+    formatted_no_apr = classify_and_format_offer(pub_no_apr, now)
+    assert formatted_no_apr is not None
+    assert not formatted_no_apr.is_comparable
+    assert "Decision D-05" in formatted_no_apr.separation_reason
+
+    # 2. Conditional autopay discount
+    cond = OfferCondition(
+        condition_id="c-guard",
+        kind=ConditionKind.AUTOPAY,
+        description="autopay discount",
+        provenance=make.provenance("autopay discount"),
+        scenario_state=MatchState.CONFLICTS,
+    )
+    candidate_cond = _make_candidate(
+        "cond-guard", "Test CU", note_rate_str="6.000", apr_str="6.100", conditions=(cond,), now=now
+    )
+    pub_cond = _public_projection(candidate_cond, Placement.BROWSE_ONLY, False)
+    formatted_cond = classify_and_format_offer(pub_cond, now)
+    assert formatted_cond is not None
+    assert not formatted_cond.is_comparable
+    assert "Conditional discount" in formatted_cond.separation_reason
+
+    # 3. Degraded freshness (> 72 hours)
+    candidate_degraded = _make_candidate(
+        "degraded-guard",
+        "Test CU",
+        note_rate_str="6.000",
+        apr_str="6.100",
+        validity=timedelta(hours=90),
+        now=now,
+    )
+    pub_degraded = _public_projection(candidate_degraded, Placement.BROWSE_ONLY, False)
+    # Evaluate at 73 hours after observation
+    formatted_degraded = classify_and_format_offer(pub_degraded, make.T0 + timedelta(hours=73))
+    assert formatted_degraded is not None
+    assert not formatted_degraded.is_comparable
+    assert "Degraded freshness" in formatted_degraded.separation_reason
+
+    # 4. Stale offer (> 96 hours): excluded completely
+    formatted_stale = classify_and_format_offer(pub_degraded, make.T0 + timedelta(hours=97))
+    assert formatted_stale is None

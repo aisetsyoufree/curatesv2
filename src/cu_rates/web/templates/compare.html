@@ -1,0 +1,180 @@
+{% extends "base.html" %}
+
+{% block title %}Compare Residential Lending Terms{% endblock %}
+
+{% block content %}
+<article class="compare-page">
+  <h1>Compare Residential Lending Terms</h1>
+  <p class="lead-text">
+    Compare publicly advertised residential mortgage and home equity terms across Massachusetts credit unions.
+    All comparisons use declared canonical borrower scenarios under like-for-like rules.
+    Offers without full APR disclosure or matching assumptions are labeled and separated.
+  </p>
+
+  <form method="get" action="{{ url_for('web.compare') }}" class="compare-controls card" aria-label="Comparison filters">
+    <div class="controls-row">
+      <div class="control-group">
+        <label for="scenario-select" class="control-label">Scenario:</label>
+        <select id="scenario-select" name="scenario" class="control-select">
+          <option value="all"{% if scenario_param == 'all' %} selected{% endif %}>All Scenarios</option>
+          {% for spec in all_scenario_specs %}
+          <option value="{{ spec.scenario_id }}"{% if scenario_param == spec.scenario_id %} selected{% endif %}>{{ spec.short_title }}</option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div class="control-group">
+        <label for="sort-select" class="control-label">Sort Order:</label>
+        <select id="sort-select" name="sort" class="control-select">
+          {% for opt_key, opt_label in sort_options.items() %}
+          <option value="{{ opt_key }}"{% if sort_param == opt_key %} selected{% endif %}>{{ opt_label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div class="control-group control-submit">
+        <button type="submit" class="control-button">Apply</button>
+      </div>
+    </div>
+  </form>
+
+  <div class="active-filters-bar" role="status">
+    <p>Active scenario: <strong>{{ 'All Scenarios' if scenario_param == 'all' else scenario_sections[0].spec.short_title }}</strong> | Active sort: <strong>{{ active_sort_label }}</strong></p>
+  </div>
+
+  {% if not has_published_data %}
+  <section class="empty-state-section" aria-labelledby="empty-state-heading">
+    <div class="empty-state-card card">
+      <h2 id="empty-state-heading">No Verified Rates Published Yet</h2>
+      <p>
+        CU-Rates.org publishes only rates that satisfy strict provenance, evidence, and publication verification rules.
+        Because routine collection is offline during development and no Massachusetts credit union source has been
+        approved for live publication, no verified rates exist in the public repository at this time.
+        When verified snapshots are built, comparable offers will appear here under declared scenarios.
+      </p>
+    </div>
+  </section>
+
+  <section class="scenarios-overview-section" aria-labelledby="scenarios-overview-heading">
+    <h2 id="scenarios-overview-heading">Canonical Comparison Scenarios</h2>
+    <p>When verified rates are published, offers will be compared under these four canonical borrower scenarios defined in our methodology:</p>
+    <div class="scenarios-grid">
+      {% for spec in all_scenario_specs %}
+      <div class="card scenario-card">
+        <h3>{{ spec.title }}</h3>
+        <p>{{ spec.description }}</p>
+        <div class="assumptions-box">
+          <h4>Declared Scenario Assumptions</h4>
+          <ul class="assumptions-list">
+            {% for item in spec.assumptions %}
+            <li><strong>{{ item.label }}:</strong> {{ item.value }}</li>
+            {% endfor %}
+          </ul>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </section>
+  {% else %}
+  {% for section in scenario_sections %}
+  <section class="scenario-block" aria-labelledby="heading-{{ section.spec.scenario_id }}">
+    <h2 id="heading-{{ section.spec.scenario_id }}">{{ section.spec.title }}</h2>
+    <p>{{ section.spec.description }}</p>
+
+    <div class="scenario-layout">
+      <aside class="scenario-assumptions-panel card" aria-labelledby="assumptions-{{ section.spec.scenario_id }}">
+        <h3 id="assumptions-{{ section.spec.scenario_id }}">Scenario Assumptions</h3>
+        <ul class="assumptions-list">
+          {% for item in section.spec.assumptions %}
+          <li><strong>{{ item.label }}:</strong> {{ item.value }}</li>
+          {% endfor %}
+        </ul>
+      </aside>
+
+      <div class="scenario-grid-panel">
+        <h3>Comparable Offers (Standard Terms)</h3>
+        {% if section.comparable %}
+        <div class="table-responsive card">
+          <table class="data-table">
+            <caption>Comparable offers for {{ section.spec.title }} meeting all declared scenario assumptions</caption>
+            <thead>
+              <tr>
+                <th scope="col">Institution</th>
+                <th scope="col">Note Rate</th>
+                <th scope="col">APR</th>
+                <th scope="col">Points</th>
+                <th scope="col">Term</th>
+                <th scope="col">Loan Type</th>
+                <th scope="col">Conditions</th>
+                <th scope="col">Freshness</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for offer in section.comparable %}
+              <tr>
+                <th scope="row" class="institution-cell">{{ offer.institution_name }}</th>
+                <td>{{ offer.note_rate_display }}</td>
+                <td>{{ offer.apr_display }}</td>
+                <td>{{ offer.points_display }}</td>
+                <td>{{ offer.term_display }}</td>
+                <td>{{ offer.loan_type_display }}</td>
+                <td>{{ offer.conditions_display }}</td>
+                <td>{{ offer.freshness_display }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% else %}
+        <div class="card notice-card">
+          <p class="no-offers-notice">No comparable offers currently published for this scenario.</p>
+        </div>
+        {% endif %}
+      </div>
+    </div>
+
+    {% if section.incomparable %}
+    <div class="incomparable-section">
+      <h3>Incomparable or Incomplete Offers</h3>
+      <p class="incomparable-intro">
+        The following offers do not meet all declared scenario assumptions, lack required APR disclosures,
+        or carry conditional pricing. They are visibly separated from the main grid with the reason stated.
+      </p>
+      <div class="table-responsive card">
+        <table class="data-table incomparable-table">
+          <caption>Incomparable or incomplete offers for {{ section.spec.title }} with plain exclusion reasons</caption>
+          <thead>
+            <tr>
+              <th scope="col">Institution</th>
+              <th scope="col">Status & Reason</th>
+              <th scope="col">Note Rate</th>
+              <th scope="col">APR</th>
+              <th scope="col">Points</th>
+              <th scope="col">Term</th>
+              <th scope="col">Conditions</th>
+              <th scope="col">Freshness</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for offer in section.incomparable %}
+            <tr>
+              <th scope="row" class="institution-cell">{{ offer.institution_name }}</th>
+              <td class="reason-cell"><span class="reason-badge">{{ offer.separation_reason }}</span></td>
+              <td>{{ offer.note_rate_display }}</td>
+              <td>{{ offer.apr_display }}</td>
+              <td>{{ offer.points_display }}</td>
+              <td>{{ offer.term_display }}</td>
+              <td>{{ offer.conditions_display }}</td>
+              <td>{{ offer.freshness_display }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    {% endif %}
+  </section>
+  {% endfor %}
+  {% endif %}
+</article>
+{% endblock %}

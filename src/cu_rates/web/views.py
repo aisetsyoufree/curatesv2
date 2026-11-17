@@ -1,8 +1,21 @@
 """Web views for CU-Rates.org."""
 
+from datetime import UTC, datetime
 from typing import Any, TypedDict
 
 from flask import Blueprint, Response, abort, current_app, render_template, request
+
+from cu_rates.web.comparison import (
+    ALLOWED_PARAMS,
+    ALLOWED_SCENARIOS,
+    ALLOWED_SORTS,
+    CANONICAL_SCENARIO_SPECS,
+    SCENARIOS_BY_ID,
+    SORT_LABELS,
+    classify_and_format_offer,
+    read_snapshot_offers,
+    sort_offers,
+)
 
 web_bp = Blueprint("web", __name__)
 
@@ -127,6 +140,12 @@ _PAGE_META: dict[str, tuple[str, str, tuple[tuple[str, str], ...]]] = {
         "Unreviewed articles stay out of the search index.",
         (("Home", "/"), ("Learn", "/learn")),
     ),
+    "web.compare": (
+        "Compare Residential Lending Terms",
+        "Compare publicly advertised mortgage and home equity terms across Massachusetts "
+        "credit unions under declared canonical scenarios.",
+        (("Home", "/"), ("Compare", "/compare")),
+    ),
 }
 
 
@@ -224,6 +243,86 @@ def privacy() -> str:
     return render_template("privacy.html")
 
 
+@web_bp.route("/compare")
+def compare() -> Response:
+    """Render the rate comparison experience reading only from the published snapshot."""
+    for param in request.args:
+        if param not in ALLOWED_PARAMS:
+            abort(400)
+
+    scenario_param = request.args.get("scenario", "all")
+    if scenario_param not in ALLOWED_SCENARIOS:
+        abort(400)
+
+    sort_param = request.args.get("sort", "institution")
+    if sort_param not in ALLOWED_SORTS:
+        abort(400)
+
+    now = datetime.now(UTC)
+    clock_override = current_app.config.get("SNAPSHOT_CLOCK")
+    if isinstance(clock_override, datetime):
+        now = clock_override
+    if now.utcoffset() is None:
+        now = now.replace(tzinfo=UTC)
+
+    info, raw_offers = read_snapshot_offers(at=now)
+
+    formatted_offers = []
+    for raw in raw_offers:
+        item = classify_and_format_offer(raw, now)
+        if item is not None:
+            formatted_offers.append(item)
+
+    has_published_data = len(formatted_offers) > 0
+
+    selected_specs = (
+        CANONICAL_SCENARIO_SPECS
+        if scenario_param == "all"
+        else ((SCENARIOS_BY_ID[scenario_param],) if scenario_param in SCENARIOS_BY_ID else ())
+    )
+
+    scenario_sections = []
+    for spec in selected_specs:
+        scenario_offers = [
+            o
+            for o in formatted_offers
+            if o.scenario_id == spec.scenario_id
+            or (o.scenario_id is None and o.family == spec.family.value)
+        ]
+        comparable = [o for o in scenario_offers if o.is_comparable]
+        incomparable = [o for o in scenario_offers if not o.is_comparable]
+
+        sorted_comparable = sort_offers(comparable, sort_param)
+        sorted_incomparable = sort_offers(incomparable, sort_param)
+
+        scenario_sections.append(
+            {
+                "spec": spec,
+                "comparable": sorted_comparable,
+                "incomparable": sorted_incomparable,
+                "total_count": len(scenario_offers),
+            }
+        )
+
+    headers: dict[str, str] = {}
+    if not has_published_data:
+        headers["X-Robots-Tag"] = "noindex, follow"
+
+    rendered = render_template(
+        "compare.html",
+        has_published_data=has_published_data,
+        scenario_param=scenario_param,
+        sort_param=sort_param,
+        active_sort_label=SORT_LABELS.get(sort_param, "Institution Name (A-Z)"),
+        sort_options=SORT_LABELS,
+        scenario_sections=scenario_sections,
+        all_scenario_specs=CANONICAL_SCENARIO_SPECS,
+        snapshot_info=info,
+        noindex=not has_published_data,
+    )
+    return Response(rendered, headers=headers)
+
+
 @web_bp.route("/learn")
 def learn_index() -> Response:
     """Render educational content index."""
@@ -273,6 +372,11 @@ def sitemap_xml() -> Response:
         f"{origin}/methodology",
         f"{origin}/privacy",
     ]
+    # Include /compare only when verified rates are published
+    _info, raw_offers = read_snapshot_offers()
+    if raw_offers:
+        urls.append(f"{origin}/compare")
+
     # Unreviewed articles remain excluded from sitemap until verified
     for slug, meta in ARTICLES.items():
         if meta.get("reviewed", False):

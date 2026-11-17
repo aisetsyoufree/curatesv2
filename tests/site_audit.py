@@ -429,11 +429,26 @@ def publication_problems(
     return problems
 
 
-def is_forbidden_module(name: str) -> bool:
+FORBIDDEN_RANKING_WORDS = ("best", "cheapest", "top", "recommended")
+FORBIDDEN_RANKING_PATTERN = re.compile(
+    r"\b(best|cheapest|top|recommended)\b",
+    re.IGNORECASE,
+)
+
+
+def forbidden_ranking_problems(text: str) -> list[str]:
+    """Detect words that imply an unsupported ranking or endorsement."""
+    matches = FORBIDDEN_RANKING_PATTERN.findall(text)
+    return [f"forbidden ranking word '{word.lower()}'" for word in sorted(set(matches))]
+
+
+def is_forbidden_module(name: str, *, from_module: str = "") -> bool:
     """True for database modules the web package must not reach."""
     root = name.split(".", 1)[0]
-    if root in {"sqlite3", "sqlalchemy"}:
+    if root == "sqlalchemy":
         return True
+    if root == "sqlite3":
+        return not from_module.startswith("cu_rates.snapshot")
     return name == "cu_rates.db" or name.startswith(("cu_rates.db.", "cu_rates.artifact_store"))
 
 
@@ -441,6 +456,8 @@ def is_database_reference(value: str) -> bool:
     """True for a path or name that opens the operational database."""
     normalized = value.replace("\\", "/").lower()
     filename = normalized.rsplit("/", 1)[-1]
+    if filename == "published.sqlite":
+        return False
     return "cu_rates.db" in normalized or filename.endswith((".db", ".sqlite", ".sqlite3"))
 
 
@@ -529,7 +546,7 @@ def database_findings(sources: Mapping[str, str], roots: Sequence[str]) -> list[
         imports, references = _scan_module(source, module=module, packages=packages)
         findings.extend(f"open {reference} in {module}" for reference in references)
         for imported in sorted(imports):
-            if is_forbidden_module(imported):
+            if is_forbidden_module(imported, from_module=module):
                 findings.append(f"import {imported} from {module}")
             elif imported in sources and imported not in seen:
                 queue.append(imported)
