@@ -21,7 +21,7 @@ from cu_rates.contracts.fingerprints import offer_fingerprints
 from cu_rates.contracts.publication import Placement, evaluate_publication
 from cu_rates.db import open_operational_database
 from cu_rates.pipeline.extract import extract_fixture
-from cu_rates.pipeline.slice import GIT_SHA, run_fixture
+from cu_rates.pipeline.slice import GIT_SHA
 from cu_rates.pipeline.trusted import load_publication_context
 from cu_rates.snapshot import Denylist, PublicOffer, SnapshotError, SnapshotReader, builder
 from cu_rates.snapshot._database import database_digest
@@ -29,6 +29,7 @@ from cu_rates.snapshot._models import SnapshotInfo, Version
 from cu_rates.snapshot.builder import SnapshotCandidate, SnapshotPublisher
 
 from .contracts import factories as make
+from .pub2_fixtures import reviewed_fixture
 from .test_validation import claim, draft
 
 _BIRTH = make.EVALUATED_AT
@@ -101,7 +102,8 @@ def test_snapshot_records_provenance_generation_and_immutable_format(tmp_path: P
     assert visible.source_url == make.SOURCE_URL
     assert visible.observed_at == item.offer.observed_at
     assert visible.evidence and {part.artifact_id for part in visible.evidence} == {
-        make.ARTIFACT_ID
+        make.ARTIFACT_ID,
+        make.ARTIFACT_ID_2,
     }
     assert {part.path for part in visible.evidence} >= {
         "note_rate",
@@ -126,7 +128,7 @@ def test_snapshot_records_provenance_generation_and_immutable_format(tmp_path: P
 def test_a_dated_t014_human_approval_is_exported_without_web_access_to_worker(
     tmp_path: Path,
 ) -> None:
-    pilot = run_fixture(tmp_path / "pilot")
+    pilot = reviewed_fixture(tmp_path / "pilot")
     assert pilot.reviewed_snapshot is not None
     as_of = pilot.reviewed_snapshot.published_at - timedelta(microseconds=1)
     worker = open_operational_database(pilot.database)
@@ -135,7 +137,7 @@ def test_a_dated_t014_human_approval_is_exported_without_web_access_to_worker(
         view = load_publication_context(conn, offer_id, as_of, store=pilot.store)
     worker.dispose()
     assert view.current_review is not None
-    (artifact,) = view.context.known_artifacts
+    artifact = view.context.known_artifacts[0]
     extracted = extract_fixture(
         "athol-style-dated",
         pilot.store.read(artifact),
@@ -161,7 +163,7 @@ def test_a_dated_t014_human_approval_is_exported_without_web_access_to_worker(
 
 
 def test_t014_refresh_without_t045_compatible_capture_does_not_activate(tmp_path: Path) -> None:
-    pilot = run_fixture(tmp_path / "pilot")
+    pilot = reviewed_fixture(tmp_path / "pilot")
     assert pilot.refreshed_snapshot is not None
     as_of = pilot.refreshed_snapshot.published_at
     worker = open_operational_database(pilot.database)
@@ -169,7 +171,7 @@ def test_t014_refresh_without_t045_compatible_capture_does_not_activate(tmp_path
     with worker.connect() as conn:
         view = load_publication_context(conn, offer_id, as_of, store=pilot.store)
     assert evaluate_publication(view.offer, view.context).publishable_now
-    (artifact,) = view.context.known_artifacts
+    artifact = view.context.known_artifacts[0]
     assert artifact.fetched_at != view.offer.observed_at
     extracted = extract_fixture(
         "athol-style-dated",

@@ -99,6 +99,9 @@ from cu_rates.contracts.offers import (
 )
 from cu_rates.contracts.publication import (
     APR_RULE_ID,
+    AUTHORITATIVE_SOURCE_CLASSES,
+    DUAL_EVIDENCE_TIME_WINDOW,
+    EvidencePath,
     Placement,
     PriorPublication,
     PublicationContext,
@@ -149,10 +152,12 @@ from cu_rates.contracts.taxonomy import (
 
 __all__ = [
     "APR_RULE_ID",
+    "AUTHORITATIVE_SOURCE_CLASSES",
     "CANONICAL_SCENARIOS",
     "CONTRACT_MAJOR",
     "CONTRACT_MINOR",
     "CONTRACT_VERSION",
+    "DUAL_EVIDENCE_TIME_WINDOW",
     "HELOC_POST_INTRO_RULE_ID",
     "PURPOSES_BY_FAMILY",
     "REQUIRED_DIMENSIONS",
@@ -172,6 +177,7 @@ __all__ = [
     "DimensionMatch",
     "EvidenceKind",
     "EvidenceLocator",
+    "EvidencePath",
     "ExtractedCandidate",
     "ExtractionProvenance",
     "ExtractionRun",

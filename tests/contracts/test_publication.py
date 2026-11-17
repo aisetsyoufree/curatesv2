@@ -396,7 +396,7 @@ UNSAFE_CASES: list[tuple[str, dict[str, Any], dict[str, Any], ReasonCode, Public
             "fetch_runs": (fetch_run(ARTIFACT_ID, IMAGE_ARTIFACT_ID),),
         },
         R.OCR_VALUE,
-        PublicationOutcome.REQUIRES_REVIEW,
+        PublicationOutcome.QUARANTINE,
     ),
     (
         "changed-product-identity",
@@ -496,6 +496,13 @@ def test_unsafe_cases_cover_every_blocking_reason() -> None:
         R.PROFILE_UNAPPROVED,
         R.LAYOUT_UNREVIEWED,
         R.REOBSERVATION_CLAIM_CHANGED,
+        R.INSUFFICIENT_EVIDENCE_PATHS,
+        R.DUPLICATE_EVIDENCE_CAPTURE,
+        R.EVIDENCE_PATH_NON_AUTHORITATIVE,
+        R.EVIDENCE_PATH_PRODUCT_MISMATCH,
+        R.EVIDENCE_PATH_SCENARIO_MISMATCH,
+        R.EVIDENCE_PATH_TIME_OUTSIDE_WINDOW,
+        R.EVIDENCE_PATH_VALUE_MISMATCH,
     }  # covered by dedicated tests below and in test_publication_gate.py
 
 
@@ -582,8 +589,8 @@ def test_incomplete_conditions_and_arm_terms_need_review_and_browse_only() -> No
     )
     arm_decision = decide(partial_arm)
     assert R.ARM_TERMS_INCOMPLETE in arm_decision.reasons
-    assert arm_decision.outcome is PublicationOutcome.REQUIRES_REVIEW
-    assert arm_decision.placement is Placement.BROWSE_ONLY
+    assert arm_decision.outcome is PublicationOutcome.QUARANTINE
+    assert arm_decision.placement is Placement.NONE
 
 
 def test_review_placement_is_reported_but_not_live() -> None:
@@ -602,7 +609,12 @@ def test_review_placement_is_reported_but_not_live() -> None:
         (timedelta(hours=71, minutes=59, seconds=59), False, PublicationOutcome.AUTO_PUBLISH, None),
         (timedelta(hours=72), False, PublicationOutcome.AUTO_PUBLISH, None),
         (timedelta(hours=72, seconds=1), True, PublicationOutcome.AUTO_PUBLISH, None),
-        (timedelta(hours=95, minutes=59, seconds=59), True, PublicationOutcome.AUTO_PUBLISH, None),
+        (
+            timedelta(hours=95, minutes=59, seconds=59),
+            True,
+            PublicationOutcome.QUARANTINE,
+            R.EVIDENCE_PATH_TIME_OUTSIDE_WINDOW,
+        ),
         # valid_until is observed_at + 96h, so the offer is expired at exactly 96h.
         (timedelta(hours=96), True, PublicationOutcome.SUPPRESS, R.VALIDITY_EXPIRED),
         (timedelta(hours=96, seconds=1), False, PublicationOutcome.SUPPRESS, R.STALE_WITHDRAWN),
@@ -665,7 +677,7 @@ def test_points_null_unknown_is_not_rankable_but_explicit_zero_is() -> None:
 
 def test_undeclared_scenario_is_browse_only() -> None:
     decision = decide(purchase_offer(scenario_id=None, scenario_matches=()))
-    assert decision.placement is Placement.BROWSE_ONLY
+    assert decision.placement is Placement.NONE
     assert R.SCENARIO_NOT_DECLARED in decision.reasons
 
 
@@ -736,7 +748,7 @@ def test_refinance_ranks_against_its_own_scenario() -> None:
 def test_cash_out_refinance_has_no_canonical_scenario_so_is_browse_only() -> None:
     offer = refinance_offer(LoanPurpose.CASH_OUT_REFINANCE, scenario_id=None, scenario_matches=())
     decision = decide(offer)
-    assert decision.placement is Placement.BROWSE_ONLY
+    assert decision.placement is Placement.NONE
     assert R.SCENARIO_NOT_DECLARED in decision.reasons
 
 

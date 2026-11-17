@@ -244,7 +244,7 @@ def test_source_approval_is_immutable_and_audited() -> None:
     with pytest.raises(ValidationError, match="schema_version"):
         type(approval).model_validate({k: v for k, v in payload.items() if k != "schema_version"})
     # The approval must predate the fetch. A decision at evaluation time is too late.
-    started = fetch_run().started_at
+    started = fetch_run().started_at - timedelta(hours=1)
     assert decide(source_approval=source_approval(decided_at=started)).publishable_now
     late = decide(source_approval=source_approval(decided_at=EVALUATED_AT))
     assert R.PROFILE_UNAPPROVED in late.reasons

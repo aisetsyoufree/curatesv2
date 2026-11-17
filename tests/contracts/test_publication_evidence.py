@@ -136,7 +136,7 @@ def test_arm_margin_jump_requires_review() -> None:
         )
 
     assert decide(arm_offer("2.800"), arm_offer("2.750")).outcome is (
-        PublicationOutcome.AUTO_PUBLISH
+        PublicationOutcome.QUARANTINE  # No evidence-backed scenario for this ARM.
     )
     jump = decide(arm_offer("3.500"), arm_offer("2.750"))
     assert R.RATE_MOVEMENT_EXCEEDS_LIMIT in jump.reasons

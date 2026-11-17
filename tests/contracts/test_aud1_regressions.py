@@ -107,7 +107,7 @@ def test_scenario_requires_independent_verification_and_current_rate_run() -> No
             ),
         ),
     )
-    assert result.publishable_now
+    assert not result.publishable_now
     assert ReasonCode.SCENARIO_UNSTATED in result.reasons
     assert not result.ranking_eligible
 
@@ -178,7 +178,8 @@ def test_304_can_extend_multiple_exactly_reviewed_artifacts_but_not_unproven_one
         observation(run_id="second-304", original_run_id=second_run, original_artifact_id=OTHER),
     )
     assert offer_evidence_sha256(before) == offer_evidence_sha256(after)
-    assert reobserve(after, reobservations=observations, **ctx).ranking_eligible
+    assert not reobserve(after, reobservations=observations, **ctx).publishable_now
+    # D-18: a 304 cannot replace two fresh, distinct content captures.
     assert not reobserve(after, reobservations=observations[:1], **ctx).publishable_now
     withdrawn = f.withdrawal(WithdrawalScope.SOURCE, f.SOURCE_ID)
     suppressed = reobserve(after, reobservations=observations, withdrawals=(withdrawn,), **ctx)
