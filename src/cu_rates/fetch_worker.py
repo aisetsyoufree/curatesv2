@@ -32,6 +32,12 @@ from cu_rates.contracts.sources import (
     SourceApproval,
     profile_sha256,
 )
+from cu_rates.fetch_dialer import (
+    TOTAL_TIMEOUT_EXTENSION,
+    PinnedTransport,
+    globally_routable,
+    normalize_address,
+)
 from cu_rates.fetch_robots import PRODUCT, RobotsPolicy, parse_robots
 
 USER_AGENT = f"{PRODUCT}/2 (+https://github.com/aisetsyoufree/curatesv2)"
@@ -123,56 +129,7 @@ _IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
 Resolver = Callable[[str], Iterable[_IPAddress | str]]
 TransportFactory = Callable[[tuple[_IPAddress, ...]], httpx.BaseTransport]
 
-_DENIED_IPV4_NETWORKS: tuple[ipaddress.IPv4Network, ...] = (
-    ipaddress.IPv4Network("0.0.0.0/8"),  # This network (RFC 791)
-    ipaddress.IPv4Network("10.0.0.0/8"),  # Private-use (RFC 1918)
-    ipaddress.IPv4Network("100.64.0.0/10"),  # Shared address space / CGNAT (RFC 6598)
-    ipaddress.IPv4Network("127.0.0.0/8"),  # Loopback (RFC 1122)
-    ipaddress.IPv4Network("169.254.0.0/16"),  # Link-local (RFC 3927)
-    ipaddress.IPv4Network("172.16.0.0/12"),  # Private-use (RFC 1918)
-    ipaddress.IPv4Network("192.0.0.0/24"),  # IETF protocol assignments (RFC 6890)
-    ipaddress.IPv4Network("192.0.2.0/24"),  # Documentation TEST-NET-1 (RFC 5737)
-    ipaddress.IPv4Network("192.88.99.0/24"),  # 6to4 relay anycast (RFC 7526)
-    ipaddress.IPv4Network("192.168.0.0/16"),  # Private-use (RFC 1918)
-    ipaddress.IPv4Network("198.18.0.0/15"),  # Benchmarking (RFC 2544)
-    ipaddress.IPv4Network("198.51.100.0/24"),  # Documentation TEST-NET-2 (RFC 5737)
-    ipaddress.IPv4Network("203.0.113.0/24"),  # Documentation TEST-NET-3 (RFC 5737)
-    ipaddress.IPv4Network("224.0.0.0/4"),  # Multicast (RFC 5771)
-    ipaddress.IPv4Network("240.0.0.0/4"),  # Reserved / Class E (RFC 1112)
-    ipaddress.IPv4Network("255.255.255.255/32"),  # Limited broadcast (RFC 8190)
-)
-
-_DENIED_IPV6_NETWORKS: tuple[ipaddress.IPv6Network, ...] = (
-    ipaddress.IPv6Network("::/128"),  # Unspecified (RFC 4291)
-    ipaddress.IPv6Network("::1/128"),  # Loopback (RFC 4291)
-    ipaddress.IPv6Network("100::/64"),  # Discard-only prefix (RFC 6666)
-    ipaddress.IPv6Network("2001::/23"),  # IETF protocol assignments, including Teredo
-    ipaddress.IPv6Network("2001:db8::/32"),  # Documentation (RFC 3849)
-    ipaddress.IPv6Network("2002::/16"),  # 6to4 (RFC 3056)
-    ipaddress.IPv6Network("3fff::/20"),  # Documentation (RFC 9637)
-    ipaddress.IPv6Network("fc00::/7"),  # Unique local / ULA (RFC 4193)
-    ipaddress.IPv6Network("fe80::/10"),  # Link-local unicast (RFC 4291)
-    ipaddress.IPv6Network("fec0::/10"),  # Site-local (RFC 3879, deprecated)
-    ipaddress.IPv6Network("ff00::/8"),  # Multicast (RFC 4291)
-)
-
-_IPV6_GLOBAL_UNICAST = ipaddress.IPv6Network("2000::/3")
-
-
-def _globally_routable(address: _IPAddress) -> bool:
-    """Accept public unicast only; reject transitions that can change the destination."""
-    if isinstance(address, ipaddress.IPv6Address):
-        if address.scope_id is not None:
-            return False
-        if address.ipv4_mapped is not None:
-            return _globally_routable(address.ipv4_mapped)
-    if not address.is_global or address.is_reserved or address.is_multicast:
-        return False
-    if isinstance(address, ipaddress.IPv4Address):
-        return not any(address in net for net in _DENIED_IPV4_NETWORKS)
-    return address in _IPV6_GLOBAL_UNICAST and not any(
-        address in net for net in _DENIED_IPV6_NETWORKS
-    )
+_globally_routable = globally_routable
 
 
 def _require_routable(host: str, resolve: Resolver) -> tuple[_IPAddress, ...]:
@@ -290,10 +247,12 @@ def _is_challenge(response: _Response) -> bool:
 
 
 class FetchWorker:
-    """Offline gateway; only an exact HTTPX MockTransport is dispatched.
+    """Gateway; only an exact HTTPX MockTransport or the gateway-owned PinnedTransport
+    (pinned to the addresses validated for this request) is dispatched.
 
     The injected factory, resolver, and mock handlers are trusted test code,
-    not a Python sandbox. A live transport needs a gateway-owned pinned dialer.
+    not a Python sandbox. No default factory or resolver exists, so nothing dials
+    unless a caller explicitly supplies both; live collection needs separate approval.
     The configured parent is trusted and the state directory is owner-only.
     """
 
@@ -402,11 +361,22 @@ class FetchWorker:
         self._set(db, "next-tick", str(tick + 5))
         self._set(db, f"tick:{origin}", str(tick))
         transport = self._transport(validated)
-        if type(transport) is not httpx.MockTransport:
+        if type(transport) is PinnedTransport:
+            # Only the gateway-owned dialer, pinned to exactly what was validated, and
+            # never one carrying the test-only destination override.
+            if transport.test_override is not None:
+                raise _Stopped("live-transport-disabled")
+            if set(transport.pinned_addresses) != {normalize_address(a) for a in validated}:
+                raise _Stopped("pin-mismatch")
+        elif type(transport) is not httpx.MockTransport:
             raise _Stopped("live-transport-disabled")
         # Single dispatch, with no HTTP client redirect processing or proxy discovery.
         request = httpx.Request(
-            "GET", url, headers={"User-Agent": USER_AGENT, "Accept-Encoding": "identity", **headers}
+            "GET",
+            url,
+            headers={"User-Agent": USER_AGENT, "Accept-Encoding": "identity", **headers},
+            # The profile deadline bounds the dialer's connect, handshake, and reads too.
+            extensions={TOTAL_TIMEOUT_EXTENSION: timeout},
         )
         with transport:
             response = transport.handle_request(request)
@@ -439,6 +409,10 @@ class FetchWorker:
             return header_only
         # These responses have no body to inspect; in particular a 304 is not a new capture.
         if code < 200 or code in (204, 205, 304):
+            # Header-only successes still answer to the profile deadline.
+            # Header-only successes still answer to the profile deadline.
+            if self._monotonic() - tick > timeout:
+                raise _Stopped("response-time-limit")
             return header_only
         if headers.get("content-encoding", "identity").lower() != "identity":
             if code != 200:
@@ -464,6 +438,9 @@ class FetchWorker:
                 if len(body) + len(chunk) > limit:
                     raise _Stopped("body-too-large")
                 body.extend(chunk)
+            # Completion is checked even when no chunk arrived (an empty body).
+            if self._monotonic() - tick > timeout:
+                raise _Stopped("response-time-limit")
         return _Response(code, headers, bytes(body), delay)
 
     def _robots(self, db: sqlite3.Connection, url: httpx.URL, timeout: int) -> RobotsPolicy:
