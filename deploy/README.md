@@ -310,6 +310,7 @@ Procedure:
 
    denylist = Denylist(Path("/var/lib/cu-rates/snapshots/denylist.json"))
    entry = WithdrawalEntry(
+       schema_version="1.0",
        withdrawal_id="wd-20261117-001",
        scope=WithdrawalScope.OFFER,  # "offer", "product", "institution", "source", or "snapshot"
        target_id="off-example-123",
@@ -319,7 +320,7 @@ Procedure:
    )
    denylist.withdraw(entry)
    ```
-   `Denylist.withdraw()` acquires the writer lock, validates required audit fields (`withdrawal_id`, `scope`, `target_id`, `actor`, `withdrawn_at`, `reason`), and atomically writes the updated ledger to `/var/lib/cu-rates/snapshots/denylist.json`.
+   `Denylist.withdraw()` acquires the writer lock, validates required audit fields (`schema_version`, `withdrawal_id`, `scope`, `target_id`, `actor`, `withdrawn_at`, `reason`), and atomically writes the updated ledger to `/var/lib/cu-rates/snapshots/denylist.json`.
 2. The web layer filters denied entities on the next incoming request with zero delay.
 
 ---
