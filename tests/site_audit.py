@@ -496,25 +496,64 @@ _SQLITE_WRITE_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
-_MUTATING_PRAGMA_PATTERN = re.compile(
-    r"\bpragma\s+([a-zA-Z_]+)\s*(=|\()",
+_PRAGMA_PATTERN = re.compile(
+    r"\bpragma\s+([a-zA-Z_]+)(?:\s*(=|\()|\s*([a-zA-Z0-9_]+))?",
     re.IGNORECASE,
 )
+
+_SAFE_INTROSPECTION_PRAGMAS = frozenset(
+    {
+        "user_version",
+        "journal_mode",
+        "quick_check",
+        "integrity_check",
+        "application_id",
+        "schema_version",
+        "table_info",
+        "foreign_key_list",
+        "index_list",
+    }
+)
+
+SAFE_SELECT_STATEMENTS = frozenset(
+    {
+        "SELECT payload FROM snapshot_info",
+        "SELECT offer_id, payload FROM public_offers ORDER BY offer_id",
+        "SELECT * FROM info",
+        "SELECT 1",
+    }
+)
+
+
+def _normalize_sql(sql: str) -> str:
+    return " ".join(sql.strip().rstrip(";").split())
+
+
+def _is_safe_select(sql: str) -> bool:
+    norm = _normalize_sql(sql).lower()
+    return any(norm == _normalize_sql(allowed).lower() for allowed in SAFE_SELECT_STATEMENTS)
 
 
 def _check_sqlite_statement(stmt: str) -> str | None:
     if _SQLITE_WRITE_KEYWORDS.search(stmt):
         return f"sqlite write statement '{stmt.strip()[:30]}'"
-    pragma_match = _MUTATING_PRAGMA_PATTERN.search(stmt)
+    pragma_match = _PRAGMA_PATTERN.search(stmt)
     if pragma_match:
         pragma_name = pragma_match.group(1).lower()
+        has_assignment = bool(pragma_match.group(2) or pragma_match.group(3))
         clean = re.sub(r"\s+", "", stmt.lower())
-        if pragma_name == "query_only" and ("query_only=on" in clean or "query_only=1" in clean):
-            return None
-        if pragma_name == "trusted_schema" and (
-            "trusted_schema=off" in clean or "trusted_schema=0" in clean
-        ):
-            return None
+        if pragma_name == "query_only":
+            if "query_only=on" in clean or "query_only=1" in clean or not has_assignment:
+                return None
+            return f"sqlite mutating pragma '{stmt.strip()[:30]}'"
+        if pragma_name == "trusted_schema":
+            if "trusted_schema=off" in clean or "trusted_schema=0" in clean or not has_assignment:
+                return None
+            return f"sqlite mutating pragma '{stmt.strip()[:30]}'"
+        if pragma_name in _SAFE_INTROSPECTION_PRAGMAS:
+            if not has_assignment:
+                return None
+            return f"sqlite mutating pragma '{stmt.strip()[:30]}'"
         return f"sqlite mutating pragma '{stmt.strip()[:30]}'"
     return None
 
@@ -567,6 +606,19 @@ def _join_module(base: str, name: str) -> str:
     return base or name
 
 
+def _extract_string_expr(node: ast.AST, var_map: Mapping[str, list[str]]) -> list[str]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [node.value]
+    if isinstance(node, ast.Name) and node.id in var_map:
+        return var_map[node.id]
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left_strs = _extract_string_expr(node.left, var_map)
+        right_strs = _extract_string_expr(node.right, var_map)
+        if left_strs and right_strs:
+            return [lhs + rhs for lhs in left_strs for rhs in right_strs]
+    return []
+
+
 def _scan_module(
     source: str,
     *,
@@ -577,35 +629,70 @@ def _scan_module(
     imports: set[str] = set()
     references: list[str] = []
 
+    parent_map: dict[ast.AST, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parent_map[child] = parent
+
     # Map variable names to string values assigned in this module
     var_values: dict[str, list[str]] = {}
+    as_uri_vars: set[str] = set()
+
     for node in ast.walk(tree):
+        assigned_strings: list[str] = []
+        target_names: list[str] = []
+        val_expr: ast.AST | None = None
+
         if isinstance(node, ast.Assign):
-            assigned_strings: list[str] = []
-            if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
-                assigned_strings.append(node.value.value)
-            elif isinstance(node.value, ast.JoinedStr):
+            val_expr = node.value
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    target_names.append(target.id)
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            val_expr = node.value
+            if isinstance(node.target, ast.Name):
+                target_names.append(node.target.id)
+
+        if val_expr is not None:
+            has_as_uri_call = any(
+                isinstance(sub, ast.Call) and _call_name(sub.func).endswith("as_uri")
+                for sub in ast.walk(val_expr)
+            )
+            if has_as_uri_call:
+                for name in target_names:
+                    as_uri_vars.add(name)
+
+            if isinstance(val_expr, ast.Constant) and isinstance(val_expr.value, str):
+                assigned_strings.append(val_expr.value)
+            elif isinstance(val_expr, ast.JoinedStr):
                 parts = [
                     p.value
-                    for p in node.value.values
+                    for p in val_expr.values
                     if isinstance(p, ast.Constant) and isinstance(p.value, str)
                 ]
                 assigned_strings.append(" ".join(parts))
-            elif isinstance(node.value, ast.BinOp):
-                parts = [
-                    sub.value
-                    for sub in ast.walk(node.value)
-                    if isinstance(sub, ast.Constant) and isinstance(sub.value, str)
-                ]
-                assigned_strings.append(" ".join(parts))
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    var_values.setdefault(target.id, []).extend(assigned_strings)
+            elif isinstance(val_expr, ast.BinOp):
+                parts = []
+                for sub in ast.walk(val_expr):
+                    if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                        parts.append(sub.value)
+                if parts:
+                    assigned_strings.append(" ".join(parts))
+
+            for name in target_names:
+                var_values.setdefault(name, []).extend(assigned_strings)
+
+    sqlite3_modules: set[str] = set()
+    sqlite3_connect_funcs: set[str] = {"sqlite3.connect", "connect"}
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 imports.add(alias.name)
+                if alias.name == "sqlite3":
+                    mod_alias = alias.asname or "sqlite3"
+                    sqlite3_modules.add(mod_alias)
+                    sqlite3_connect_funcs.add(f"{mod_alias}.connect")
         elif isinstance(node, ast.ImportFrom):
             base = node.module or ""
             if node.level:
@@ -615,7 +702,52 @@ def _scan_module(
             for alias in node.names:
                 if alias.name != "*":
                     imports.add(_join_module(base, alias.name))
-        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                if base == "sqlite3":
+                    if alias.name == "connect":
+                        fn_alias = alias.asname or "connect"
+                        sqlite3_connect_funcs.add(fn_alias)
+                    elif alias.name == "*":
+                        sqlite3_connect_funcs.add("connect")
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    if isinstance(node.value, ast.Name) and node.value.id in sqlite3_modules:
+                        sqlite3_modules.add(target.id)
+                        sqlite3_connect_funcs.add(f"{target.id}.connect")
+                    elif _call_name(node.value) in sqlite3_connect_funcs:
+                        sqlite3_connect_funcs.add(target.id)
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and node.value is not None
+            and isinstance(node.target, ast.Name)
+        ):
+            if isinstance(node.value, ast.Name) and node.value.id in sqlite3_modules:
+                sqlite3_modules.add(node.target.id)
+                sqlite3_connect_funcs.add(f"{node.target.id}.connect")
+            elif _call_name(node.value) in sqlite3_connect_funcs:
+                sqlite3_connect_funcs.add(node.target.id)
+
+    query_only_conn_vars: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            called = _call_name(node.func)
+            method = called.rsplit(".", 1)[-1]
+            if method in {"execute", "executemany"} and node.args:
+                stmt_strs: list[str] = []
+                first_arg = node.args[0]
+                if isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str):
+                    stmt_strs.append(first_arg.value)
+                elif isinstance(first_arg, ast.Name):
+                    stmt_strs.extend(var_values.get(first_arg.id, []))
+                for s in stmt_strs:
+                    clean = re.sub(r"\s+", "", s.lower())
+                    if "pragmaquery_only=on" in clean or "pragmaquery_only=1" in clean:
+                        var_name = called.rsplit(".", 1)[0] if "." in called else ""
+                        if var_name:
+                            query_only_conn_vars.add(var_name)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
             if is_database_reference(node.value):
                 references.append(node.value)
         elif isinstance(node, ast.Call):
@@ -634,57 +766,97 @@ def _scan_module(
                 elif method_name == "executescript":
                     references.append(f"sqlite forbidden executescript '{called}'")
                 elif method_name in {"execute", "executemany"} and node.args:
-                    stmts_to_check: list[str] = []
                     first_arg = node.args[0]
                     if isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str):
-                        stmts_to_check.append(first_arg.value)
-                    elif isinstance(first_arg, ast.Name):
-                        stmts_to_check.extend(var_values.get(first_arg.id, []))
-                    elif isinstance(first_arg, ast.JoinedStr):
-                        parts = [
-                            p.value
-                            for p in first_arg.values
-                            if isinstance(p, ast.Constant) and isinstance(p.value, str)
-                        ]
-                        stmts_to_check.append(" ".join(parts))
-                    elif isinstance(first_arg, ast.BinOp):
-                        parts = [
-                            sub.value
-                            for sub in ast.walk(first_arg)
-                            if isinstance(sub, ast.Constant) and isinstance(sub.value, str)
-                        ]
-                        stmts_to_check.append(" ".join(parts))
-                    for stmt in stmts_to_check:
-                        problem = _check_sqlite_statement(stmt)
+                        problem = _check_sqlite_statement(first_arg.value)
                         if problem:
                             references.append(problem)
-                elif called in {"sqlite3.connect", "connect"}:
-                    # Enforce read-only SQLite use: mode=ro required
+                    else:
+                        resolved = _extract_string_expr(first_arg, var_values)
+                        if not resolved and isinstance(first_arg, ast.Name):
+                            resolved = var_values.get(first_arg.id, [])
+                        if not resolved:
+                            name_str = _call_name(first_arg) or "expr"
+                            references.append(f"sqlite forbidden non-literal SQL '{name_str}'")
+                        else:
+                            for stmt in resolved:
+                                problem = _check_sqlite_statement(stmt)
+                                if problem:
+                                    references.append(problem)
+                                elif not _is_safe_select(stmt):
+                                    references.append(
+                                        f"sqlite forbidden non-literal SQL '{stmt.strip()[:30]}'"
+                                    )
+                elif called in sqlite3_connect_funcs:
+                    has_uri_true = any(
+                        kw.arg == "uri"
+                        and isinstance(kw.value, ast.Constant)
+                        and kw.value.value is True
+                        for kw in node.keywords
+                    )
                     conn_target_strings: list[str] = []
+                    target_expr: ast.AST | None = None
                     if node.args:
-                        first_arg = node.args[0]
-                        if isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str):
-                            conn_target_strings.append(first_arg.value)
-                        elif isinstance(first_arg, ast.Name):
-                            conn_target_strings.extend(var_values.get(first_arg.id, []))
-                        elif isinstance(first_arg, ast.BinOp):
-                            parts = [
-                                sub.value
-                                for sub in ast.walk(first_arg)
-                                if isinstance(sub, ast.Constant) and isinstance(sub.value, str)
-                            ]
-                            conn_target_strings.append(" ".join(parts))
-                    for kw in node.keywords:
-                        if kw.arg == "database":
-                            if isinstance(kw.value, ast.Constant) and isinstance(
-                                kw.value.value, str
+                        target_expr = node.args[0]
+                    else:
+                        for kw in node.keywords:
+                            if kw.arg == "database":
+                                target_expr = kw.value
+                                break
+
+                    has_as_uri = False
+                    if target_expr is not None:
+                        if isinstance(target_expr, ast.Name) and target_expr.id in as_uri_vars:
+                            has_as_uri = True
+                        for sub in ast.walk(target_expr):
+                            if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                                conn_target_strings.append(sub.value)
+                            elif isinstance(sub, ast.Name):
+                                conn_target_strings.extend(var_values.get(sub.id, []))
+                                if sub.id in as_uri_vars:
+                                    has_as_uri = True
+                            elif isinstance(sub, ast.Call) and _call_name(sub.func).endswith(
+                                "as_uri"
                             ):
-                                conn_target_strings.append(kw.value.value)
-                            elif isinstance(kw.value, ast.Name):
-                                conn_target_strings.extend(var_values.get(kw.value.id, []))
-                    if not conn_target_strings or not any(
-                        "mode=ro" in s for s in conn_target_strings
-                    ):
+                                has_as_uri = True
+
+                    is_file_uri = has_as_uri or any("file:" in s for s in conn_target_strings)
+                    has_query_mode_ro = False
+                    for s in conn_target_strings:
+                        if "#" in s:
+                            q_part, _f_part = s.split("#", 1)
+                            if "mode=ro" in q_part:
+                                has_query_mode_ro = True
+                        else:
+                            if "mode=ro" in s:
+                                has_query_mode_ro = True
+
+                    valid_uri_ro = has_uri_true and is_file_uri and has_query_mode_ro
+
+                    has_query_only = False
+                    conn_vars: list[str] = []
+                    curr: ast.AST | None = node
+                    while curr is not None:
+                        p = parent_map.get(curr)
+                        if isinstance(p, ast.Assign):
+                            for t in p.targets:
+                                if isinstance(t, ast.Name):
+                                    conn_vars.append(t.id)
+                            break
+                        if isinstance(p, ast.AnnAssign):
+                            if isinstance(p.target, ast.Name):
+                                conn_vars.append(p.target.id)
+                            break
+                        if isinstance(p, ast.withitem):
+                            if isinstance(p.optional_vars, ast.Name):
+                                conn_vars.append(p.optional_vars.id)
+                            break
+                        curr = p
+
+                    if any(v in query_only_conn_vars for v in conn_vars):
+                        has_query_only = True
+
+                    if not (valid_uri_ro or has_query_only):
                         references.append(f"sqlite writable connection '{called}'")
     return imports, references
 
