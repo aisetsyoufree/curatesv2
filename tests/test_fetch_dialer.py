@@ -1,5 +1,6 @@
 """Pinned dialer tests. The only server is a loopback TLS server with a test-only CA."""
 
+import gzip
 import ipaddress
 import socket
 import ssl
@@ -145,30 +146,37 @@ def test_connects_to_pinned_address_and_verifies_original_hostname(
     response = get(lab.transport(server), url_for(server))
     assert response.status_code == 200 and response.content == b"hello"
     assert server.requests == ["/"]
-    assert lookups == ["127.0.0.1"]  # the hostname was never looked up
+    assert lookups == []  # no resolver call at all, not even a numeric one
 
 
-def test_second_lookup_answer_is_never_used(lab: Lab, lookups: list[str]) -> None:
-    answers = [["127.0.0.1"], ["192.0.2.55"]]
-    calls = 0
+def test_sockets_are_family_specific_and_never_use_create_connection(
+    lab: Lab, lookups: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    families: list[int] = []
+    real = socket.socket
 
-    def resolver(host: str) -> list[str]:
-        nonlocal calls
-        calls += 1
-        return answers[calls - 1]
+    class Spy(real):  # type: ignore[valid-type, misc]
+        def __init__(self, family: int = -1, *args: Any, **kwargs: Any) -> None:
+            families.append(family)
+            super().__init__(family, *args, **kwargs)
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("create_connection resolves names")
 
     server = lab.serve(lambda conn, path: reply(conn))
-    first = [ipaddress.ip_address(a) for a in resolver(HOST)]
-    transport = PinnedTransport(
-        first,
-        ssl_context=lab.client_context(),
-        test_override=LoopbackOverride(server.port),
-    )
+    transport = lab.transport(server)
+    monkeypatch.setattr(socket, "create_connection", forbidden)
+    monkeypatch.setattr(socket, "socket", Spy)
+    get(transport, url_for(server))
+    assert socket.AF_INET in families and lookups == []
+
+
+def test_each_request_reuses_the_pin_not_a_new_lookup(lab: Lab, lookups: list[str]) -> None:
+    server = lab.serve(lambda conn, path: reply(conn))
+    transport = lab.transport(server)
     get(transport, url_for(server))
     get(transport, url_for(server))
-    assert calls == 1
-    assert lookups == ["127.0.0.1", "127.0.0.1"]
-    assert len(server.requests) == 2
+    assert lookups == [] and len(server.requests) == 2
 
 
 def test_certificate_for_another_hostname_is_rejected(lab: Lab) -> None:
@@ -200,11 +208,47 @@ def test_mismatching_peer_address_is_rejected(lab: Lab, monkeypatch: pytest.Monk
     assert server.requests == []
 
 
-def test_peer_address_is_compared_after_ipv4_mapping() -> None:
+def test_pinned_mapped_address_is_normalized() -> None:
     mapped = ipaddress.ip_address("::ffff:8.8.8.8")
-    assert fetch_dialer.normalize_address(mapped) == ipaddress.ip_address("8.8.8.8")
     transport = PinnedTransport([mapped])
     assert transport.pinned_addresses == (ipaddress.ip_address("8.8.8.8"),)
+
+
+def report_peer_as(monkeypatch: pytest.MonkeyPatch, text: str) -> None:
+    """Make the real peer look like `text` to the real verification, without touching it."""
+
+    class FakePeer:
+        def __init__(self, real: socket.socket) -> None:
+            self._real = real
+
+        def getpeername(self) -> tuple[str, int, int, int]:
+            return (text, 443, 0, 0)
+
+    original = fetch_dialer._PinnedStream.get_extra_info
+
+    def patched(self: Any, info: str) -> Any:
+        found = original(self, info)
+        return FakePeer(found) if info == "socket" and found is not None else found
+
+    monkeypatch.setattr(fetch_dialer._PinnedStream, "get_extra_info", patched)
+
+
+def test_peer_reported_in_ipv4_mapped_form_matches_its_pin(
+    lab: Lab, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = lab.serve(lambda conn, path: reply(conn, body=b"mapped"))
+    report_peer_as(monkeypatch, "::ffff:127.0.0.1")
+    assert get(lab.transport(server), url_for(server)).content == b"mapped"
+
+
+def test_peer_reported_as_a_mismatching_mapped_address_is_rejected(
+    lab: Lab, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = lab.serve(lambda conn, path: reply(conn))
+    report_peer_as(monkeypatch, "::ffff:8.8.8.8")
+    with pytest.raises(PinViolation):
+        get(lab.transport(server), url_for(server))
+    assert server.requests == []
 
 
 def test_read_timeout_fires(lab: Lab) -> None:
@@ -230,26 +274,126 @@ def test_total_timeout_fires_on_a_slow_drip(lab: Lab) -> None:
     assert time.monotonic() - started < 2
 
 
-def test_connect_timeout_and_attempts_are_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
-    dialed: list[str] = []
+def test_connect_attempts_are_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    dialed: list[Any] = []
 
-    def refuse(self: Any, host: str, port: int, *args: Any, **kwargs: Any) -> Any:
-        dialed.append(host)
-        raise httpcore.ConnectTimeout("simulated")
+    def refuse(self: Any, address: Any) -> Any:
+        dialed.append(address[0])
+        raise ConnectionRefusedError("simulated")
 
-    monkeypatch.setattr(httpcore.SyncBackend, "connect_tcp", refuse)
+    monkeypatch.setattr(socket.socket, "connect", refuse, raising=False)
     transport = PinnedTransport(
         [ipaddress.ip_address(a) for a in ("8.8.8.8", "8.8.4.4", "1.1.1.1")], max_attempts=2
     )
-    with pytest.raises(httpx.ConnectTimeout):
+    with pytest.raises(httpx.ConnectError):
         get(transport, f"https://{HOST}/")
     assert dialed == ["8.8.8.8", "8.8.4.4"]
+
+
+@pytest.fixture
+def stalled() -> Iterator[socket.socket]:
+    """A loopback listener whose kernel completes TCP but which never answers TLS."""
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+    yield listener
+    listener.close()
+
+
+def stalled_transport(stalled: socket.socket, lab: Lab, **kwargs: Any) -> PinnedTransport:
+    return PinnedTransport(
+        [LOOPBACK],
+        ssl_context=lab.client_context(),
+        test_override=LoopbackOverride(stalled.getsockname()[1]),
+        **kwargs,
+    )
+
+
+def test_stalled_tls_upgrade_hits_the_connect_timeout(lab: Lab, stalled: socket.socket) -> None:
+    transport = stalled_transport(stalled, lab, connect_timeout=0.2, total_timeout=20)
+    started = time.monotonic()
+    with pytest.raises(httpx.ConnectTimeout):
+        get(transport, f"https://{HOST}:{stalled.getsockname()[1]}/")
+    assert time.monotonic() - started < 3
+
+
+def test_total_timeout_bounds_a_stalled_handshake(lab: Lab, stalled: socket.socket) -> None:
+    transport = stalled_transport(
+        stalled, lab, connect_timeout=20, read_timeout=20, total_timeout=0.1
+    )
+    started = time.monotonic()
+    with pytest.raises(httpx.TimeoutException):
+        get(transport, f"https://{HOST}:{stalled.getsockname()[1]}/")
+    assert time.monotonic() - started < 1
+
+
+def test_request_deadline_extension_tightens_the_total_timeout(
+    lab: Lab, stalled: socket.socket
+) -> None:
+    transport = stalled_transport(stalled, lab, connect_timeout=20, total_timeout=20)
+    request = httpx.Request(
+        "GET",
+        f"https://{HOST}:{stalled.getsockname()[1]}/",
+        extensions={fetch_dialer.TOTAL_TIMEOUT_EXTENSION: 0.1},
+    )
+    started = time.monotonic()
+    with pytest.raises(httpx.TimeoutException):
+        transport.handle_request(request)
+    assert time.monotonic() - started < 1
+
+
+def test_socket_registered_after_the_deadline_is_closed_immediately() -> None:
+    run = fetch_dialer._Run(0.05)
+    time.sleep(0.1)
+    late = socket.socket()
+    with pytest.raises(httpcore.ConnectTimeout):
+        run.register(late)
+    assert late.fileno() == -1
+    run.abort()
+
+
+def test_closing_the_transport_severs_a_streaming_response(lab: Lab) -> None:
+    def drip(conn: ssl.SSLSocket, path: str) -> None:
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n")
+        for _ in range(50):
+            conn.sendall(b"x")
+            time.sleep(0.1)
+
+    server = lab.serve(drip)
+    transport = lab.transport(server, read_timeout=10, total_timeout=20)
+    response = transport.handle_request(httpx.Request("GET", url_for(server)))
+    assert transport._runs
+    transport.close()
+    assert not transport._runs
+    started = time.monotonic()
+    with pytest.raises(httpx.HTTPError):
+        for _ in response.stream:  # type: ignore[union-attr]
+            pass
+    assert time.monotonic() - started < 2
 
 
 def test_response_size_limit_fires(lab: Lab) -> None:
     server = lab.serve(lambda conn, path: reply(conn, body=b"x" * 50_000))
     with pytest.raises(ResponseTooLarge):
         get(lab.transport(server, max_bytes=1_000), url_for(server))
+
+
+def test_compressed_response_is_refused_before_any_decoding(lab: Lab) -> None:
+    payload = gzip.compress(b"\0" * 1_000_000)  # ~1 KB on the wire, 1 MB decoded
+    server = lab.serve(
+        lambda conn, path: reply(conn, body=payload, extra="Content-Encoding: gzip\r\n")
+    )
+    with pytest.raises(fetch_dialer.UnsupportedEncoding):
+        get(lab.transport(server, max_bytes=100_000), url_for(server))
+
+
+def test_response_lying_about_its_encoding_is_not_decoded_and_stays_capped(lab: Lab) -> None:
+    payload = gzip.compress(b"\0" * 1_000_000)
+    server = lab.serve(lambda conn, path: reply(conn, body=payload))  # no Content-Encoding
+    response = get(lab.transport(server, max_bytes=100_000), url_for(server))
+    assert response.content == payload  # raw bytes, never inflated
+    with pytest.raises(ResponseTooLarge):
+        get(lab.transport(server, max_bytes=len(payload) - 1), url_for(server))
 
 
 def test_redirects_are_not_followed(lab: Lab) -> None:

@@ -7,11 +7,14 @@ certificate against the original hostname (SNI and hostname check). It is HTTPS-
 request. Nothing here runs at import time or by default; a caller must build a transport.
 """
 
+import contextlib
 import ipaddress
+import select
 import socket
 import ssl
 import threading
-from collections.abc import Iterator, Sequence
+import time
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any, final
 
@@ -90,6 +93,14 @@ class ResponseTooLarge(httpx.TransportError):
     """The response body exceeded the dialer's byte limit."""
 
 
+class UnsupportedEncoding(httpx.TransportError):
+    """The response declares a content encoding; only identity bodies are accepted."""
+
+
+# Request extension a caller may set to tighten (never loosen) the total deadline.
+TOTAL_TIMEOUT_EXTENSION = "cu_total_timeout"
+
+
 @dataclass(frozen=True)
 class LoopbackOverride:
     """Test-only: permit non-public pinned addresses and one non-443 port.
@@ -111,50 +122,91 @@ def _peer_address(stream: httpcore.NetworkStream) -> IPAddress:
 
 
 class _Run:
-    """One request's total-time watchdog and the sockets it can sever."""
+    """One request's single monotonic deadline and everything it can sever.
+
+    The deadline covers registration, every connect attempt, the TLS handshake, and every
+    read. Each blocking socket call is bounded by the time remaining; a watchdog also severs
+    registered sockets, and a socket registered after the deadline is closed immediately.
+    """
 
     def __init__(self, total: float) -> None:
-        self.expired = False
-        self._streams: list[httpcore.NetworkStream] = []
+        self._deadline = time.monotonic() + total
+        self._lock = threading.Lock()
+        self._sockets: list[socket.socket] = []
+        self._tripped = False
+        self.pool: httpcore.ConnectionPool | None = None
         self._timer = threading.Timer(total, self._expire)
         self._timer.daemon = True
 
     def start(self) -> None:
         self._timer.start()
 
-    def track(self, stream: httpcore.NetworkStream) -> None:
-        self._streams.append(stream)
+    def remaining(self) -> float:
+        return self._deadline - time.monotonic()
+
+    @property
+    def expired(self) -> bool:
+        return self._tripped or self.remaining() <= 0
+
+    def bound(self, timeout: float | None) -> float:
+        """Clamp a per-operation timeout to the time left; raise once none is left."""
+        left = self.remaining()
+        if left <= 0:
+            raise TimeoutError("total time limit exceeded")
+        return left if timeout is None else min(timeout, left)
+
+    def register(self, sock: socket.socket) -> None:
+        with self._lock:
+            if self.expired:
+                sock.close()
+                raise httpcore.ConnectTimeout("total time limit exceeded")
+            self._sockets.append(sock)
 
     def _expire(self) -> None:
-        self.expired = True
-        for stream in list(self._streams):
-            sock = stream.get_extra_info("socket")
-            try:
-                if sock is not None:
-                    sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
+        with self._lock:
+            self._tripped = True
+            sockets = list(self._sockets)
+        for sock in sockets:
+            with contextlib.suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
 
-    def stop(self) -> None:
+    def abort(self) -> None:
+        """Stop the watchdog and close every socket and the pool."""
         self._timer.cancel()
+        with self._lock:
+            sockets, self._sockets = self._sockets, []
+        for sock in sockets:
+            with contextlib.suppress(OSError):
+                sock.close()
+        if self.pool is not None:
+            self.pool.close()
 
 
 class _PinnedStream(httpcore.NetworkStream):
-    def __init__(
-        self,
-        inner: httpcore.NetworkStream,
-        backend: "_PinnedBackend",
-    ) -> None:
-        self._inner, self._backend = inner, backend
+    def __init__(self, sock: socket.socket, backend: "_PinnedBackend") -> None:
+        self._sock, self._backend = sock, backend
 
     def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
-        return self._inner.read(max_bytes, timeout)
+        try:
+            self._sock.settimeout(self._backend.run.bound(timeout))
+            return self._sock.recv(max_bytes)
+        except TimeoutError as exc:
+            raise httpcore.ReadTimeout(str(exc)) from exc
+        except OSError as exc:
+            raise httpcore.ReadError(str(exc)) from exc
 
     def write(self, buffer: bytes, timeout: float | None = None) -> None:
-        self._inner.write(buffer, timeout)
+        try:
+            while buffer:
+                self._sock.settimeout(self._backend.run.bound(timeout))
+                buffer = buffer[self._sock.send(buffer) :]
+        except TimeoutError as exc:
+            raise httpcore.WriteTimeout(str(exc)) from exc
+        except OSError as exc:
+            raise httpcore.WriteError(str(exc)) from exc
 
     def close(self) -> None:
-        self._inner.close()
+        self._sock.close()
 
     def start_tls(
         self,
@@ -168,17 +220,50 @@ class _PinnedStream(httpcore.NetworkStream):
             or ssl_context.verify_mode is not ssl.CERT_REQUIRED
             or not ssl_context.check_hostname
         ):
-            self._inner.close()
+            self._sock.close()
             raise PinViolation("TLS must verify the original hostname")
-        secured = self._inner.start_tls(ssl_context, server_hostname, timeout)
-        return self._backend.accept(secured)
+        run = self._backend.run
+        secured: ssl.SSLSocket | None = None
+        try:
+            secured = ssl_context.wrap_socket(
+                self._sock, server_hostname=server_hostname, do_handshake_on_connect=False
+            )
+            run.register(secured)
+            # One call, bounded by what is left of the single deadline.
+            secured.settimeout(run.bound(timeout))
+            secured.do_handshake()
+        except httpcore.ConnectTimeout:
+            raise
+        except TimeoutError as exc:
+            (secured or self._sock).close()
+            raise httpcore.ConnectTimeout(str(exc)) from exc
+        except OSError as exc:
+            (secured or self._sock).close()
+            raise httpcore.ConnectError(str(exc)) from exc
+        return self._backend.accept(_PinnedStream(secured, self._backend))
 
     def get_extra_info(self, info: str) -> Any:
-        return self._inner.get_extra_info(info)
+        sock = self._sock
+        try:
+            if info == "ssl_object" and isinstance(sock, ssl.SSLSocket):
+                return sock._sslobj  # type: ignore[attr-defined]
+            if info == "client_addr":
+                return sock.getsockname()
+            if info == "server_addr":
+                return sock.getpeername()
+            if info == "is_readable":
+                return bool(select.select([sock], [], [], 0)[0])
+        except (OSError, ValueError):
+            return None
+        return sock if info == "socket" else None
 
 
-class _PinnedBackend(httpcore.SyncBackend):
-    """Ignores the hostname it is asked to dial; connects only to pinned addresses."""
+class _PinnedBackend(httpcore.NetworkBackend):
+    """Ignores the hostname it is asked to dial; connects only to pinned addresses.
+
+    Sockets are created for the pin's own address family and connected to the numeric
+    address, so no resolver call is made at all.
+    """
 
     def __init__(
         self,
@@ -188,21 +273,18 @@ class _PinnedBackend(httpcore.SyncBackend):
         max_attempts: int,
         run: _Run,
     ) -> None:
-        super().__init__()
         self.host, self._port, self._addresses = host, port, addresses
-        self._max_attempts, self._run = max_attempts, run
+        self._max_attempts, self.run = max_attempts, run
 
-    def accept(self, stream: httpcore.NetworkStream) -> httpcore.NetworkStream:
-        """Verify the peer is a validated address, then guard the stream."""
+    def accept(self, stream: _PinnedStream) -> _PinnedStream:
+        """Verify the peer is a validated address."""
         try:
             if _peer_address(stream) not in self._addresses:
                 raise PinViolation("connected peer is not a validated address")
         except PinViolation:
             stream.close()
             raise
-        wrapped = _PinnedStream(stream, self)
-        self._run.track(wrapped)
-        return wrapped
+        return stream
 
     def connect_tcp(
         self,
@@ -212,19 +294,31 @@ class _PinnedBackend(httpcore.SyncBackend):
         local_address: str | None = None,
         socket_options: Any = None,
     ) -> httpcore.NetworkStream:
-        del host  # the name is never looked up; only the pinned addresses are dialed
+        del host, local_address, socket_options  # only the pinned addresses are dialed
         if port != self._port:
             raise PinViolation("unexpected destination port")
         failure: Exception | None = None
         for address in self._addresses[: self._max_attempts]:
+            family = (
+                socket.AF_INET6 if isinstance(address, ipaddress.IPv6Address) else socket.AF_INET
+            )
+            sock = socket.socket(family, socket.SOCK_STREAM)
             try:
-                stream = super().connect_tcp(
-                    str(address), port, timeout, local_address, socket_options
-                )
-            except (httpcore.ConnectError, httpcore.ConnectTimeout) as exc:
-                failure = exc
+                self.run.register(sock)
+                sock.settimeout(self.run.bound(timeout))
+                sock.connect((str(address), port))
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except TimeoutError as exc:
+                sock.close()
+                failure = httpcore.ConnectTimeout(str(exc))
+                if self.run.expired:
+                    break
                 continue
-            return self.accept(stream)
+            except OSError as exc:
+                sock.close()
+                failure = httpcore.ConnectError(str(exc))
+                continue
+            return self.accept(_PinnedStream(sock, self))
         raise failure if failure is not None else PinViolation("no pinned address")
 
 
@@ -243,7 +337,7 @@ _HTTPCORE_TO_HTTPX: tuple[tuple[type[Exception], type[httpx.TransportError]], ..
 
 
 def _map_error(exc: Exception, run: _Run) -> Exception:
-    if run.expired and not isinstance(exc, PinViolation | ResponseTooLarge):
+    if run.expired and not isinstance(exc, PinViolation | ResponseTooLarge | UnsupportedEncoding):
         return httpx.ReadTimeout("total time limit exceeded")
     if isinstance(exc, httpx.HTTPError):
         return exc
@@ -257,14 +351,19 @@ class _GuardedBody(httpx.SyncByteStream):
     def __init__(
         self,
         response: httpcore.Response,
-        pool: httpcore.ConnectionPool,
+        finish: Callable[[], None],
         run: _Run,
         max_bytes: int,
+        encoded: bool,
     ) -> None:
-        self._response, self._pool, self._run, self._max_bytes = response, pool, run, max_bytes
+        self._response, self._finish, self._run = response, finish, run
+        self._max_bytes, self._encoded = max_bytes, encoded
 
     def __iter__(self) -> Iterator[bytes]:
         received = 0
+        if self._encoded:
+            # The limit counts the bytes we hand on, so a decoder could inflate past it.
+            raise UnsupportedEncoding("compressed content encodings are refused")
         try:
             for chunk in self._response.iter_stream():
                 received += len(chunk)
@@ -284,8 +383,16 @@ class _GuardedBody(httpx.SyncByteStream):
         try:
             self._response.close()
         finally:
-            self._run.stop()
-            self._pool.close()
+            self._finish()
+
+
+def _is_encoded(headers: Sequence[tuple[bytes, bytes]]) -> bool:
+    return any(
+        token.strip() not in (b"", b"identity")
+        for name, value in headers
+        if name.lower() == b"content-encoding"
+        for token in value.lower().split(b",")
+    )
 
 
 @final
@@ -333,6 +440,20 @@ class PinnedTransport(httpx.BaseTransport):
         self._timeouts = (connect_timeout, read_timeout, total_timeout)
         self._max_bytes, self._max_attempts = max_bytes, max_attempts
         self._override = test_override
+        self._runs: set[_Run] = set()
+        self._runs_lock = threading.Lock()
+
+    def _finish(self, run: _Run) -> None:
+        with self._runs_lock:
+            self._runs.discard(run)
+        run.abort()
+
+    def close(self) -> None:
+        """Sever every outstanding request, including streaming bodies not yet closed."""
+        with self._runs_lock:
+            runs = list(self._runs)
+        for run in runs:
+            self._finish(run)
 
     @property
     def pinned_addresses(self) -> tuple[IPAddress, ...]:
@@ -357,6 +478,9 @@ class PinnedTransport(httpx.BaseTransport):
         ):
             raise httpx.UnsupportedProtocol("only HTTPS GET to a hostname on port 443 is allowed")
         connect, read, total = self._timeouts
+        requested = request.extensions.get(TOTAL_TIMEOUT_EXTENSION)
+        if isinstance(requested, int | float) and not isinstance(requested, bool):
+            total = min(total, max(float(requested), 0.001))
         run = _Run(total)
         pool = httpcore.ConnectionPool(
             ssl_context=self._ssl,
@@ -380,17 +504,25 @@ class PinnedTransport(httpx.BaseTransport):
                 "timeout": {"connect": connect, "read": read, "write": read, "pool": connect}
             },
         )
+        run.pool = pool
+        with self._runs_lock:
+            self._runs.add(run)
         run.start()
         try:
             response = pool.handle_request(core_request)
         except Exception as exc:
-            run.stop()
-            pool.close()
+            self._finish(run)
             mapped = _map_error(exc, run)
             if mapped is exc:
                 raise
             raise mapped from exc
-        body = _GuardedBody(response, pool, run, self._max_bytes)
+        body = _GuardedBody(
+            response,
+            lambda: self._finish(run),
+            run,
+            self._max_bytes,
+            _is_encoded(response.headers),
+        )
         return httpx.Response(
             status_code=response.status,
             headers=response.headers,

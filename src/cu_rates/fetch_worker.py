@@ -32,7 +32,12 @@ from cu_rates.contracts.sources import (
     SourceApproval,
     profile_sha256,
 )
-from cu_rates.fetch_dialer import PinnedTransport, globally_routable, normalize_address
+from cu_rates.fetch_dialer import (
+    TOTAL_TIMEOUT_EXTENSION,
+    PinnedTransport,
+    globally_routable,
+    normalize_address,
+)
 from cu_rates.fetch_robots import PRODUCT, RobotsPolicy, parse_robots
 
 USER_AGENT = f"{PRODUCT}/2 (+https://github.com/aisetsyoufree/curatesv2)"
@@ -367,7 +372,11 @@ class FetchWorker:
             raise _Stopped("live-transport-disabled")
         # Single dispatch, with no HTTP client redirect processing or proxy discovery.
         request = httpx.Request(
-            "GET", url, headers={"User-Agent": USER_AGENT, "Accept-Encoding": "identity", **headers}
+            "GET",
+            url,
+            headers={"User-Agent": USER_AGENT, "Accept-Encoding": "identity", **headers},
+            # The profile deadline bounds the dialer's connect, handshake, and reads too.
+            extensions={TOTAL_TIMEOUT_EXTENSION: timeout},
         )
         with transport:
             response = transport.handle_request(request)
@@ -425,6 +434,9 @@ class FetchWorker:
                 if len(body) + len(chunk) > limit:
                     raise _Stopped("body-too-large")
                 body.extend(chunk)
+            # Completion is checked even when no chunk arrived (an empty body).
+            if self._monotonic() - tick > timeout:
+                raise _Stopped("response-time-limit")
         return _Response(code, headers, bytes(body), delay)
 
     def _robots(self, db: sqlite3.Connection, url: httpx.URL, timeout: int) -> RobotsPolicy:

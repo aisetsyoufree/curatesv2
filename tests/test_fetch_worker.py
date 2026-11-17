@@ -23,7 +23,7 @@ from cu_rates.contracts.sources import (
     RateSource,
     profile_sha256,
 )
-from cu_rates.fetch_dialer import LoopbackOverride, PinnedTransport
+from cu_rates.fetch_dialer import TOTAL_TIMEOUT_EXTENSION, LoopbackOverride, PinnedTransport
 from cu_rates.fetch_worker import (
     ROBOTS_TTL,
     USER_AGENT,
@@ -615,6 +615,68 @@ def test_worker_dispatches_the_gateway_dialer_pinned_to_validated_addresses(
     result = worker.fetch(pilot.source, pilot.profile, pilot.approval, pilot.terms)
     assert result.reason == "fetched"
     assert served == ["/robots.txt", "/rates"]
+
+
+def test_worker_passes_the_profile_deadline_to_the_dialer(
+    pilot: Pilot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[object] = []
+
+    def stub(transport: PinnedTransport, request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions.get(TOTAL_TIMEOUT_EXTENSION))
+        return ok(request)
+
+    monkeypatch.setattr(PinnedTransport, "handle_request", stub)
+    pinned_worker(pilot, PinnedTransport).fetch(
+        pilot.source, pilot.profile, pilot.approval, pilot.terms
+    )
+    assert seen == [pilot.profile.timeout_seconds] * 2
+
+
+class NoChunks(httpx.SyncByteStream):
+    def __iter__(self) -> Iterator[bytes]:
+        return iter(())
+
+
+def test_empty_body_past_the_profile_deadline_is_stopped(pilot: Pilot) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/robots.txt":
+            return robots()
+        pilot.clock.sleep(pilot.profile.timeout_seconds + 5)
+        # A stream that yields no chunk at all, as a real empty body does.
+        return httpx.Response(200, stream=NoChunks(), headers={"Content-Type": "text/html"})
+
+    result = pilot.fetch(handler)
+    assert result.reason == "response-time-limit" and result.artifact is None
+
+
+def test_resolver_rebinding_never_reaches_the_dialer(
+    pilot: Pilot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answers = iter([("8.8.8.8",), ("127.0.0.1",)])
+    dialed: list[tuple[_IPAddress, ...]] = []
+
+    def resolve(host: str) -> tuple[str, ...]:
+        return next(answers)
+
+    def factory(addresses: tuple[_IPAddress, ...]) -> PinnedTransport:
+        dialed.append(addresses)
+        return PinnedTransport(addresses)
+
+    monkeypatch.setattr(PinnedTransport, "handle_request", lambda t, request: ok(request))
+    worker = FetchWorker(
+        pilot.path / "state",
+        pilot.store,
+        factory,
+        git_sha="0" * 40,
+        clock=pilot.clock.now,
+        monotonic=pilot.clock.now,
+        sleep=pilot.clock.sleep,
+        resolve=resolve,
+    )
+    result = worker.fetch(pilot.source, pilot.profile, pilot.approval, pilot.terms)
+    assert result.reason == "non-routable-address"
+    assert dialed == [(ipaddress.IPv4Address("8.8.8.8"),)]  # the rebound answer never got a dialer
 
 
 def test_worker_refuses_a_dialer_not_pinned_to_the_validated_set(
