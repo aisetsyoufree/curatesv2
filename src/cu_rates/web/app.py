@@ -53,6 +53,9 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
     app.config.setdefault("ENABLE_ANALYTICS", False)
     app.config.setdefault("GA_MEASUREMENT_ID", None)
     app.config.setdefault("CANONICAL_ORIGIN", "https://cu-rates.org")
+    app.config.setdefault("SNAPSHOT_ROOT", None)
+    app.config.setdefault("DENYLIST_PATH", None)
+    app.config.setdefault("SNAPSHOT_CLOCK", None)
 
     if config:
         app.config.update(config)

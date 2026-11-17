@@ -1,8 +1,23 @@
 """Web views for CU-Rates.org."""
 
+from datetime import UTC, datetime
 from typing import Any, TypedDict
 
 from flask import Blueprint, Response, abort, current_app, render_template, request
+
+from cu_rates.contracts.enums import ProductFamily
+from cu_rates.web.comparison import (
+    ALLOWED_PARAMS,
+    ALLOWED_SCENARIOS,
+    ALLOWED_SORTS,
+    CANONICAL_SCENARIO_SPECS,
+    SCENARIOS_BY_ID,
+    SORT_LABELS,
+    FormattedOffer,
+    classify_and_format_offer,
+    read_snapshot_offers,
+    sort_offers,
+)
 
 web_bp = Blueprint("web", __name__)
 
@@ -127,6 +142,12 @@ _PAGE_META: dict[str, tuple[str, str, tuple[tuple[str, str], ...]]] = {
         "Unreviewed articles stay out of the search index.",
         (("Home", "/"), ("Learn", "/learn")),
     ),
+    "web.compare": (
+        "Compare Residential Lending Terms",
+        "Compare publicly advertised mortgage and home equity terms across Massachusetts "
+        "credit unions under declared canonical scenarios.",
+        (("Home", "/"), ("Compare", "/compare")),
+    ),
 }
 
 
@@ -224,6 +245,136 @@ def privacy() -> str:
     return render_template("privacy.html")
 
 
+MAX_COMPARE_QUERY_BYTES = 2048
+MAX_COMPARE_QUERY_PARAMS = 10
+
+
+@web_bp.route("/compare")
+def compare() -> Response:
+    """Render the rate comparison experience reading only from the published snapshot."""
+    if len(request.query_string) > MAX_COMPARE_QUERY_BYTES:
+        abort(400)
+
+    if len(request.args) > MAX_COMPARE_QUERY_PARAMS:
+        abort(400)
+
+    for param in request.args:
+        if len(request.args.getlist(param)) > 1:
+            abort(400)
+        if param not in ALLOWED_PARAMS:
+            abort(400)
+
+    scenario_param = request.args.get("scenario", "all")
+    if scenario_param not in ALLOWED_SCENARIOS:
+        abort(400)
+
+    sort_param = request.args.get("sort", "institution")
+    if sort_param not in ALLOWED_SORTS:
+        abort(400)
+
+    now = datetime.now(UTC)
+    clock_override = current_app.config.get("SNAPSHOT_CLOCK")
+    if isinstance(clock_override, datetime):
+        now = clock_override
+    if now.utcoffset() is None:
+        now = now.replace(tzinfo=UTC)
+
+    info, raw_offers = read_snapshot_offers(at=now)
+
+    formatted_offers = []
+    for raw in raw_offers:
+        item = classify_and_format_offer(raw, now)
+        if item is not None:
+            formatted_offers.append(item)
+
+    has_published_data = len(formatted_offers) > 0
+
+    selected_specs = (
+        CANONICAL_SCENARIO_SPECS
+        if scenario_param == "all"
+        else ((SCENARIOS_BY_ID[scenario_param],) if scenario_param in SCENARIOS_BY_ID else ())
+    )
+
+    scenario_sections: list[dict[str, Any]] = []
+    for spec in selected_specs:
+        scenario_offers = [
+            o
+            for o in formatted_offers
+            if o.scenario_id == spec.scenario_id
+            or (o.scenario_id is None and o.family == spec.family.value)
+        ]
+        comparable = [o for o in scenario_offers if o.is_comparable]
+        incomparable = [o for o in scenario_offers if not o.is_comparable]
+
+        # Group identical structures for HELOC before sorting; never mix structures in one grid
+        structure_groups = []
+        if spec.family is ProductFamily.HELOC:
+            groups_map: dict[tuple[int | None, int | None], list[FormattedOffer]] = {}
+            for o in comparable:
+                key = (o.draw_period_months, o.repayment_period_months)
+                groups_map.setdefault(key, []).append(o)
+            for _key, group_offers in sorted(
+                groups_map.items(),
+                key=lambda item: (item[0][0] or 0, item[0][1] or 0),
+            ):
+                label = group_offers[0].structure_label if group_offers else ""
+                structure_groups.append(
+                    {
+                        "label": label,
+                        "offers": sort_offers(group_offers, sort_param),
+                    }
+                )
+        else:
+            if comparable:
+                structure_groups.append(
+                    {
+                        "label": "",
+                        "offers": sort_offers(comparable, sort_param),
+                    }
+                )
+
+        # Incomparable/incomplete sections keep neutral institution ordering
+        # regardless of sort parameters (Finding 4)
+        sorted_incomparable = sort_offers(incomparable, "institution")
+        represented_institutions = tuple(sorted({o.institution_name for o in comparable}))
+
+        scenario_sections.append(
+            {
+                "spec": spec,
+                "structure_groups": structure_groups,
+                "comparable": sort_offers(comparable, sort_param),
+                "incomparable": sorted_incomparable,
+                "comparable_count": len(comparable),
+                "incomparable_count": len(incomparable),
+                "total_count": len(scenario_offers),
+                "represented_institutions": represented_institutions,
+                "institution_count": len(represented_institutions),
+            }
+        )
+
+    total_displayed = sum(int(s["total_count"]) for s in scenario_sections)
+    noindex = (not has_published_data) or (total_displayed == 0)
+
+    headers: dict[str, str] = {}
+    if noindex:
+        headers["X-Robots-Tag"] = "noindex, follow"
+
+    rendered = render_template(
+        "compare.html",
+        has_published_data=has_published_data,
+        scenario_param=scenario_param,
+        sort_param=sort_param,
+        active_sort_label=SORT_LABELS.get(sort_param, "Institution Name (A-Z)"),
+        sort_options=SORT_LABELS,
+        scenario_sections=scenario_sections,
+        all_scenario_specs=CANONICAL_SCENARIO_SPECS,
+        snapshot_info=info,
+        noindex=noindex,
+        total_displayed=total_displayed,
+    )
+    return Response(rendered, headers=headers)
+
+
 @web_bp.route("/learn")
 def learn_index() -> Response:
     """Render educational content index."""
@@ -273,6 +424,18 @@ def sitemap_xml() -> Response:
         f"{origin}/methodology",
         f"{origin}/privacy",
     ]
+    # Include /compare only when display-eligible offers exist (same predicate as noindex)
+    now = datetime.now(UTC)
+    clock_override = current_app.config.get("SNAPSHOT_CLOCK")
+    if isinstance(clock_override, datetime):
+        now = clock_override
+    if now.utcoffset() is None:
+        now = now.replace(tzinfo=UTC)
+
+    _info, raw_offers = read_snapshot_offers(at=now)
+    if any(classify_and_format_offer(raw, now) is not None for raw in raw_offers):
+        urls.append(f"{origin}/compare")
+
     # Unreviewed articles remain excluded from sitemap until verified
     for slug, meta in ARTICLES.items():
         if meta.get("reviewed", False):

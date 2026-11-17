@@ -308,6 +308,241 @@ li {
   margin: 0;
 }
 
+/* Rate Comparison Page Styles */
+.compare-controls {
+  margin-bottom: 1.5rem;
+}
+
+.controls-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1.25rem;
+  align-items: flex-end;
+}
+
+.control-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  flex: 1 1 14rem;
+}
+
+.control-group.control-submit {
+  flex: 0 0 auto;
+}
+
+.control-label {
+  font-size: 0.875rem;
+  font-weight: 700;
+  color: var(--color-text);
+}
+
+.control-select {
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--color-border);
+  border-radius: 0.375rem;
+  font-size: 0.95rem;
+  background-color: var(--color-surface);
+  color: var(--color-text);
+}
+
+.control-button {
+  padding: 0.55rem 1.25rem;
+  background-color: var(--color-primary);
+  color: #ffffff;
+  border: none;
+  border-radius: 0.375rem;
+  font-weight: 700;
+  font-size: 0.95rem;
+  cursor: pointer;
+}
+
+.control-button:hover {
+  background-color: var(--color-primary-hover);
+}
+
+.active-filters-bar {
+  background-color: var(--color-surface-alt);
+  border: 1px solid var(--color-border);
+  border-radius: 0.375rem;
+  padding: 0.65rem 1rem;
+  margin-bottom: 2rem;
+  font-size: 0.9rem;
+}
+
+.active-filters-bar p {
+  margin: 0;
+}
+
+.scenarios-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 1.5rem;
+  margin-top: 1.5rem;
+}
+
+.scenario-card h3 {
+  margin-top: 0;
+  margin-bottom: 0.5rem;
+}
+
+.assumptions-box {
+  background-color: var(--color-surface-alt);
+  border: 1px solid var(--color-border);
+  border-radius: 0.375rem;
+  padding: 1rem;
+  margin-top: 1rem;
+}
+
+.assumptions-box h4 {
+  margin-top: 0;
+  margin-bottom: 0.5rem;
+  font-size: 0.95rem;
+  color: var(--color-text);
+}
+
+.assumptions-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.assumptions-list li {
+  font-size: 0.875rem;
+  margin-bottom: 0.35rem;
+  color: var(--color-text-muted);
+}
+
+.scenario-block {
+  margin-bottom: 3.5rem;
+  padding-bottom: 2rem;
+  border-bottom: 2px solid var(--color-border);
+}
+
+.scenario-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+  margin-top: 1.5rem;
+}
+
+.scenario-assumptions-panel {
+  background-color: var(--color-surface-alt);
+}
+
+.scenario-assumptions-panel h3 {
+  margin-top: 0;
+  margin-bottom: 0.75rem;
+  font-size: 1.1rem;
+}
+
+.scenario-grid-panel {
+  flex: 1 1 auto;
+}
+
+.scenario-grid-panel h3 {
+  margin-top: 0;
+  margin-bottom: 0.75rem;
+  font-size: 1.15rem;
+}
+
+.table-responsive {
+  overflow-x: auto;
+  padding: 0;
+  border: 1px solid var(--color-border);
+  background-color: var(--color-surface);
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+  text-align: left;
+}
+
+.data-table caption {
+  caption-side: top;
+  text-align: left;
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--color-text-muted);
+  padding: 0.75rem 1rem;
+  background-color: var(--color-surface-alt);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.data-table th,
+.data-table td {
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--color-border);
+  vertical-align: top;
+}
+
+.data-table thead th {
+  background-color: #f8fafc;
+  font-weight: 700;
+  color: var(--color-text);
+}
+
+.institution-cell {
+  font-weight: 700;
+  color: var(--color-text);
+}
+
+.reason-cell {
+  max-width: 16rem;
+}
+
+.reason-badge {
+  display: inline-block;
+  background-color: #fef2f2;
+  color: #991b1b;
+  border: 1px solid #fecaca;
+  border-radius: 0.25rem;
+  padding: 0.2rem 0.5rem;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.incomparable-section {
+  margin-top: 2rem;
+  padding-top: 1.5rem;
+  border-top: 1px dashed var(--color-border);
+}
+
+.incomparable-section h3 {
+  margin-top: 0;
+  margin-bottom: 0.5rem;
+  font-size: 1.15rem;
+  color: #991b1b;
+}
+
+.incomparable-intro {
+  font-size: 0.875rem;
+  color: var(--color-text-muted);
+  margin-bottom: 1rem;
+}
+
+.no-offers-notice {
+  font-size: 0.95rem;
+  color: var(--color-text-muted);
+  margin: 0;
+}
+
+.notice-card {
+  padding: 1.25rem;
+}
+
+.empty-state-card {
+  border-left: 5px solid var(--color-primary);
+}
+
+.empty-state-card h2 {
+  margin-top: 0;
+  color: var(--color-text);
+}
+
 /* Responsive adjustments */
 @media (min-width: 640px) {
   h1 {
@@ -315,5 +550,16 @@ li {
   }
   .site-main {
     padding: 2.5rem 1.5rem 4rem 1.5rem;
+  }
+  .scenarios-grid {
+    grid-template-columns: repeat(auto-fit, minmax(28rem, 1fr));
+  }
+}
+
+@media (min-width: 1024px) {
+  .scenario-layout {
+    display: grid;
+    grid-template-columns: 20rem 1fr;
+    align-items: start;
   }
 }

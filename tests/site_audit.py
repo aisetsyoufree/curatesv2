@@ -5,6 +5,7 @@ slipping through, then the corrected detector catching it.
 """
 
 import ast
+import html
 import re
 from collections.abc import Mapping, Sequence
 from html.parser import HTMLParser
@@ -429,11 +430,141 @@ def publication_problems(
     return problems
 
 
-def is_forbidden_module(name: str) -> bool:
+FORBIDDEN_RANKING_WORDS = ("#1", "best", "cheapest", "lowest", "recommended", "top")
+FORBIDDEN_RANKING_PATTERN = re.compile(
+    r"\b(best|cheapest|top|recommended|lowest)\b|#1\b",
+    re.IGNORECASE,
+)
+
+
+class _RankingScanner(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.texts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        for key, value in attrs:
+            if key == "alt" and value:
+                self.texts.append(value)
+
+    def handle_data(self, data: str) -> None:
+        if data.strip():
+            self.texts.append(data)
+
+
+def forbidden_ranking_problems(text: str) -> list[str]:
+    """Detect words that imply an unsupported ranking or endorsement in text or HTML elements."""
+    matches: set[str] = set()
+
+    # 1. Normalized rendered text with tags stripped to catch split-markup
+    # (e.g. "<b>low</b>est", "<i>be</i>st")
+    stripped = re.sub(r"<[^>]+>", "", text)
+    decoded_stripped = html.unescape(stripped)
+    collapsed_stripped = re.sub(r"\s+", " ", decoded_stripped).strip()
+    folded_stripped = collapsed_stripped.casefold()
+    for m in FORBIDDEN_RANKING_PATTERN.finditer(folded_stripped):
+        matches.add(m.group(0).lower())
+
+    # 2. Normalized rendered text with tags spaced to keep separate elements distinct
+    spaced = re.sub(r"<[^>]+>", " ", text)
+    decoded_spaced = html.unescape(spaced)
+    collapsed_spaced = re.sub(r"\s+", " ", decoded_spaced).strip()
+    folded_spaced = collapsed_spaced.casefold()
+    for m in FORBIDDEN_RANKING_PATTERN.finditer(folded_spaced):
+        matches.add(m.group(0).lower())
+
+    # 3. Direct unescaped text match
+    decoded_raw = html.unescape(text).casefold()
+    for m in FORBIDDEN_RANKING_PATTERN.finditer(decoded_raw):
+        matches.add(m.group(0).lower())
+
+    if "<" in text and ">" in text:
+        scanner = _RankingScanner()
+        try:
+            scanner.feed(text)
+            for snippet in scanner.texts:
+                snip_dec = html.unescape(snippet).casefold()
+                for m in FORBIDDEN_RANKING_PATTERN.finditer(snip_dec):
+                    matches.add(m.group(0).lower())
+        except Exception:
+            pass
+    return [f"forbidden ranking word '{word}'" for word in sorted(matches)]
+
+
+_SQLITE_WRITE_KEYWORDS = re.compile(
+    r"\b(insert\s+into|update\s+\w+|delete\s+from|drop\s+table|create\s+table|alter\s+table|replace\s+into|vacuum|attach\s+database)\b",
+    re.IGNORECASE,
+)
+
+_PRAGMA_PATTERN = re.compile(
+    r"\bpragma\s+([a-zA-Z_]+)(?:\s*(=|\()|\s*([a-zA-Z0-9_]+))?",
+    re.IGNORECASE,
+)
+
+_SAFE_INTROSPECTION_PRAGMAS = frozenset(
+    {
+        "user_version",
+        "journal_mode",
+        "quick_check",
+        "integrity_check",
+        "application_id",
+        "schema_version",
+        "table_info",
+        "foreign_key_list",
+        "index_list",
+    }
+)
+
+SAFE_SELECT_STATEMENTS = frozenset(
+    {
+        "SELECT payload FROM snapshot_info",
+        "SELECT offer_id, payload FROM public_offers ORDER BY offer_id",
+        "SELECT * FROM info",
+        "SELECT 1",
+    }
+)
+
+
+def _normalize_sql(sql: str) -> str:
+    return " ".join(sql.strip().rstrip(";").split())
+
+
+def _is_safe_select(sql: str) -> bool:
+    norm = _normalize_sql(sql).lower()
+    return any(norm == _normalize_sql(allowed).lower() for allowed in SAFE_SELECT_STATEMENTS)
+
+
+def _check_sqlite_statement(stmt: str) -> str | None:
+    if _SQLITE_WRITE_KEYWORDS.search(stmt):
+        return f"sqlite write statement '{stmt.strip()[:30]}'"
+    pragma_match = _PRAGMA_PATTERN.search(stmt)
+    if pragma_match:
+        pragma_name = pragma_match.group(1).lower()
+        has_assignment = bool(pragma_match.group(2) or pragma_match.group(3))
+        clean = re.sub(r"\s+", "", stmt.lower())
+        if pragma_name == "query_only":
+            if "query_only=on" in clean or "query_only=1" in clean or not has_assignment:
+                return None
+            return f"sqlite mutating pragma '{stmt.strip()[:30]}'"
+        if pragma_name == "trusted_schema":
+            if "trusted_schema=off" in clean or "trusted_schema=0" in clean or not has_assignment:
+                return None
+            return f"sqlite mutating pragma '{stmt.strip()[:30]}'"
+        if pragma_name in _SAFE_INTROSPECTION_PRAGMAS:
+            if not has_assignment:
+                return None
+            return f"sqlite mutating pragma '{stmt.strip()[:30]}'"
+        return f"sqlite mutating pragma '{stmt.strip()[:30]}'"
+    return None
+
+
+def is_forbidden_module(name: str, *, from_module: str = "") -> bool:
     """True for database modules the web package must not reach."""
     root = name.split(".", 1)[0]
-    if root in {"sqlite3", "sqlalchemy"}:
+    if root == "sqlalchemy":
         return True
+    if root == "sqlite3":
+        return not from_module.startswith("cu_rates.snapshot")
     return name == "cu_rates.db" or name.startswith(("cu_rates.db.", "cu_rates.artifact_store"))
 
 
@@ -441,6 +572,8 @@ def is_database_reference(value: str) -> bool:
     """True for a path or name that opens the operational database."""
     normalized = value.replace("\\", "/").lower()
     filename = normalized.rsplit("/", 1)[-1]
+    if filename == "published.sqlite":
+        return False
     return "cu_rates.db" in normalized or filename.endswith((".db", ".sqlite", ".sqlite3"))
 
 
@@ -473,6 +606,19 @@ def _join_module(base: str, name: str) -> str:
     return base or name
 
 
+def _extract_string_expr(node: ast.AST, var_map: Mapping[str, list[str]]) -> list[str]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [node.value]
+    if isinstance(node, ast.Name) and node.id in var_map:
+        return var_map[node.id]
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left_strs = _extract_string_expr(node.left, var_map)
+        right_strs = _extract_string_expr(node.right, var_map)
+        if left_strs and right_strs:
+            return [lhs + rhs for lhs in left_strs for rhs in right_strs]
+    return []
+
+
 def _scan_module(
     source: str,
     *,
@@ -482,10 +628,71 @@ def _scan_module(
     tree = ast.parse(source)
     imports: set[str] = set()
     references: list[str] = []
+
+    parent_map: dict[ast.AST, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parent_map[child] = parent
+
+    # Map variable names to string values assigned in this module
+    var_values: dict[str, list[str]] = {}
+    as_uri_vars: set[str] = set()
+
+    for node in ast.walk(tree):
+        assigned_strings: list[str] = []
+        target_names: list[str] = []
+        val_expr: ast.AST | None = None
+
+        if isinstance(node, ast.Assign):
+            val_expr = node.value
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    target_names.append(target.id)
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            val_expr = node.value
+            if isinstance(node.target, ast.Name):
+                target_names.append(node.target.id)
+
+        if val_expr is not None:
+            has_as_uri_call = any(
+                isinstance(sub, ast.Call) and _call_name(sub.func).endswith("as_uri")
+                for sub in ast.walk(val_expr)
+            )
+            if has_as_uri_call:
+                for name in target_names:
+                    as_uri_vars.add(name)
+
+            if isinstance(val_expr, ast.Constant) and isinstance(val_expr.value, str):
+                assigned_strings.append(val_expr.value)
+            elif isinstance(val_expr, ast.JoinedStr):
+                parts = [
+                    p.value
+                    for p in val_expr.values
+                    if isinstance(p, ast.Constant) and isinstance(p.value, str)
+                ]
+                assigned_strings.append(" ".join(parts))
+            elif isinstance(val_expr, ast.BinOp):
+                parts = []
+                for sub in ast.walk(val_expr):
+                    if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                        parts.append(sub.value)
+                if parts:
+                    assigned_strings.append(" ".join(parts))
+
+            for name in target_names:
+                var_values.setdefault(name, []).extend(assigned_strings)
+
+    sqlite3_modules: set[str] = set()
+    sqlite3_connect_funcs: set[str] = {"sqlite3.connect", "connect"}
+
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 imports.add(alias.name)
+                if alias.name == "sqlite3":
+                    mod_alias = alias.asname or "sqlite3"
+                    sqlite3_modules.add(mod_alias)
+                    sqlite3_connect_funcs.add(f"{mod_alias}.connect")
         elif isinstance(node, ast.ImportFrom):
             base = node.module or ""
             if node.level:
@@ -495,7 +702,52 @@ def _scan_module(
             for alias in node.names:
                 if alias.name != "*":
                     imports.add(_join_module(base, alias.name))
-        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                if base == "sqlite3":
+                    if alias.name == "connect":
+                        fn_alias = alias.asname or "connect"
+                        sqlite3_connect_funcs.add(fn_alias)
+                    elif alias.name == "*":
+                        sqlite3_connect_funcs.add("connect")
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    if isinstance(node.value, ast.Name) and node.value.id in sqlite3_modules:
+                        sqlite3_modules.add(target.id)
+                        sqlite3_connect_funcs.add(f"{target.id}.connect")
+                    elif _call_name(node.value) in sqlite3_connect_funcs:
+                        sqlite3_connect_funcs.add(target.id)
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and node.value is not None
+            and isinstance(node.target, ast.Name)
+        ):
+            if isinstance(node.value, ast.Name) and node.value.id in sqlite3_modules:
+                sqlite3_modules.add(node.target.id)
+                sqlite3_connect_funcs.add(f"{node.target.id}.connect")
+            elif _call_name(node.value) in sqlite3_connect_funcs:
+                sqlite3_connect_funcs.add(node.target.id)
+
+    query_only_conn_vars: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            called = _call_name(node.func)
+            method = called.rsplit(".", 1)[-1]
+            if method in {"execute", "executemany"} and node.args:
+                stmt_strs: list[str] = []
+                first_arg = node.args[0]
+                if isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str):
+                    stmt_strs.append(first_arg.value)
+                elif isinstance(first_arg, ast.Name):
+                    stmt_strs.extend(var_values.get(first_arg.id, []))
+                for s in stmt_strs:
+                    clean = re.sub(r"\s+", "", s.lower())
+                    if "pragmaquery_only=on" in clean or "pragmaquery_only=1" in clean:
+                        var_name = called.rsplit(".", 1)[0] if "." in called else ""
+                        if var_name:
+                            query_only_conn_vars.add(var_name)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
             if is_database_reference(node.value):
                 references.append(node.value)
         elif isinstance(node, ast.Call):
@@ -507,7 +759,102 @@ def _scan_module(
                 and isinstance(node.args[0].value, str)
             ):
                 imports.add(node.args[0].value)
+            if module.startswith("cu_rates.snapshot"):
+                method_name = called.rsplit(".", 1)[-1]
+                if method_name in {"commit", "rollback"}:
+                    references.append(f"sqlite write method '{called}'")
+                elif method_name == "executescript":
+                    references.append(f"sqlite forbidden executescript '{called}'")
+                elif method_name in {"execute", "executemany"} and node.args:
+                    first_arg = node.args[0]
+                    if isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str):
+                        problem = _check_sqlite_statement(first_arg.value)
+                        if problem:
+                            references.append(problem)
+                    else:
+                        resolved = _extract_string_expr(first_arg, var_values)
+                        if not resolved and isinstance(first_arg, ast.Name):
+                            resolved = var_values.get(first_arg.id, [])
+                        if not resolved:
+                            name_str = _call_name(first_arg) or "expr"
+                            references.append(f"sqlite forbidden non-literal SQL '{name_str}'")
+                        else:
+                            for stmt in resolved:
+                                problem = _check_sqlite_statement(stmt)
+                                if problem:
+                                    references.append(problem)
+                                elif not _is_safe_select(stmt):
+                                    references.append(
+                                        f"sqlite forbidden non-literal SQL '{stmt.strip()[:30]}'"
+                                    )
+                elif called in sqlite3_connect_funcs:
+                    has_uri_true = any(
+                        kw.arg == "uri"
+                        and isinstance(kw.value, ast.Constant)
+                        and kw.value.value is True
+                        for kw in node.keywords
+                    )
+                    conn_target_strings: list[str] = []
+                    target_expr: ast.AST | None = None
+                    if node.args:
+                        target_expr = node.args[0]
+                    else:
+                        for kw in node.keywords:
+                            if kw.arg == "database":
+                                target_expr = kw.value
+                                break
+
+                    has_as_uri = False
+                    if target_expr is not None:
+                        if isinstance(target_expr, ast.Name) and target_expr.id in as_uri_vars:
+                            has_as_uri = True
+                        for sub in ast.walk(target_expr):
+                            if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                                conn_target_strings.append(sub.value)
+                            elif isinstance(sub, ast.Name):
+                                conn_target_strings.extend(var_values.get(sub.id, []))
+                                if sub.id in as_uri_vars:
+                                    has_as_uri = True
+                            elif isinstance(sub, ast.Call) and _call_name(sub.func).endswith(
+                                "as_uri"
+                            ):
+                                has_as_uri = True
+
+                    is_file_uri = has_as_uri or any("file:" in s for s in conn_target_strings)
+                    has_query_mode_ro = any(_uri_is_read_only(s) for s in conn_target_strings)
+
+                    valid_uri_ro = has_uri_true and is_file_uri and has_query_mode_ro
+
+                    conn_vars: list[str] = []
+                    curr: ast.AST | None = node
+                    while curr is not None:
+                        p = parent_map.get(curr)
+                        if isinstance(p, ast.Assign):
+                            for t in p.targets:
+                                if isinstance(t, ast.Name):
+                                    conn_vars.append(t.id)
+                            break
+                        if isinstance(p, ast.AnnAssign):
+                            if isinstance(p.target, ast.Name):
+                                conn_vars.append(p.target.id)
+                            break
+                        if isinstance(p, ast.withitem):
+                            if isinstance(p.optional_vars, ast.Name):
+                                conn_vars.append(p.optional_vars.id)
+                            break
+                        curr = p
+
+                    if not valid_uri_ro:
+                        references.append(f"sqlite writable connection '{called}'")
     return imports, references
+
+
+def _uri_is_read_only(uri: str) -> bool:
+    """True only when the URI's real query string says mode=ro (not a fragment or filename)."""
+    from urllib.parse import parse_qs, urlsplit
+
+    parts = urlsplit(uri)
+    return parse_qs(parts.query).get("mode") == ["ro"]
 
 
 def database_findings(sources: Mapping[str, str], roots: Sequence[str]) -> list[str]:
@@ -527,9 +874,18 @@ def database_findings(sources: Mapping[str, str], roots: Sequence[str]) -> list[
                 findings.append(f"import {module}")
             continue
         imports, references = _scan_module(source, module=module, packages=packages)
-        findings.extend(f"open {reference} in {module}" for reference in references)
+        for reference in references:
+            if (
+                reference.startswith("sqlite write")
+                or reference.startswith("sqlite forbidden")
+                or reference.startswith("sqlite mutating")
+                or reference.startswith("sqlite writable")
+            ):
+                findings.append(f"{reference} in {module}")
+            else:
+                findings.append(f"open {reference} in {module}")
         for imported in sorted(imports):
-            if is_forbidden_module(imported):
+            if is_forbidden_module(imported, from_module=module):
                 findings.append(f"import {imported} from {module}")
             elif imported in sources and imported not in seen:
                 queue.append(imported)
