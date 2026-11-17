@@ -1,6 +1,7 @@
 """Operational schema: migrations, provenance, isolation, foreign keys, rollback."""
 
 import hashlib
+import re
 import sqlite3
 from collections import Counter
 from datetime import UTC, datetime, timedelta
@@ -12,7 +13,7 @@ from alembic.autogenerate import compare_metadata
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from pydantic import ValidationError
-from sqlalchemy import insert, inspect, select, text, update
+from sqlalchemy import CheckConstraint, insert, inspect, select, text, update
 from sqlalchemy.exc import IntegrityError, StatementError
 
 from cu_rates.contracts import (
@@ -43,8 +44,6 @@ from cu_rates.db.records import persist_normalized_offer as write_offer
 from cu_rates.db.schema import (
     artifact_blobs,
     artifact_observations,
-    expected_check_names,
-    expected_trigger_names,
     extracted_candidates,
     extraction_runs,
     fetch_profiles,
@@ -61,6 +60,7 @@ from cu_rates.db.schema import (
     rate_sources,
     review_decisions,
     review_evidence,
+    schema_triggers,
     service_providers,
     validation_results,
     withdrawal_entries,
@@ -473,18 +473,11 @@ def test_enum_checks_use_contract_values(tmp_path: Path) -> None:
     engine = open_operational_database(path)
     with engine.connect() as conn:
         checker = inspect(conn)
-        # AUD1 added WithdrawalScope.SOURCE. The frozen t012 CHECK does not list it yet.
-        # A later migration must accept 'source' before a source withdrawal is stored.
-        frozen_gap = {("withdrawal_entries", "scope", "source")}
         for table_name, column, enum_cls in ENUM_CHECKS:
             sql = " ".join(item["sqltext"] for item in checker.get_check_constraints(table_name))
             assert column in sql
             for member in enum_cls:
-                token = f"'{member.value}'"
-                if (table_name, column, member.value) in frozen_gap:
-                    assert token not in sql
-                    continue
-                assert token in sql
+                assert f"'{member.value}'" in sql
         with pytest.raises(IntegrityError):
             conn.execute(
                 insert(institutions),
@@ -1283,21 +1276,32 @@ def test_published_offer_rejects_nonfinite_apr_and_bad_times(tmp_path: Path) -> 
     assert after == before
 
 
-def test_migrated_triggers_and_checks_match_expected_set(tmp_path: Path) -> None:
+def _sql_tokens(sql: str) -> tuple[str, ...]:
+    return tuple(re.findall(r"'(?:''|[^'])*'|[A-Za-z_0-9]+|\S", sql.rstrip(";")))
+
+
+def test_migrated_triggers_and_checks_match_expected_definitions(tmp_path: Path) -> None:
     path = _database(tmp_path)
     _migrate(path)
     engine = open_operational_database(path)
     with engine.connect() as conn:
         triggers = {
-            row[0]
-            for row in conn.execute(text("SELECT name FROM sqlite_master WHERE type = 'trigger'"))
+            row.name: _sql_tokens(row.sql)
+            for row in conn.execute(
+                text("SELECT name, sql FROM sqlite_master WHERE type = 'trigger'")
+            )
         }
         inspector = inspect(conn)
-        actual: Counter[tuple[str, str]] = Counter()
+        actual: Counter[tuple[str, str, tuple[str, ...]]] = Counter()
         for table_name in inspector.get_table_names():
             if table_name == "alembic_version":
                 continue
             for check in inspector.get_check_constraints(table_name):
-                actual[(table_name, str(check["name"]))] += 1
-    assert triggers == expected_trigger_names()
-    assert actual == expected_check_names()
+                actual[(table_name, str(check["name"]), _sql_tokens(check["sqltext"]))] += 1
+    assert triggers == {name: _sql_tokens(sql) for name, sql in schema_triggers()}
+    assert actual == Counter(
+        (table.name, str(check.name), _sql_tokens(str(check.sqltext)))
+        for table in metadata.tables.values()
+        for check in table.constraints
+        if isinstance(check, CheckConstraint)
+    )

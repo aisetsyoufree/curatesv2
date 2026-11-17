@@ -36,6 +36,7 @@ def _cases() -> list[dict[str, Any]]:
     assert isinstance(cases, list)
     assert [case["case_id"] for case in cases] == [
         "athol-style",
+        "athol-style-dated",
         "stoughton-style",
         "worcester-style",
     ]
@@ -74,12 +75,12 @@ def _reserved_https_example(url: str) -> None:
     assert parts.username is None and parts.password is None
 
 
-def test_catalog_identifies_three_distinct_fixture_artifacts() -> None:
+def test_catalog_identifies_distinct_fixture_artifacts() -> None:
     cases = _cases()
     artifact_ids = [case["artifact_id"] for case in cases]
     fixtures = [case["fixture"] for case in cases]
-    assert len(set(artifact_ids)) == 3
-    assert len(set(fixtures)) == 3
+    assert len(set(artifact_ids)) == len(cases)
+    assert len(set(fixtures)) == len(cases)
     for artifact_id in artifact_ids:
         assert isinstance(artifact_id, str)
         assert _SHA256_RE.fullmatch(artifact_id)
@@ -149,7 +150,7 @@ def test_seed_fixtures_round_trip_through_the_evidence_store(tmp_path: Path) -> 
         assert repeat.artifact_id == record.artifact_id
         stored_ids.append(record.artifact_id)
     assert {record.artifact_id for record in store.observations()} == set(stored_ids)
-    assert len(list(store.observations())) == 6
+    assert len(list(store.observations())) == 2 * len(_cases())
 
 
 def test_changed_fixture_bytes_receive_a_different_artifact_id(tmp_path: Path) -> None:
