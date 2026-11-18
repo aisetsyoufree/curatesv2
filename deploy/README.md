@@ -46,7 +46,7 @@ All persistent data, code, virtual environments, and evidence artifacts reside u
 │   └── denylist.json     # Emergency withdrawal denylist (root:cu-rates, mode 0640)
 ├── data/                 # Operational SQLite database (WAL mode; worker only, mode 0750)
 ├── artifacts/            # Content-addressed raw evidence store (worker only, mode 0700)
-├── backups/              # Encrypted backup staging area (mode 0750)
+├── backups/              # Local private backup staging (tool enforces mode 0700)
 └── installed-commit      # Root-owned deployment commit record (mode 0644, D-17)
 
 /etc/cu-rates/
@@ -421,8 +421,8 @@ CU-Rates provides automated backup and health monitoring via systemd timers. The
 
 1. **Daily Backup (`cu-rates-backup.timer` -> `cu-rates-backup.service`):**
    - **Schedule:** Daily at 03:17 local time with up to 30 minutes randomized delay (`RandomizedDelaySec=1800`), catch-up enabled (`Persistent=true`).
-   - **Actions:** Runs `python -m cu_rates.ops.backup create` to create an atomic, integrity-verified backup of the operational SQLite database (`/var/lib/cu-rates/data/operational.sqlite`) and artifact store (`/var/lib/cu-rates/artifacts`) into `/var/lib/cu-rates/backups/backup-<timestamp>`. Immediately follows with `python -m cu_rates.ops.backup prune --destination /var/lib/cu-rates/backups --keep 14` to retain the 14 newest valid backups. Any backup failing verification is left in place for operator investigation (the CLI exits non-zero so the unit shows as failed). The data directory is writable for this unit only so SQLite can create its WAL `-shm` file for a read-only open; the tool never writes the database. **The operational database path above is a convention: no deployed worker creates it yet (issue #115), so enabling these timers before it exists makes the units fail, which is the intended alert.**
-   - **Hardening & Isolation:** Unprivileged execution as `cu-rates`, `ProtectSystem=strict`, no network access (`PrivateNetwork=true`, `RestrictAddressFamilies=AF_UNIX`), `UMask=0077`, `Type=oneshot`, and writes ONLY to `/var/lib/cu-rates/backups` (`ReadWritePaths`). Non-zero exit marks the unit as failed without swallowing errors.
+   - **Actions:** Runs `python -m cu_rates.ops.backup create` to create an atomic, integrity-verified backup of the operational SQLite database (`/var/lib/cu-rates/data/operational.sqlite`), artifact store (`/var/lib/cu-rates/artifacts`), operator ledger (`/var/lib/cu-rates/independent/denylist.json`), automatic ledger (`/var/lib/cu-rates/automatic/denylist.json`), private correction intake (`/var/lib/cu-rates/intake/intake.sqlite`), and snapshot pointer plus committed versions (`/var/lib/cu-rates/snapshots`) into `/var/lib/cu-rates/backups/backup-<timestamp>`. Immediately follows with `python -m cu_rates.ops.backup prune --destination /var/lib/cu-rates/backups --keep 14` to retain the 14 newest valid backups. Any backup failing verification is left in place for operator investigation (the CLI exits non-zero so the unit shows as failed). Both SQLite files use the online backup API, including committed WAL data. The data and intake directories are writable only for SQLite WAL side files during read-only opens; the tool never writes either source database. **The operational database path above is a convention: no deployed worker creates it yet (issue #115), so enabling these timers before it exists makes the units fail, which is the intended alert.**
+   - **Hardening & Isolation:** Unprivileged execution as `cu-rates`, `ProtectSystem=strict`, no network access (`PrivateNetwork=true`, `RestrictAddressFamilies=AF_UNIX`), `UMask=0077`, `Type=oneshot`, and `ReadWritePaths` limited to backups, data and intake (the latter two for WAL side files). Artifacts, both ledgers, snapshots and application code remain read-only. The intake directory stays mode 0700, owned by `cu-rates`; backed-up/restored intake and ledgers are 0600, all backup/restore directories 0700, and restored snapshot versions remain sealed read-only. Non-zero exit marks the unit as failed without swallowing errors.
 
 2. **Periodic Health Check (`cu-rates-health.timer` -> `cu-rates-health.service`):**
    - **Schedule:** Every 15 minutes (`OnCalendar=*:00/15:00`) with catch-up enabled (`Persistent=true`).
@@ -447,6 +447,61 @@ CU-Rates provides automated backup and health monitoring via systemd timers. The
 
 > **Status Notice:**
 > - **Off-device encrypted copies and alert delivery are NOT implemented yet.** Backups currently stage locally on NVMe under `/var/lib/cu-rates/backups` and require an operator-managed key before remote export is implemented. Automated alert delivery (e.g. webhook, email, or paging notification on unit failure) has not yet been wired; failures record to the system journal.
+
+### Backup scope and offline restore
+
+The create options `--denylist-path`, `--automatic-denylist-path`, `--intake-database`,
+and `--snapshot-root` are optional for compatibility with older invocations. The service
+passes all four paths above. A supplied input that is missing, invalid, symlinked or
+unreadable fails the backup; it is never silently omitted. Initialize both ledgers and
+intake using the earlier runbook steps, and publish a verified snapshot before enabling
+this service. Do not re-initialize empty ledgers after a disk loss.
+
+Backups with optional state use manifest version 2; legacy database/artifact-only backups
+remain version 1. `verify` checks hashes and sizes for every file, SQLite integrity for
+both databases, valid withdrawal history, and snapshot descriptors/databases. `prune`
+uses those checks and preserves invalid backups for investigation. Private reply contacts
+are present in intake backups: keep them access-controlled and never print or log their
+contents. The existing contact purge does not retroactively remove contacts from backups;
+apply the retention policy to backup copies as well. This task adds no encryption or
+off-device copying. Terms and worker state outside the operational database remain
+outside this bounded backup scope.
+
+Snapshots are copied as `current.json` and all committed `versions/<id>/` releases.
+Publisher locks and unfinished `.build-*` directories are excluded. The tool copies
+immutable versions first and refuses a pointer change during copying (retry the backup);
+it validates the copied pointer and every committed version. Database, intake and ledgers
+are individually consistent copies, not a single transaction across stores. On recovery,
+the publication gate and both ledgers must still be enforced; a backup grants no new
+publication approval and does not extend snapshot expiry.
+
+Stop the web, worker, publisher, intake purge and backup services/timers before restore.
+Restore first to a private staging directory on a trusted local filesystem:
+
+```bash
+/var/lib/cu-rates/venv/bin/python -m cu_rates.ops.backup verify /absolute/backup-<timestamp>
+/var/lib/cu-rates/venv/bin/python -m cu_rates.ops.backup restore /absolute/backup-<timestamp> /absolute/recovery
+```
+
+The result contains the operational database by its original filename, `artifacts/`,
+`independent/denylist.json`, `automatic/denylist.json`, `intake/intake.sqlite`, and
+`snapshots/`. Missing optional inputs in a legacy backup remain absent. The target must
+be absent or empty by default. To protect withdrawal history during recovery, first
+place any surviving ledgers in the target's `independent/` and `automatic/` directories.
+`--replace-ledgers` permits a target containing **only** these ledger files and their
+directories (including writer lock files), and refuses missing backed-up replacements or newer/different destination
+history (including lifts and disjoint IDs). Only a deliberate owner-authorized rollback
+may add `--allow-ledger-rollback` alongside `--replace-ledgers`; this can re-expose offers.
+Other existing files, symlinks and backup/target overlap are always refused. Keep all
+writers stopped during the check and replacement. A staging restore cannot inspect
+surviving ledgers elsewhere: never manually install an older ledger over a live one.
+
+After verification, install recovered components into the deployment paths while services
+remain stopped. Restore their deployed ownership and directory access before restarting:
+the operator ledger directory is `root:cu-rates`, 0750, ledger 0640; the automatic ledger
+must be readable by the web user, and the intake directory/file stay `cu-rates`, 0700/0600.
+The recovery bundle's stricter 0700/0600 permissions are intentional and must not be
+relaxed to world-readable access. Verify web health and both ledgers before resuming reads.
 
 ### Enabling Scheduled Timers
 
@@ -491,6 +546,8 @@ sudo -u cu-rates /var/lib/cu-rates/venv/bin/python -m cu_rates.intake --db /var/
 sudo systemctl restart cu-rates-web
 sudo systemctl enable --now cu-rates-intake-purge.timer   # daily deletion of expired reply contacts
 ```
+
+**Backup unit symptom.** If `cu-rates-backup.service` fails with `status=226/NAMESPACE`, one of its read-only state directories (independent, automatic, snapshots, intake) does not exist yet; create it (see Step 2) rather than loosening the unit. Backups copy every snapshot version ever published, so watch disk growth.
 
 **Working the inbox** (as the service user): `... --db <path> list` (exit status 3 means a case missed its triage target: one business day for rate, identity, privacy and security reports, five for others), `show <id>`, `triage`, `note`, `resolve --decision confirmed|amended|quarantined|rejected`, `bulk-reject --from ... --to ... --yes` (junk flooding), and `redact` (removes unsolicited personal data from a case). The purge timer runs `purge-contacts`.
 
