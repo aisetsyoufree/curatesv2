@@ -1,0 +1,12 @@
+[Unit]
+Description=CU-Rates.org Health Check Timer
+Documentation=file:///var/lib/cu-rates/app/deploy/README.md https://github.com/aisetsyoufree/curatesv2
+
+[Timer]
+OnCalendar=*:00/15:00
+RandomizedDelaySec=60
+Persistent=true
+Unit=cu-rates-health.service
+
+[Install]
+WantedBy=timers.target

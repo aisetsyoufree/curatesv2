@@ -249,6 +249,10 @@ UNITS=(
     "cu-rates-web.service"
     "cu-rates-worker.service"
     "cu-rates-worker.timer"
+    "cu-rates-backup.service"
+    "cu-rates-backup.timer"
+    "cu-rates-health.service"
+    "cu-rates-health.timer"
 )
 
 for unit in "${UNITS[@]}"; do
@@ -318,6 +322,7 @@ if [[ "${APPLY}" -eq 1 ]]; then
     echo "4. Configure Caddy: copy deploy/caddy/Caddyfile to /etc/caddy/conf.d/cu-rates.caddyfile"
     echo "5. Start web service: sudo systemctl start cu-rates-web.service"
     echo "6. Note: Worker service and timer remain STOPPED, DISABLED, and MASKED per MASTER.md D-15 and D-17."
+    echo "7. Enable scheduled operations (backup and health timers): sudo systemctl enable --now cu-rates-backup.timer cu-rates-health.timer"
 else
     echo "=== Dry-Run Complete ==="
     echo "No filesystem, user, or service changes were made."

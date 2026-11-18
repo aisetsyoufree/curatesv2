@@ -381,14 +381,64 @@ To verify that services survive a host reboot correctly:
 
 ---
 
-## 7. Uninstall Runbook
+## 7. Scheduled Operations
+
+CU-Rates provides automated backup and health monitoring via systemd timers. These timers are installed by `deploy/install.sh` in a disabled state, allowing operators to review configuration before enabling them.
+
+### What Each Timer Does
+
+1. **Daily Backup (`cu-rates-backup.timer` -> `cu-rates-backup.service`):**
+   - **Schedule:** Daily at 03:17 local time with up to 30 minutes randomized delay (`RandomizedDelaySec=1800`), catch-up enabled (`Persistent=true`).
+   - **Actions:** Runs `python -m cu_rates.ops.backup create` to create an atomic, integrity-verified backup of the operational SQLite database (`/var/lib/cu-rates/data/operational.sqlite`) and artifact store (`/var/lib/cu-rates/artifacts`) into `/var/lib/cu-rates/backups/backup-<timestamp>`. Immediately follows with `python -m cu_rates.ops.backup prune --destination /var/lib/cu-rates/backups --keep 14` to retain the 14 newest valid backups. Any backup failing verification is left in place for operator investigation (the CLI exits non-zero so the unit shows as failed). The data directory is writable for this unit only so SQLite can create its WAL `-shm` file for a read-only open; the tool never writes the database. **The operational database path above is a convention: no deployed worker creates it yet (issue #115), so enabling these timers before it exists makes the units fail, which is the intended alert.**
+   - **Hardening & Isolation:** Unprivileged execution as `cu-rates`, `ProtectSystem=strict`, no network access (`PrivateNetwork=true`, `RestrictAddressFamilies=AF_UNIX`), `UMask=0077`, `Type=oneshot`, and writes ONLY to `/var/lib/cu-rates/backups` (`ReadWritePaths`). Non-zero exit marks the unit as failed without swallowing errors.
+
+2. **Periodic Health Check (`cu-rates-health.timer` -> `cu-rates-health.service`):**
+   - **Schedule:** Every 15 minutes (`OnCalendar=*:00/15:00`) with catch-up enabled (`Persistent=true`).
+   - **Actions:** Runs `python -m cu_rates.ops.health` to inspect:
+     - Public snapshot readability and offer freshness (`/var/lib/cu-rates/snapshots`)
+     - Independent denylist / withdrawal ledger readability (`/var/lib/cu-rates/independent/denylist.json`)
+     - Newest backup validity and age (`/var/lib/cu-rates/backups`)
+     - Operational SQLite database integrity via `PRAGMA quick_check` (`/var/lib/cu-rates/data/operational.sqlite`)
+   - **Hardening & Isolation:** Strictly read-only everywhere (`ReadOnlyPaths`, no `ReadWritePaths`), unprivileged execution as `cu-rates`, no network access (`PrivateNetwork=true`, `RestrictAddressFamilies=AF_UNIX`), `Type=oneshot`, `Restart=no`.
+   - **Alert Hook:** Non-zero exit (exit code 1) on any check failure marks `cu-rates-health.service` as failed in systemd.
+
+> **Status Notice:**
+> - **Off-device encrypted copies and alert delivery are NOT implemented yet.** Backups currently stage locally on NVMe under `/var/lib/cu-rates/backups` and require an operator-managed key before remote export is implemented. Automated alert delivery (e.g. webhook, email, or paging notification on unit failure) has not yet been wired; failures record to the system journal.
+
+### Enabling Scheduled Timers
+
+To enable and immediately start both timers:
+```bash
+sudo systemctl enable --now cu-rates-backup.timer cu-rates-health.timer
+```
+
+### Checking Timer Status and Logs
+
+Inspect active timer schedules:
+```bash
+systemctl list-timers
+systemctl status cu-rates-backup.timer cu-rates-health.timer
+```
+
+Check execution output and error logs:
+```bash
+# Health check logs
+journalctl -u cu-rates-health
+
+# Backup service logs
+journalctl -u cu-rates-backup
+```
+
+---
+
+## 8. Uninstall Runbook
 
 To cleanly decommission the deployment without affecting other host services:
 
 1. **Stop and Disable Services:**
    ```bash
-   sudo systemctl stop cu-rates-web.service cu-rates-worker.timer cu-rates-worker.service
-   sudo systemctl disable cu-rates-web.service cu-rates-worker.timer
+   sudo systemctl stop cu-rates-web.service cu-rates-worker.timer cu-rates-worker.service cu-rates-backup.timer cu-rates-backup.service cu-rates-health.timer cu-rates-health.service
+   sudo systemctl disable cu-rates-web.service cu-rates-worker.timer cu-rates-backup.timer cu-rates-health.timer
    ```
 
 2. **Remove Systemd Units:**
