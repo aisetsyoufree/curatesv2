@@ -25,6 +25,7 @@ from cu_rates.contracts import (
     HelocDetails,
     HtmlLocator,
     Institution,
+    InstitutionIdentityReview,
     InstitutionSourceRelationship,
     InstitutionStatus,
     LienPosition,
@@ -548,6 +549,26 @@ def relationship(**overrides: Any) -> InstitutionSourceRelationship:
     return InstitutionSourceRelationship(**kwargs)
 
 
+def identity_review(**overrides: Any) -> InstitutionIdentityReview:
+    """A current, approving identity and Massachusetts-scope review for ``institution()``."""
+    kwargs: dict[str, Any] = {
+        "schema_version": SV,
+        "review_id": "identity-review-001",
+        "institution_charter": CHARTER,
+        "legal_name": institution().legal_name,
+        "identity_confirmed": True,
+        "massachusetts_scope_confirmed": True,
+        "evidence": (
+            provenance(f"Example Synthetic Credit Union - NCUA charter {CHARTER} - Massachusetts"),
+        ),
+        "reviewer": "Sid",
+        "decided_at": T0 - timedelta(days=30),
+        "rationale": "Charter number, legal name and Massachusetts location match the cited page.",
+    }
+    kwargs.update(overrides)
+    return InstitutionIdentityReview(**kwargs)
+
+
 def review(
     offer: NormalizedOffer, verdict: ReviewVerdict = ReviewVerdict.APPROVED
 ) -> ReviewDecision:
@@ -713,6 +734,19 @@ def context(
         "evaluated_at": EVALUATED_AT,
     }
     kwargs.update(overrides)
+    if "identity_review" not in overrides:
+        # By default the review describes the institution this context carries; tests of
+        # a stale, mismatched or missing review pass ``identity_review`` explicitly.
+        named = kwargs["institution"]
+        kwargs["identity_review"] = identity_review(
+            institution_charter=named.charter_number,
+            legal_name=named.legal_name,
+            evidence=(
+                provenance(
+                    f"{named.legal_name} - NCUA charter {named.charter_number} - Massachusetts"
+                ),
+            ),
+        )
     # Most contract tests override the primary record to exercise a separate rule.
     # Keep the explicitly modeled second fixture capture unless paths are supplied
     # explicitly (single-capture tests use that lane or remove records on the model).

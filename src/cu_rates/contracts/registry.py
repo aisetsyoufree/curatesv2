@@ -1,5 +1,6 @@
 """Institutions, membership, providers, source relationships, and product identity."""
 
+import re
 from typing import Annotated, Self
 
 from pydantic import Field, model_validator
@@ -26,6 +27,11 @@ from cu_rates.contracts.enums import (
     RateAvailability,
     SourceRelationshipKind,
 )
+from cu_rates.contracts.evidence import Provenance
+
+_MASSACHUSETTS_WORD = re.compile(r"\bmassachusetts\b", re.IGNORECASE)
+# The postal abbreviation is upper-case and letter-bounded: "Ma Bell", "e-ma-il" do not count.
+_MASSACHUSETTS_ABBREVIATION = re.compile(r"(?<![A-Za-z])MA(?![A-Za-z])")
 
 
 class Institution(VersionedModel):
@@ -121,4 +127,59 @@ class ProductIdentity(VersionedModel):
             self.government_guaranty is GovernmentGuaranty.NONE
             and not self.borrower_programs
             and not self.partner_programs
+        )
+
+
+class InstitutionIdentityReview(VersionedModel):
+    """A human's evidence-backed decision about who an institution is and where it operates.
+
+    ``Institution.charter_verified`` and a relationship's ``approved_by`` are bare flags.
+    This record is the proof behind them: it names the charter and legal name that were
+    confirmed against an official source, states whether the institution is in scope for
+    this Massachusetts directory, and cites located evidence that can be re-verified
+    against stored bytes. Publication requires a current, approving review.
+    """
+
+    review_id: Identifier
+    institution_charter: CharterNumber
+    legal_name: Text
+    identity_confirmed: bool
+    massachusetts_scope_confirmed: bool
+    evidence: Annotated[tuple[Provenance, ...], Field(min_length=1, max_length=20)]
+    reviewer: Text
+    decided_at: UtcDatetime
+    rationale: Text
+
+    @property
+    def approves(self) -> bool:
+        return self.identity_confirmed and self.massachusetts_scope_confirmed
+
+    @property
+    def evidence_states_identity(self) -> bool:
+        """The cited text itself names this charter number AND this legal name.
+
+        The number must follow the word "charter" (``Charter Number: 12345``, ``NCUA charter
+        #12345``) so a street number or phone fragment cannot satisfy it, and the name must
+        stand alone. This screens out blatantly wrong evidence; the human review is the proof.
+        """
+        number = re.compile(rf"charter\D{{0,20}}(?<!\d){self.institution_charter}(?!\d)", re.I)
+        # Not preceded by another word ("South Boston Credit Union" is not "Boston Credit
+        # Union"), and not followed by more letters.
+        name = re.compile(
+            rf"(?<![A-Za-z0-9])(?<![A-Za-z] ){re.escape(' '.join(self.legal_name.split()))}"
+            r"(?![A-Za-z0-9])",
+            re.I,
+        )
+        return any(
+            number.search(text) and name.search(text)
+            for text in (" ".join(item.source_text.split()) for item in self.evidence)
+        )
+
+    @property
+    def evidence_states_massachusetts(self) -> bool:
+        """The cited text itself places the institution in Massachusetts."""
+        return any(
+            _MASSACHUSETTS_WORD.search(item.source_text)
+            or _MASSACHUSETTS_ABBREVIATION.search(item.source_text)
+            for item in self.evidence
         )

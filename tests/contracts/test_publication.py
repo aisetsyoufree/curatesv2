@@ -59,11 +59,13 @@ from .factories import (
     fetch_run,
     heloc_details,
     heloc_offer,
+    identity_review,
     institution,
     margin,
     matches_all,
     points,
     product,
+    provenance,
     purchase_offer,
     rate,
     raw_artifact,
@@ -201,6 +203,95 @@ UNSAFE_CASES: list[tuple[str, dict[str, Any], dict[str, Any], ReasonCode, Public
         {"institution": institution(charter_verified=False)},
         R.CHARTER_UNVERIFIED,
         PublicationOutcome.SUPPRESS,
+    ),
+    (
+        "identity-review-absent",
+        {},
+        {"identity_review": None},
+        R.IDENTITY_REVIEW_MISSING,
+        PublicationOutcome.QUARANTINE,
+    ),
+    (
+        "identity-review-for-another-charter",
+        {},
+        {"identity_review": identity_review(institution_charter=777)},
+        R.IDENTITY_REVIEW_MISSING,
+        PublicationOutcome.QUARANTINE,
+    ),
+    (
+        "identity-review-dated-in-the-future",
+        {},
+        {"identity_review": identity_review(decided_at=EVALUATED_AT + timedelta(days=1))},
+        R.IDENTITY_REVIEW_MISSING,
+        PublicationOutcome.QUARANTINE,
+    ),
+    (
+        "identity-not-confirmed",
+        {},
+        {"identity_review": identity_review(identity_confirmed=False)},
+        R.IDENTITY_NOT_CONFIRMED,
+        PublicationOutcome.QUARANTINE,
+    ),
+    (
+        "legal-name-drifted-since-review",
+        {},
+        {"identity_review": identity_review(legal_name="A Different Credit Union")},
+        R.IDENTITY_NOT_CONFIRMED,
+        PublicationOutcome.QUARANTINE,
+    ),
+    (
+        "massachusetts-scope-not-confirmed",
+        {},
+        {"identity_review": identity_review(massachusetts_scope_confirmed=False)},
+        R.SCOPE_NOT_CONFIRMED,
+        PublicationOutcome.QUARANTINE,
+    ),
+    (
+        "evidence-does-not-name-the-charter",
+        {},
+        {
+            "identity_review": identity_review(
+                evidence=(provenance("Example Synthetic Credit Union - Massachusetts"),)
+            )
+        },
+        R.IDENTITY_NOT_CONFIRMED,
+        PublicationOutcome.QUARANTINE,
+    ),
+    (
+        "evidence-names-another-institution",
+        {},
+        {
+            "identity_review": identity_review(
+                evidence=(provenance("Other Credit Union - NCUA charter 12345 - Massachusetts"),)
+            )
+        },
+        R.IDENTITY_NOT_CONFIRMED,
+        PublicationOutcome.QUARANTINE,
+    ),
+    (
+        "evidence-is-an-unrelated-rate-page",
+        {},
+        {"identity_review": identity_review(evidence=(provenance("30 days"),))},
+        R.IDENTITY_NOT_CONFIRMED,
+        PublicationOutcome.QUARANTINE,
+    ),
+    (
+        "evidence-does-not-place-it-in-massachusetts",
+        {},
+        {
+            "identity_review": identity_review(
+                evidence=(provenance("Example Synthetic Credit Union - NCUA charter 12345 - Ohio"),)
+            )
+        },
+        R.SCOPE_NOT_CONFIRMED,
+        PublicationOutcome.QUARANTINE,
+    ),
+    (
+        "identity-review-stale",
+        {},
+        {"identity_review": identity_review(decided_at=EVALUATED_AT - timedelta(days=401))},
+        R.IDENTITY_REVIEW_STALE,
+        PublicationOutcome.QUARANTINE,
     ),
     (
         "withdrawn",

@@ -96,6 +96,8 @@ APPEND_ONLY_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "slice_offer_captures": ("offer_id", "fetch_run_id"),
     "slice_snapshot_baselines": ("snapshot_id", "offer_id"),
     "slice_normalization_failures": ("extraction_run_id", "row_id"),
+    "institution_identity_reviews": ("review_id",),
+    "institution_identity_evidence": ("review_id", "provenance_id"),
     "roster_imports": ("import_id",),
     "roster_import_entries": ("import_id", "charter_number"),
 }
@@ -711,6 +713,54 @@ review_evidence = Table(
     Column("provenance_id", SqlText, ForeignKey("provenance.provenance_id"), primary_key=True),
     Column("ordinal", Integer, nullable=False),
     CheckConstraint("ordinal >= 0", name="ck_review_evidence_ordinal"),
+)
+
+# Human identity and Massachusetts-scope decisions, with the evidence they cite. The flags
+# on ``institutions`` are not proof; publication requires a current approving review here.
+institution_identity_reviews = Table(
+    "institution_identity_reviews",
+    metadata,
+    _id("review_id", primary_key=True),
+    _schema_version(),
+    Column(
+        "institution_charter",
+        Integer,
+        ForeignKey("institutions.charter_number"),
+        nullable=False,
+    ),
+    Column("legal_name", SqlText, nullable=False),
+    Column("identity_confirmed", Integer, nullable=False),
+    Column("massachusetts_scope_confirmed", Integer, nullable=False),
+    Column("reviewer", SqlText, nullable=False),
+    Column("decided_at", UtcDateTime, nullable=False),
+    Column("rationale", SqlText, nullable=False),
+    CheckConstraint(
+        "identity_confirmed IN (0, 1)", name="ck_institution_identity_reviews_identity"
+    ),
+    CheckConstraint(
+        "massachusetts_scope_confirmed IN (0, 1)", name="ck_institution_identity_reviews_scope"
+    ),
+)
+
+institution_identity_evidence = Table(
+    "institution_identity_evidence",
+    metadata,
+    Column(
+        "review_id",
+        SqlText,
+        ForeignKey("institution_identity_reviews.review_id"),
+        primary_key=True,
+    ),
+    Column("provenance_id", SqlText, primary_key=True),
+    Column("institution_charter", Integer, nullable=False),
+    Column("ordinal", Integer, nullable=False),
+    CheckConstraint("ordinal >= 0", name="ck_institution_identity_evidence_ordinal"),
+    # Evidence must belong to the SAME institution as the review that cites it.
+    ForeignKeyConstraint(
+        ["institution_charter", "provenance_id"],
+        ["provenance.institution_charter", "provenance.provenance_id"],
+        name="fk_institution_identity_evidence_provenance_institution",
+    ),
 )
 
 withdrawal_entries = Table(

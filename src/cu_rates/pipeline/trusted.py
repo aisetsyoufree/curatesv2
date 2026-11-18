@@ -7,7 +7,7 @@ from datetime import timedelta
 from hashlib import sha256
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.engine import Connection
 
 from cu_rates.artifact_store import ArtifactStore, ArtifactStoreError
@@ -20,7 +20,7 @@ from cu_rates.contracts.audit import (
     snapshot_manifest_sha256,
 )
 from cu_rates.contracts.base import CONTRACT_VERSION, UtcDatetime
-from cu_rates.contracts.enums import OfferStatus, RunStatus
+from cu_rates.contracts.enums import OfferStatus, RunStatus, WithdrawalScope
 from cu_rates.contracts.evidence import HtmlLocator, ParserVersion, Provenance, RawArtifact
 from cu_rates.contracts.fingerprints import (
     OfferFingerprints,
@@ -47,6 +47,7 @@ from cu_rates.contracts.publication import (
 )
 from cu_rates.contracts.registry import (
     Institution,
+    InstitutionIdentityReview,
     InstitutionSourceRelationship,
     ProductIdentity,
 )
@@ -67,6 +68,7 @@ from cu_rates.contracts.taxonomy import ProductFinding
 from cu_rates.db.records import (
     _insert_provenance,
     _load_provenance,
+    load_identity_reviews,
     load_normalized_offer,
     load_review_decision,
     persist_normalized_offer,
@@ -693,6 +695,47 @@ def _approval(row: Any) -> SourceApproval:
     )
 
 
+def _identity_review(
+    conn: Connection, store: ArtifactStore, charter: int, evaluated_at: UtcDatetime
+) -> InstitutionIdentityReview | None:
+    """The newest decision in force, offered to the gate only if its evidence still verifies.
+
+    A newer decision always wins, so a later rejection is never hidden behind an older
+    approval. Every cited location is re-checked against stored bytes: evidence that is
+    missing or no longer matches yields no review at all (the gate then fails closed).
+    """
+    try:
+        decided = [r for r in load_identity_reviews(conn, charter) if r.decided_at <= evaluated_at]
+    except ValueError:
+        return None  # an untrustworthy review exists: fail closed, never fall back to an older one
+    if not decided:
+        return None
+    # Reviews sharing the newest decision time are ordered by nothing meaningful, so an
+    # approval must never hide a rejection decided at the same moment: fail closed.
+    newest = [r for r in decided if r.decided_at == decided[0].decided_at]
+    review = next((r for r in newest if not r.approves), newest[0])
+    if len({r.legal_name for r in newest}) > 1:
+        return None  # tied approvals that disagree about who the institution is
+    # The roster importer clears verification when an institution is reported inactive or
+    # leaves the Massachusetts roster. A review older than that event cannot vouch for it.
+    cleared_at = conn.execute(
+        select(func.max(withdrawal_entries.c.withdrawn_at)).where(
+            withdrawal_entries.c.scope == WithdrawalScope.INSTITUTION.value,
+            withdrawal_entries.c.target_id == str(charter),
+            withdrawal_entries.c.actor == "roster-importer",
+            withdrawal_entries.c.withdrawn_at <= evaluated_at,
+        )
+    ).scalar()
+    if cleared_at is not None and cleared_at > review.decided_at:
+        return None
+    try:
+        for evidence in review.evidence:
+            verify_located_claim(store.read_body(evidence.artifact_id), evidence)
+    except (ArtifactStoreError, ValueError, OSError):
+        return None
+    return review
+
+
 def load_publication_context(
     conn: Connection, offer_id: str, evaluated_at: UtcDatetime, *, store: ArtifactStore
 ) -> TrustedView:
@@ -1018,6 +1061,7 @@ def load_publication_context(
             institution=institution,
             product=product,
             relationship=relationship,
+            identity_review=_identity_review(conn, store, institution.charter_number, evaluated_at),
             source=source,
             source_approval=approval,
             validation_policy=policy,

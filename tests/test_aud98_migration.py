@@ -23,6 +23,16 @@ NEW_DIMENSIONS = ("property_value", "autopay_discount", "first_lien_balance")
 TABLE = "verified_scenario_statements"
 
 
+_LATER_TABLES = frozenset({"institution_identity_reviews", "institution_identity_evidence"})
+
+
+def _expected_triggers() -> dict[str, str]:
+    """Guards for the tables that exist at this revision (later tables arrive later)."""
+    return {
+        name: sql for name, sql in s.schema_triggers() if not name.startswith(tuple(_LATER_TABLES))
+    }
+
+
 def _deployed(path: Path) -> None:
     upgrade_database(path, PREVIOUS)
     _seed_history(path)
@@ -38,7 +48,8 @@ def _insert(raw: sqlite3.Connection, statement_id: str, dimension: str, run: str
 
 def test_head_is_this_migration_on_top_of_the_unique_key_guards(tmp_path: Path) -> None:
     script = ScriptDirectory.from_config(_config(tmp_path / "unused.sqlite"))
-    assert script.get_heads() == [REVISION]
+    assert len(script.get_heads()) == 1
+    assert REVISION in {r.revision for r in script.walk_revisions()}
     revision = script.get_revision(REVISION)
     assert revision is not None and revision.down_revision == PREVIOUS
 
@@ -50,12 +61,12 @@ def test_upgrade_keeps_rows_and_guards_and_accepts_only_the_three_new_dimensions
     _deployed(path)
     with closing(sqlite3.connect(path)) as raw:
         kept = _rows(raw, TABLE)
-    upgrade_database(path)
+    upgrade_database(path, REVISION)
     assert current_revision(path) == REVISION
     with closing(sqlite3.connect(path)) as raw:
         raw.execute("PRAGMA foreign_keys=ON")
         assert _rows(raw, TABLE) == kept
-        assert _triggers(raw) == dict(s.schema_triggers())
+        assert _triggers(raw) == _expected_triggers()
         for index, dimension in enumerate(NEW_DIMENSIONS):
             with raw:
                 _insert(raw, f"statement-new-{index}", dimension, "run-north")
@@ -81,7 +92,7 @@ def test_downgrade_restores_the_predecessor_guards_and_data(tmp_path: Path) -> N
     with closing(sqlite3.connect(path)) as raw:
         before = _triggers(raw)
         kept = _rows(raw, TABLE)
-    upgrade_database(path)
+    upgrade_database(path, REVISION)
     downgrade_database(path, PREVIOUS)
     assert current_revision(path) == PREVIOUS
     with closing(sqlite3.connect(path)) as raw:
@@ -89,14 +100,14 @@ def test_downgrade_restores_the_predecessor_guards_and_data(tmp_path: Path) -> N
         assert _triggers(raw) == before
         with pytest.raises(sqlite3.DatabaseError, match="append-only"), raw:
             raw.execute(f"DELETE FROM {TABLE}")
-    upgrade_database(path)
+    upgrade_database(path, REVISION)
     assert current_revision(path) == REVISION
 
 
 def test_downgrade_refuses_to_drop_rows_that_use_a_new_dimension(tmp_path: Path) -> None:
     path = tmp_path / "history.sqlite"
     _deployed(path)
-    upgrade_database(path)
+    upgrade_database(path, REVISION)
     with closing(sqlite3.connect(path)) as raw, raw:
         raw.execute("PRAGMA foreign_keys=ON")
         _insert(raw, "statement-new", "property_value", "run-north")
@@ -104,4 +115,4 @@ def test_downgrade_refuses_to_drop_rows_that_use_a_new_dimension(tmp_path: Path)
         downgrade_database(path, PREVIOUS)
     assert current_revision(path) == REVISION  # atomic: nothing half-applied
     with closing(sqlite3.connect(path)) as raw:
-        assert _triggers(raw) == dict(s.schema_triggers())
+        assert _triggers(raw) == _expected_triggers()

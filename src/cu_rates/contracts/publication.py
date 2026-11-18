@@ -78,7 +78,12 @@ from cu_rates.contracts.offers import (
     PurchaseMortgageDetails,
     RefinanceMortgageDetails,
 )
-from cu_rates.contracts.registry import Institution, InstitutionSourceRelationship, ProductIdentity
+from cu_rates.contracts.registry import (
+    Institution,
+    InstitutionIdentityReview,
+    InstitutionSourceRelationship,
+    ProductIdentity,
+)
 from cu_rates.contracts.scenarios import (
     CANONICAL_SCENARIOS,
     ComparisonScenario,
@@ -131,6 +136,10 @@ class ReasonCode(StrEnum):
     DENYLISTED = "denylisted"
     INSTITUTION_NOT_ACTIVE = "institution_not_active"
     CHARTER_UNVERIFIED = "charter_unverified"
+    IDENTITY_REVIEW_MISSING = "identity_review_missing"
+    IDENTITY_NOT_CONFIRMED = "identity_not_confirmed"
+    SCOPE_NOT_CONFIRMED = "scope_not_confirmed"
+    IDENTITY_REVIEW_STALE = "identity_review_stale"
     OFFER_NOT_CURRENT = "offer_not_current"
     NOT_YET_EFFECTIVE = "not_yet_effective"
     ARTIFACT_STALE = "artifact_stale"
@@ -231,6 +240,10 @@ QUARANTINE_REASONS = frozenset(
     {
         R.OFFER_CANDIDATE,
         R.OFFER_QUARANTINED,
+        R.IDENTITY_REVIEW_MISSING,
+        R.IDENTITY_NOT_CONFIRMED,
+        R.SCOPE_NOT_CONFIRMED,
+        R.IDENTITY_REVIEW_STALE,
         R.RELATIONSHIP_UNVERIFIED,
         R.RELATIONSHIP_MISMATCH,
         R.RELATIONSHIP_NOT_PRODUCT_BOUND,
@@ -474,6 +487,7 @@ class PublicationContext(ContractModel):
     institution: Institution
     product: ProductIdentity
     relationship: InstitutionSourceRelationship
+    identity_review: InstitutionIdentityReview | None = None
     source: RateSource
     source_approval: SourceApproval | None = None
     validation_policy: ValidationPolicy | None = None
@@ -660,6 +674,33 @@ def _snapshot_withdrawn(snapshot_id: str, ctx: PublicationContext) -> bool:
     )
 
 
+IDENTITY_REVIEW_MAX_AGE = timedelta(days=400)
+
+
+def _identity_reasons(institution: Institution, ctx: PublicationContext) -> set[ReasonCode]:
+    """The flags on the institution are not proof: a current approving review is required."""
+    review = ctx.identity_review
+    if (
+        review is None
+        or review.institution_charter != institution.charter_number
+        or review.decided_at > ctx.evaluated_at
+    ):
+        return {R.IDENTITY_REVIEW_MISSING}
+    reasons: set[ReasonCode] = set()
+    # A review is a human claim; the text it cites must itself say what it claims.
+    if (
+        not review.identity_confirmed
+        or review.legal_name != institution.legal_name
+        or not review.evidence_states_identity
+    ):
+        reasons.add(R.IDENTITY_NOT_CONFIRMED)
+    if not review.massachusetts_scope_confirmed or not review.evidence_states_massachusetts:
+        reasons.add(R.SCOPE_NOT_CONFIRMED)
+    if ctx.evaluated_at - review.decided_at > IDENTITY_REVIEW_MAX_AGE:
+        reasons.add(R.IDENTITY_REVIEW_STALE)
+    return reasons
+
+
 def _lifecycle_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[ReasonCode]:
     reasons: set[ReasonCode] = set()
     institution = ctx.institution
@@ -669,6 +710,7 @@ def _lifecycle_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[R
         reasons.add(R.INSTITUTION_NOT_ACTIVE)
     if not institution.charter_verified:
         reasons.add(R.CHARTER_UNVERIFIED)
+    reasons |= _identity_reasons(institution, ctx)
     if offer.status not in _PUBLISHABLE_STATUSES:  # only approved/published may proceed
         reasons.add(_STATUS_REASON.get(offer.status, R.OFFER_NOT_CURRENT))
     if offer.effective_at is not None and offer.effective_at > ctx.evaluated_at:
