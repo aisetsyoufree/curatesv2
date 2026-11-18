@@ -951,6 +951,20 @@ def test_readme_documents_denylist_initialize_step() -> None:
     assert "Denylist(Path(" in readme
 
 
+def test_withdraw_runbook_uses_root_and_private_reader_group() -> None:
+    readme = (DEPLOY_DIR / "README.md").read_text(encoding="utf-8")
+    provisioning = readme.split("### Step 5:", 1)[1].split("### Step 6:", 1)[0]
+    assert "sudo chown root:cu-rates /var/lib/cu-rates/independent" in provisioning
+    assert "sudo chmod 0640 /var/lib/cu-rates/independent/denylist.json" in provisioning
+    assert "0644" not in provisioning
+    inbox = readme.split("## 7b.", 1)[1].split("## 8.", 1)[0]
+    assert (
+        "sudo /var/lib/cu-rates/venv/bin/python -m cu_rates.intake "
+        "--db /var/lib/cu-rates/intake/intake.sqlite withdraw"
+    ) in inbox
+    assert "root" in inbox and "0640" in inbox and "cu-rates" in inbox
+
+
 def test_tunnel_port_consistency() -> None:
     """Verify Cloudflare Tunnel target port is consistent between Caddyfile and README."""
     caddyfile = (DEPLOY_DIR / "caddy" / "Caddyfile").read_text(encoding="utf-8")

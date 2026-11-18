@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, Self
@@ -47,7 +48,10 @@ class Denylist:
         payload = value.model_dump_json().encode()
         if len(payload) > _MAX_LEDGER_BYTES:
             raise SnapshotError("withdrawal ledger exceeds its size limit")
-        atomic_write(self.path, payload, mode=0o640)
+        # Root's temporary files otherwise acquire root's group, hiding the ledger
+        # from the web reader after replacement. Provision the parent with its group.
+        gid = self.path.parent.stat().st_gid if os.geteuid() == 0 else None
+        atomic_write(self.path, payload, mode=0o640, gid=gid)
 
     @property
     def _lock(self) -> Path:

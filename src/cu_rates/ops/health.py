@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+import stat
 import sys
 from collections.abc import Sequence
 from contextlib import closing
@@ -161,6 +162,20 @@ def _check_denylist_readable(
                 name=name,
                 status="fail",
                 detail="denylist_path must be an absolute path",
+            )
+        metadata = denylist_path.lstat()
+        parent_gid = denylist_path.parent.stat().st_gid
+        # Do not let a health check run by the owner/root mask broken web-reader
+        # permissions. This checks the deployment's shared-group convention, not ACLs.
+        if not metadata.st_mode & stat.S_IRGRP or metadata.st_gid != parent_gid:
+            return Check(
+                name=name,
+                status="fail",
+                detail=(
+                    f"{denylist_path.name} must be group-readable (mode 0640) with the "
+                    f"parent directory's web-reader group (gid {parent_gid}); "
+                    "provision that group as cu-rates and repair the ledger's group/mode"
+                ),
             )
         denylist = Denylist(denylist_path)
         entries = denylist.entries()

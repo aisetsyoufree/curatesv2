@@ -194,9 +194,10 @@ if [[ -d "${INDEPENDENT_DIR}" ]]; then
 else
     run_action "create operator-owned independent directory '${INDEPENDENT_DIR}'" \
         mkdir -p "${INDEPENDENT_DIR}"
-    run_action "set ownership of independent directory '${INDEPENDENT_DIR}' to root" \
-        chown root "${INDEPENDENT_DIR}"
 fi
+# root-owned, group cu-rates: root-run withdrawals then keep the ledger group-readable by the web user
+run_action "set ownership of independent directory '${INDEPENDENT_DIR}' to root:${APP_GROUP}" \
+    chown "root:${APP_GROUP}" "${INDEPENDENT_DIR}"
 run_action "set 0755 permissions on independent directory '${INDEPENDENT_DIR}'" \
     chmod 0755 "${INDEPENDENT_DIR}"
 

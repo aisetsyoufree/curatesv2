@@ -48,12 +48,16 @@ def sync_directory(path: Path) -> None:
         os.close(fd)
 
 
-def atomic_write(path: Path, data: bytes, *, mode: int) -> None:
+def atomic_write(path: Path, data: bytes, *, mode: int, gid: int | None = None) -> None:
     """Same-directory replacement: a reader sees the full old or full new document."""
     fd, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}-")
     temporary = Path(name)
     try:
         with os.fdopen(fd, "wb") as stream:
+            # Set access metadata before exposing the new inode. A failed chown leaves
+            # the previous document in place; never repair permissions after replacement.
+            if gid is not None:
+                os.fchown(stream.fileno(), -1, gid)
             os.fchmod(stream.fileno(), mode)
             stream.write(data)
             stream.flush()
