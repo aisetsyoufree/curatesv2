@@ -781,6 +781,19 @@ def test_compare_page_empty_state_and_noindex(client: FlaskClient) -> None:
     assert "$400,000" in html
     assert "80.000%" in html
     assert "780" in html
+    assert "Home purchase" in html
+    assert "Rate-and-term refinance (no cash out)" in html
+    assert "Closed-end home equity loan (Second lien)" in html
+    assert "Revolving line of credit (Second lien)" in html
+    assert "$350,000" in html
+    assert "$50,000" in html
+    assert "30 years (360 months) fixed" in html
+    assert "10 years (120 months) fixed" in html
+    assert "30 days" in html
+    assert "0.000 (Zero points)" in html
+    assert "Owner-occupied single-family primary residence" in html
+    assert "None (No relationship or automatic payment discount)" in html
+    assert "Post-introductory variable APR" in html
 
     # Excluded from sitemap when no verified data is published
     sitemap = client.get("/sitemap.xml").get_data(as_text=True)
@@ -2453,6 +2466,43 @@ def test_borrower_only_condition_accurate_exclusion_reason() -> None:
     assert formatted is not None
     assert "Borrower eligibility requirement" in formatted.separation_reason
     assert "discount or relationship" not in formatted.separation_reason
+    assert "Borrower eligibility condition" in formatted.conditions_display
+
+
+def test_borrower_condition_label_text_asserted_in_conditions_display() -> None:
+    """Borrower-condition label text is asserted via conditions_display (Finding 2)."""
+    from cu_rates.contracts.offers import OfferCondition
+    from cu_rates.snapshot.builder import _public_projection
+    from cu_rates.web.comparison import classify_and_format_offer
+
+    now = make.EVALUATED_AT
+    borrower_cond = OfferCondition(
+        condition_id="cond-borrower",
+        kind=ConditionKind.BORROWER_REQUIREMENT,
+        description="Borrower must meet credit union membership criteria",
+        provenance=make.provenance("Membership required"),
+        scenario_state=MatchState.MATCHES,
+    )
+    # 1. Offer with scenario matches includes "Borrower eligibility condition"
+    cand = _make_candidate(
+        "offer-borrower-label",
+        "Borrower Label CU",
+        conditions=(borrower_cond,),
+        now=now,
+    )
+    pub = _public_projection(cand, Placement.BROWSE_ONLY, False)
+    formatted = classify_and_format_offer(pub, now)
+    assert formatted is not None
+    assert "Borrower eligibility condition" in formatted.conditions_display
+
+    # 2. Offer without published scenario bounds displays exactly "Borrower eligibility condition"
+    cand_bare = cand.model_copy(
+        update={"offer": cand.offer.model_copy(update={"scenario_matches": ()})}
+    )
+    pub_bare = _public_projection(cand_bare, Placement.BROWSE_ONLY, False)
+    formatted_bare = classify_and_format_offer(pub_bare, now)
+    assert formatted_bare is not None
+    assert formatted_bare.conditions_display == "Borrower eligibility condition"
 
 
 def _sort_stub(institution: str, observed_at: datetime) -> Any:
@@ -2584,3 +2634,67 @@ def test_compare_reads_a_snapshot_admitted_from_persisted_pipeline_evidence(tmp_
     html = response.get_data(as_text=True)
     assert "Example North Charter" in html
     assert "6.375%" in html and "6.441%" in html
+
+
+def test_canonical_scenario_assumptions_asserted_independently() -> None:
+    """Each assumption value for each canonical scenario is independently asserted (~38 values)."""
+    from cu_rates.contracts.enums import CanonicalScenarioId
+    from cu_rates.web.comparison import SCENARIOS_BY_ID
+
+    # 1. Purchase 30-year fixed (10 assumptions)
+    purch = SCENARIOS_BY_ID[CanonicalScenarioId.PURCHASE_30Y_FIXED.value]
+    purch_map = {a.label: a.value for a in purch.assumptions}
+    assert len(purch.assumptions) == 10
+    assert purch_map["Loan Purpose"] == "Home purchase"
+    assert purch_map["Property Value"] == "$500,000"
+    assert purch_map["Loan Amount"] == "$400,000"
+    assert purch_map["Loan-to-Value (LTV)"] == "80.000% (First lien)"
+    assert purch_map["Credit Score"] == "780"
+    assert purch_map["Term"] == "30 years (360 months) fixed"
+    assert purch_map["Rate Lock"] == "30 days"
+    assert purch_map["Points"] == "0.000 (Zero points)"
+    assert purch_map["Occupancy"] == "Owner-occupied single-family primary residence"
+    assert purch_map["Discounts"] == "None (No relationship or automatic payment discount)"
+
+    # 2. Rate-and-term refinance 30-year fixed (10 assumptions)
+    refi = SCENARIOS_BY_ID[CanonicalScenarioId.RATE_TERM_REFI_30Y_FIXED.value]
+    refi_map = {a.label: a.value for a in refi.assumptions}
+    assert len(refi.assumptions) == 10
+    assert refi_map["Loan Purpose"] == "Rate-and-term refinance (no cash out)"
+    assert refi_map["Property Value"] == "$500,000"
+    assert refi_map["Loan Balance"] == "$400,000"
+    assert refi_map["Loan-to-Value (LTV)"] == "80.000% (First lien)"
+    assert refi_map["Credit Score"] == "780"
+    assert refi_map["Term"] == "30 years (360 months) fixed"
+    assert refi_map["Rate Lock"] == "30 days"
+    assert refi_map["Points"] == "0.000 (Zero points)"
+    assert refi_map["Occupancy"] == "Owner-occupied single-family primary residence"
+    assert refi_map["Discounts"] == "None (No relationship or automatic payment discount)"
+
+    # 3. Fixed home equity 10-year (9 assumptions)
+    heq = SCENARIOS_BY_ID[CanonicalScenarioId.FIXED_HOME_EQUITY_10Y.value]
+    heq_map = {a.label: a.value for a in heq.assumptions}
+    assert len(heq.assumptions) == 9
+    assert heq_map["Loan Purpose"] == "Closed-end home equity loan (Second lien)"
+    assert heq_map["Property Value"] == "$500,000"
+    assert heq_map["First Lien Balance"] == "$350,000"
+    assert heq_map["Loan Amount"] == "$50,000"
+    assert heq_map["Combined LTV (CLTV)"] == "80.000%"
+    assert heq_map["Credit Score"] == "780"
+    assert heq_map["Term"] == "10 years (120 months) fixed"
+    assert heq_map["Occupancy"] == "Owner-occupied single-family primary residence"
+    assert heq_map["Discounts"] == "None (No relationship or automatic payment discount)"
+
+    # 4. HELOC (9 assumptions)
+    heloc = SCENARIOS_BY_ID[CanonicalScenarioId.HELOC.value]
+    heloc_map = {a.label: a.value for a in heloc.assumptions}
+    assert len(heloc.assumptions) == 9
+    assert heloc_map["Loan Purpose"] == "Revolving line of credit (Second lien)"
+    assert heloc_map["Property Value"] == "$500,000"
+    assert heloc_map["First Lien Balance"] == "$350,000"
+    assert heloc_map["Line Amount"] == "$50,000"
+    assert heloc_map["Combined LTV (CLTV)"] == "80.000%"
+    assert heloc_map["Credit Score"] == "780"
+    assert heloc_map["Rate Structure"] == "Post-introductory variable APR"
+    assert heloc_map["Occupancy"] == "Owner-occupied single-family primary residence"
+    assert heloc_map["Discounts"] == "None (No relationship or automatic payment discount)"

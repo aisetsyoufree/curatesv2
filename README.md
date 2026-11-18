@@ -64,7 +64,7 @@ uv run ruff format --check .
 | `src/cu_rates/db/`, `alembic/` | Operational SQLite schema and frozen migrations |
 | `src/cu_rates/roster/` | Source-versioned institution roster import |
 | `src/cu_rates/pipeline/` | Offline vertical slice (slice-only extractor) |
-| `src/cu_rates/snapshot/` | Atomic public snapshot builder and reader, when merged |
+| `src/cu_rates/snapshot/` | Atomic public snapshot builder and reader |
 | `src/cu_rates/web/` | Server-rendered website foundation and draft educational articles |
 | `tests/` | Offline tests and synthetic fixtures (no live requests) |
 | `scripts/check` | The quality gate |
