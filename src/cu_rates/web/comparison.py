@@ -187,8 +187,10 @@ class FormattedOffer:
 
 def exact_decimal(value: Decimal, minimum_places: int = 3) -> str:
     """Show a published value exactly: at least three places, never silently rounded."""
+    if not value.is_finite():
+        raise ValueError("a non-finite value cannot be displayed")
     places = max(minimum_places, -int(value.as_tuple().exponent))
-    return f"{value:.{places}f}"
+    return f"{abs(value) if value.is_zero() else value:.{places}f}"  # never "-0.000"
 
 
 def format_age(delta: timedelta) -> str:
