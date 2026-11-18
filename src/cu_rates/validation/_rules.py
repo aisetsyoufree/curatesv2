@@ -6,7 +6,7 @@ import re
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
 from datetime import timedelta
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from typing import TYPE_CHECKING
 
 from cu_rates.contracts import (
@@ -590,7 +590,9 @@ def _valid_bound(dimension: TierDimension, value: Decimal) -> bool:
         return value == value.to_integral_value() and 300 <= value <= 850
     if dimension is TierDimension.TERM_MONTHS:
         return value == value.to_integral_value() and 1 <= value <= 720
-    return value > 0 and value == value.quantize(Decimal("0.01"))
+    with localcontext() as context:  # ambient precision must not change the verdict
+        context.prec = max(len(value.as_tuple().digits) + 4, 28)
+        return value > 0 and value == value.quantize(Decimal("0.01"))
 
 
 def _tier_bounds_match(bounds: tuple[TierBound, ...], text: str) -> bool:
