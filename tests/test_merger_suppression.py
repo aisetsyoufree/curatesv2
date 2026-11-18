@@ -5,6 +5,7 @@ the implementation: they describe externally observable behaviour that the
 issue requires.
 """
 
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -33,6 +34,10 @@ def _denylist(tmp_path: Path) -> Denylist:
     denylist = Denylist(tmp_path / "independent" / "withdrawals.json")
     denylist.initialize()
     return denylist
+
+
+def _at(moment: datetime) -> Callable[[], datetime]:
+    return lambda: moment
 
 
 def _store(tmp_path: Path) -> ArtifactStore:
@@ -488,13 +493,17 @@ def test_merger_suppresses_public_reads_via_the_independent_denylist(tmp_path: P
     """The reader enforces only the independent denylist, so it must hold the suppression."""
     engine = open_operational_database(_database(tmp_path))
     store, denylist = _store(tmp_path), _denylist(tmp_path)
-    for csv, version, moment in ((_V1_CSV, "v1", FROZEN_V1), (_V2_MERGED_CSV, "v2", FROZEN_V2)):
+    steps: tuple[tuple[bytes, str, datetime], ...] = (
+        (_V1_CSV, "v1", FROZEN_V1),
+        (_V2_MERGED_CSV, "v2", FROZEN_V2),
+    )
+    for csv, version, moment in steps:
         import_roster(
             csv,
             engine_or_connection=engine,
             artifact_store=store,
             source_version=version,
-            clock=lambda moment=moment: moment,
+            clock=_at(moment),
             denylist=denylist,
         )
     assert ("institution", "60001") in denylist.active_targets(FROZEN_V2)
