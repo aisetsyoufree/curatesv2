@@ -254,8 +254,7 @@ def test_execstart_binary_paths_match_readme_venv() -> None:
     documented_venv = match.group(1)
     assert documented_venv == "/var/lib/cu-rates/venv"
     assert (
-        "UV_PROJECT_ENVIRONMENT=/var/lib/cu-rates/venv"
-        " UV_CACHE_DIR=/var/lib/cu-rates/.cache/uv uv sync --locked --no-dev --group deploy"
+        "UV_PROJECT_ENVIRONMENT=/var/lib/cu-rates/venv uv sync --locked --no-dev --group deploy"
         in readme_content
     )
 
@@ -406,13 +405,16 @@ def test_documented_runbook_order_against_install_checks(tmp_path: Path) -> None
     # 3. uv sync runs as cu-rates with UV_CACHE_DIR and UV_PROJECT_ENVIRONMENT
     apply_step = "sudo bash deploy/install.sh --apply"
     clone_step = (
-        "sudo -u cu-rates git clone https://github.com/aisetsyoufree/curatesv2.git"
-        " /var/lib/cu-rates/app"
+        "sudo git clone https://github.com/aisetsyoufree/curatesv2.git /var/lib/cu-rates/app"
     )
+    pin_step = "sudo git -C /var/lib/cu-rates/app checkout --detach <reviewed-tag-or-sha>"
     sync_step = (
-        "sudo -u cu-rates UV_PROJECT_ENVIRONMENT=/var/lib/cu-rates/venv"
-        " UV_CACHE_DIR=/var/lib/cu-rates/.cache/uv uv sync --locked --no-dev --group deploy"
+        "sudo UV_PROJECT_ENVIRONMENT=/var/lib/cu-rates/venv"
+        " uv sync --locked --no-dev --group deploy"
     )
+    assert pin_step in readme and "rev-parse HEAD" in readme  # A6: pinned, recorded commit
+    assert "sudo -u cu-rates git clone" not in readme  # A5: code is never service-writable
+    assert "sudo -u cu-rates UV_PROJECT_ENVIRONMENT" not in readme
 
     assert apply_step in readme, "README must document install.sh --apply step"
     assert clone_step in readme, "README must document git clone as cu-rates user into app/"
@@ -439,7 +441,7 @@ def test_documented_runbook_order_against_install_checks(tmp_path: Path) -> None
     assert res_dry.returncode == 0
     assert f"Would create directory '{test_root}/app'" in res_dry.stdout
     assert (
-        f"Would set ownership of created directory '{test_root}/app' to cu-rates:cu-rates"
+        f"Would set ownership of created directory '{test_root}/app' to root:cu-rates"
         in res_dry.stdout
     )
 
@@ -497,7 +499,7 @@ exit 0
     assert res_apply.returncode == 0, f"install.sh --apply failed: {res_apply.stderr}"
     assert log_file.is_file(), "Fake chown was never invoked"
     chown_logs = log_file.read_text(encoding="utf-8")
-    assert f"chown cu-rates:cu-rates {test_root}/app" in chown_logs, (
+    assert f"chown root:cu-rates {test_root}/app" in chown_logs, (
         f"install.sh --apply did not chown app/ to cu-rates:cu-rates. Logs:\n{chown_logs}"
     )
 

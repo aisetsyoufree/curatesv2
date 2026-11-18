@@ -179,8 +179,14 @@ for dir in "${DIRS[@]}"; do
         echo "Directory '${dir}' already exists."
     else
         run_action "create directory '${dir}'" mkdir -p "${dir}"
-        run_action "set ownership of created directory '${dir}' to ${APP_USER}:${APP_GROUP}" \
-            chown "${APP_USER}:${APP_GROUP}" "${dir}"
+        owner="${APP_USER}:${APP_GROUP}"
+        # Code the service runs must not be writable by the service (AUD9 A5): root-owned,
+        # group-readable. Operators build and update app/ and venv/ as root.
+        if [[ "${dir}" == "${NVME_ROOT}/app" || "${dir}" == "${NVME_ROOT}/venv" ]]; then
+            owner="root:${APP_GROUP}"
+        fi
+        run_action "set ownership of created directory '${dir}' to ${owner}" \
+            chown "${owner}" "${dir}"
     fi
 done
 
@@ -248,7 +254,7 @@ if [[ -f "${ENV_FILE}" ]]; then
     echo "Configuration '${ENV_FILE}' already exists (not overwriting)."
 else
     run_action "install environment file template to '${ENV_FILE}' (mode 0600)" \
-        install -m 0600 -o "${APP_USER}" -g "${APP_GROUP}" "${SCRIPT_DIR}/env.example" "${ENV_FILE}"
+        install -m 0640 -o root -g "${APP_GROUP}" "${SCRIPT_DIR}/env.example" "${ENV_FILE}"
 fi
 
 # 5. Install systemd units
@@ -328,8 +334,8 @@ if [[ "${APPLY}" -eq 1 ]]; then
     echo "=== Installation Applied Successfully ==="
     echo "Next steps for operator:"
     echo "1. Review and populate /etc/cu-rates/cu-rates.env"
-    echo "2. Clone app repository as service user: sudo -u cu-rates git clone https://github.com/aisetsyoufree/curatesv2.git ${NVME_ROOT}/app"
-    echo "3. Build venv using: sudo -u cu-rates UV_PROJECT_ENVIRONMENT=${NVME_ROOT}/venv UV_CACHE_DIR=${NVME_ROOT}/.cache/uv uv sync --locked --no-dev --group deploy"
+    echo "2. Clone app repository AS ROOT at a pinned tag or commit, then record it: see deploy/README.md Step 3"
+    echo "3. Build the venv AS ROOT (the service user must not be able to modify code): see deploy/README.md Step 4"
     echo "4. Configure Caddy: copy deploy/caddy/Caddyfile to /etc/caddy/conf.d/cu-rates.caddyfile"
     echo "5. Start web service: sudo systemctl start cu-rates-web.service"
     echo "6. Note: Worker service and timer remain STOPPED, DISABLED, and MASKED per MASTER.md D-15 and D-17."
