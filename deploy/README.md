@@ -547,6 +547,8 @@ sudo systemctl restart cu-rates-web
 sudo systemctl enable --now cu-rates-intake-purge.timer   # daily deletion of expired reply contacts
 ```
 
+**Backup unit symptom.** If `cu-rates-backup.service` fails with `status=226/NAMESPACE`, one of its read-only state directories (independent, automatic, snapshots, intake) does not exist yet; create it (see Step 2) rather than loosening the unit. Backups copy every snapshot version ever published, so watch disk growth.
+
 **Working the inbox** (as the service user): `... --db <path> list` (exit status 3 means a case missed its triage target: one business day for rate, identity, privacy and security reports, five for others), `show <id>`, `triage`, `note`, `resolve --decision confirmed|amended|quarantined|rejected`, `bulk-reject --from ... --to ... --yes` (junk flooding), and `redact` (removes unsolicited personal data from a case). The purge timer runs `purge-contacts`.
 
 **Withdraw a case as root**, after completing Step 5. This immediately suppresses the target on the independent denylist, then records the decision in the existing intake database. The service user cannot create the ledger's writer lock in the root-owned directory. Use the actual case ID, target, actor and reason:

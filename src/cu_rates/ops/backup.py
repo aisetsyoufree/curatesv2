@@ -743,8 +743,10 @@ def restore_backup(
         verify_backup(temp_target)
         # Recheck immediately before changing a ledger-only destination. Restore is
         # offline: stop all ledger writers/readers first, as documented in the runbook.
+        # Compare the bytes that will actually be installed (temp_target), not the backup
+        # directory, which a writer could swap between the first check and this one.
         _check_restore_target(
-            backup_dir,
+            temp_target,
             target,
             replace_ledgers=replace_ledgers,
             allow_rollback=allow_ledger_rollback,
