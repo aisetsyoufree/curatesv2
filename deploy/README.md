@@ -108,8 +108,10 @@ sudo -u cu-rates UV_PROJECT_ENVIRONMENT=/var/lib/cu-rates/venv UV_CACHE_DIR=/var
 ```
 
 ### Step 5: Initialize Emergency Withdrawal Ledger
-The emergency withdrawal mechanism requires an initialized ledger file at `/var/lib/cu-rates/independent/denylist.json` before any withdrawal records can be appended (uninitialized reads fail closed). Initial provisioning creates the parent directory `/var/lib/cu-rates/independent` (operator-owned, mode 0755) but does not establish the ledger. Initialize the empty ledger as the root or operator user:
+The emergency withdrawal mechanism requires an initialized ledger file at `/var/lib/cu-rates/independent/denylist.json` before any withdrawal records can be appended (uninitialized reads fail closed). Initial provisioning creates the parent directory `/var/lib/cu-rates/independent` (operator-owned, mode 0755) but does not establish the ledger. Set its group to the web-reader group and initialize the ledger **as root**:
 ```bash
+sudo chown root:cu-rates /var/lib/cu-rates/independent
+sudo chmod 0755 /var/lib/cu-rates/independent
 sudo /var/lib/cu-rates/venv/bin/python -c '
 from pathlib import Path
 from cu_rates.snapshot import Denylist
@@ -117,9 +119,11 @@ from cu_rates.snapshot import Denylist
 denylist = Denylist(Path("/var/lib/cu-rates/independent/denylist.json"))
 denylist.initialize()
 '
-sudo chmod 0644 /var/lib/cu-rates/independent/denylist.json
+sudo chown root:cu-rates /var/lib/cu-rates/independent/denylist.json
+sudo chmod 0640 /var/lib/cu-rates/independent/denylist.json
+sudo -u cu-rates test -r /var/lib/cu-rates/independent/denylist.json
 ```
-This explicitly establishes the empty ledger with version 1 (`mode 0644`) so subsequent operator withdrawals can append records safely, while the worker service cannot write to or tamper with the independent ledger directory.
+This establishes version 1 with ownership `root:cu-rates` and mode `0640`, readable by the web user without world read access. On an existing install these commands preserve the entries and repair the directory/file group and mode. Every root-run initialize, withdraw, or lift writes mode `0640` with the parent directory's group **before** atomic replacement; failure to assign the group aborts the write. Keep the parent `root:cu-rates` at `0755`: only root can create the writer lock or replace the ledger, and the worker and web services cannot modify it.
 
 ### Step 6: Configure Environment
 Review and edit `/etc/cu-rates/cu-rates.env`:
@@ -303,20 +307,20 @@ The independent denylist above is **operator-owned**: the collection worker can 
 sudo -u cu-rates /var/lib/cu-rates/venv/bin/python -c "from pathlib import Path; from cu_rates.snapshot import Denylist; Denylist(Path('/var/lib/cu-rates/automatic/denylist.json')).initialize()"
 ```
 
-Only an operator lifts an automatic suppression, **as the service user** (running it as root would leave the ledger root-owned, unreadable by the site, and every public read would then fail closed):
+Only an operator lifts an automatic suppression, **as the service user**, preserving the worker's ownership of its separate ledger:
 
 ```bash
 sudo -u cu-rates /var/lib/cu-rates/venv/bin/python -c "from datetime import UTC, datetime; from pathlib import Path; from cu_rates.snapshot import Denylist; Denylist(Path('/var/lib/cu-rates/automatic/denylist.json')).lift('<withdrawal id>', at=datetime.now(UTC), actor='<your name>')"
 ```
 
-The health check reads both ledgers.
+The health check reads both ledgers and requires group-read permission and a file group matching the parent directory's group, even when invoked by root. This is a mode/group check, not an ACL or arbitrary-user impersonation check; provision the shared group as `cu-rates`. The deployed health service also runs as `cu-rates`, checking actual read access.
 
 **Upgrading an existing install.** The installer never overwrites `/etc/cu-rates/cu-rates.env`, so add `AUTOMATIC_DENYLIST_PATH=/var/lib/cu-rates/automatic/denylist.json` to it yourself (after creating the ledger as above, and after re-running the installer so the directory and units exist) and restart `cu-rates-web`. The web service refuses to start if `DENYLIST_PATH` is set without it, rather than silently ignoring the worker's blocks.
 
 ### Emergency Withdrawal Denylist
 The web application enforces the configured `DENYLIST_PATH` through `SnapshotReader` on each read. An uninitialized, missing, or invalid `denylist.json` fails closed and suppresses offers.
 
-> **Prerequisite:** Withdrawal requires an initialized ledger. If `/var/lib/cu-rates/independent/denylist.json` was not already initialized during initial setup, run `Denylist.initialize()` once before appending entries (otherwise uninitialized reads fail closed):
+> **Prerequisite:** Complete Step 5, including the `root:cu-rates` parent group and `0640` ledger permissions. If the ledger was not initialized, run `Denylist.initialize()` once **as root** before appending entries (otherwise uninitialized reads fail closed):
 > ```python
 > from pathlib import Path
 > from cu_rates.snapshot import Denylist
@@ -326,7 +330,7 @@ The web application enforces the configured `DENYLIST_PATH` through `SnapshotRea
 > ```
 
 Procedure:
-1. Append an emergency withdrawal record using `Denylist.withdraw()` (from `src/cu_rates/snapshot/denylist.py`) with all required audit fields:
+1. Run the following Python as root with `sudo /var/lib/cu-rates/venv/bin/python`, and append an emergency withdrawal record using `Denylist.withdraw()` (from `src/cu_rates/snapshot/denylist.py`) with all required audit fields. Root is required to create the writer lock in the operator-owned directory; the replacement ledger remains group-readable at `0640`:
    ```python
    from datetime import datetime, timezone
    from pathlib import Path
@@ -468,7 +472,16 @@ sudo systemctl restart cu-rates-web
 sudo systemctl enable --now cu-rates-intake-purge.timer   # daily deletion of expired reply contacts
 ```
 
-**Working the inbox** (as the service user): `... --db <path> list` (exit status 3 means a case missed its triage target: one business day for rate, identity, privacy and security reports, five for others), `show <id>`, `triage`, `note`, `resolve --decision confirmed|amended|quarantined|rejected`, `withdraw` (immediately suppresses an offer, product, institution, source or snapshot on the independent denylist, then records the decision), `bulk-reject --from ... --to ... --yes` (junk flooding), and `redact` (removes unsolicited personal data from a case). The purge timer runs `purge-contacts`.
+**Working the inbox** (as the service user): `... --db <path> list` (exit status 3 means a case missed its triage target: one business day for rate, identity, privacy and security reports, five for others), `show <id>`, `triage`, `note`, `resolve --decision confirmed|amended|quarantined|rejected`, `bulk-reject --from ... --to ... --yes` (junk flooding), and `redact` (removes unsolicited personal data from a case). The purge timer runs `purge-contacts`.
+
+**Withdraw a case as root**, after completing Step 5. This immediately suppresses the target on the independent denylist, then records the decision in the existing intake database. The service user cannot create the ledger's writer lock in the root-owned directory. Use the actual case ID, target, actor and reason:
+
+```bash
+sudo /var/lib/cu-rates/venv/bin/python -m cu_rates.intake --db /var/lib/cu-rates/intake/intake.sqlite withdraw '<case-id>' --denylist /var/lib/cu-rates/independent/denylist.json --scope offer --target '<offer-id>' --actor '<your name>' --note '<reason>'
+sudo -u cu-rates test -r /var/lib/cu-rates/independent/denylist.json
+```
+
+The root write retains mode `0640` and the parent directory's `cu-rates` group; it never grants world read access. Lifts on the independent ledger also run as root. A group-assignment error aborts replacement and must be resolved before retrying; missing, unreadable or invalid ledgers continue to fail closed.
 
 **Limits to know.** The form's rate limits are per web process (three Gunicorn workers), so roughly 6 reports per client and 45 in total per hour per host; one determined client can still fill the inbox, which is what `bulk-reject` is for. The client address used for those limits comes from `CF-Connecting-IP` and is trusted for that purpose only.
 

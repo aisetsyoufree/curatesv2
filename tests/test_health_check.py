@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -105,6 +106,59 @@ def test_health_check_all_ok(health_env: HealthFixture) -> None:
     for c in report.checks:
         assert c.status == "ok"
         assert len(c.detail) > 0
+
+
+@pytest.mark.parametrize("automatic", [False, True], ids=["operator", "automatic"])
+def test_health_rejects_ledgers_without_group_read(
+    health_env: HealthFixture, tmp_path: Path, automatic: bool
+) -> None:
+    other = Denylist(tmp_path / "automatic" / "denylist.json")
+    other.initialize()
+    path = other.path if automatic else health_env.denylist_path
+    path.chmod(0o600)  # Still readable by the health process; not by a separate web user.
+    report = check_health(
+        snapshot_root=health_env.snapshot_root,
+        denylist_path=health_env.denylist_path,
+        automatic_denylist_path=other.path,
+        now=health_env.now,
+    )
+    name = "automatic_denylist_readable" if automatic else "denylist_readable"
+    check = next(c for c in report.checks if c.name == name)
+    assert not report.ok
+    assert check.status == "fail"
+    assert "group-readable" in check.detail
+    assert "cu-rates" in check.detail
+
+
+@pytest.mark.parametrize("automatic", [False, True], ids=["operator", "automatic"])
+def test_health_rejects_ledger_group_mismatch(
+    health_env: HealthFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, automatic: bool
+) -> None:
+    other = Denylist(tmp_path / "automatic" / "denylist.json")
+    other.initialize()
+    path = other.path if automatic else health_env.denylist_path
+    real_stat = Path.stat
+
+    def wrong_group(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        result = real_stat(self, follow_symlinks=follow_symlinks)
+        if self == path:
+            values = list(result)
+            values[5] += 10000
+            return os.stat_result(values)
+        return result
+
+    monkeypatch.setattr(Path, "stat", wrong_group)
+    report = check_health(
+        snapshot_root=health_env.snapshot_root,
+        denylist_path=health_env.denylist_path,
+        automatic_denylist_path=other.path,
+        now=health_env.now,
+    )
+    name = "automatic_denylist_readable" if automatic else "denylist_readable"
+    check = next(c for c in report.checks if c.name == name)
+    assert not report.ok
+    assert check.status == "fail"
+    assert "group" in check.detail and "parent" in check.detail
 
 
 def test_health_check_optional_components_omitted(health_env: HealthFixture) -> None:
