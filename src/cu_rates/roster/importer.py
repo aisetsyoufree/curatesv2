@@ -27,15 +27,18 @@ from cu_rates.artifact_store import (
     ArtifactNotFoundError,
     ArtifactStore,
 )
+from cu_rates.contracts.audit import WithdrawalEntry
 from cu_rates.contracts.base import CONTRACT_VERSION
-from cu_rates.contracts.enums import InstitutionStatus
+from cu_rates.contracts.enums import InstitutionStatus, WithdrawalScope
 from cu_rates.contracts.registry import Institution
 from cu_rates.db.schema import institutions, roster_import_entries, roster_imports
+from cu_rates.pipeline.trusted import insert_withdrawal
 from cu_rates.roster.mapping import (
     DEFAULT_NCUA_MAPPING,
     RosterColumnMapping,
     map_institution_status,
 )
+from cu_rates.snapshot import Denylist
 
 # Budgets keep one roster file from exhausting memory. They are far above the
 # committed fixtures and are reported instead of raising.
@@ -50,6 +53,16 @@ _UNDATED_STATUSES = frozenset(
     {
         InstitutionStatus.ACTIVE,
         InstitutionStatus.UNDER_REVIEW,
+        InstitutionStatus.CONVERTED,
+    }
+)
+# Statuses that make an institution ineligible for publication.  A roster
+# import transitioning an institution *into* one of these clears eligibility
+# and suppresses existing offers pending human reconciliation.
+_INELIGIBLE_STATUSES = frozenset(
+    {
+        InstitutionStatus.MERGED,
+        InstitutionStatus.LIQUIDATED,
         InstitutionStatus.CONVERTED,
     }
 )
@@ -97,6 +110,7 @@ class RosterImportReport:
     mergers: tuple[int, ...] = field(default_factory=tuple)
     closures: tuple[int, ...] = field(default_factory=tuple)
     quarantined_charters: tuple[int, ...] = field(default_factory=tuple)
+    suppressed_charters: tuple[int, ...] = field(default_factory=tuple)
     review_charters: tuple[int, ...] = field(default_factory=tuple)
     stale_charters: tuple[int, ...] = field(default_factory=tuple)
     errors: tuple[str, ...] = field(default_factory=tuple)
@@ -148,7 +162,9 @@ class RosterImporter:
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         mapping: RosterColumnMapping = DEFAULT_NCUA_MAPPING,
         source_url: str = "https://www.ncua.gov/data/credit-union-roster.csv",
+        denylist: Denylist | None = None,
     ) -> None:
+        self._denylist = denylist
         self._target = engine_or_connection
         self._store = artifact_store
         self._clock = clock
@@ -317,6 +333,7 @@ class RosterImporter:
         closures: list[int] = []
         review: list[int] = []
         stale: list[int] = []
+        suppressed: list[int] = []
         clean: set[int] = set()
 
         for inst, row_item in parsed.valid_rows:
@@ -358,6 +375,57 @@ class RosterImporter:
                 or current.status != inst.status.value
                 or current.successor_charter_number != inst.successor_charter_number
             )
+
+            # When a roster file reports an institution as merged, liquidated
+            # or converted, fail closed: clear publication eligibility and
+            # suppress existing offers immediately, regardless of whether the
+            # charter was previously verified.  The institution is routed to
+            # review for human reconciliation; nothing is auto-restored.
+            if (
+                current is not None
+                and inst.status in _INELIGIBLE_STATUSES
+                and current.status != inst.status.value
+            ):
+                was_verified = int(current.charter_verified) == 1
+                conn.execute(
+                    update(institutions)
+                    .where(institutions.c.charter_number == inst.charter_number)
+                    .values(
+                        legal_name=inst.legal_name,
+                        status=inst.status.value,
+                        successor_charter_number=inst.successor_charter_number,
+                        charter_verified=0,
+                    )
+                )
+                # Record an institution-scoped withdrawal to suppress any
+                # published offers at read time.  Lifting requires explicit
+                # human review — nothing is auto-restored.
+                if self._denylist is None:
+                    # Fail closed: never record a merger without the independent
+                    # suppression that the public reader actually enforces.
+                    raise ValueError("a denylist is required to import a merger or closure")
+                insert_withdrawal(
+                    conn,
+                    WithdrawalEntry(
+                        schema_version=CONTRACT_VERSION,
+                        withdrawal_id=f"{import_id}.suppress.{inst.charter_number}",
+                        scope=WithdrawalScope.INSTITUTION,
+                        target_id=str(inst.charter_number),
+                        actor="roster-importer",
+                        withdrawn_at=now,
+                        reason=(
+                            f"Institution {inst.charter_number} status changed to "
+                            f"{inst.status.value} in roster import {import_id}"
+                        ),
+                    ),
+                    denylist=self._denylist,
+                )
+                suppressed.append(inst.charter_number)
+                updated.append(inst.charter_number)
+                if was_verified:
+                    review.append(inst.charter_number)
+                continue
+
             if current is not None and int(current.charter_verified) == 1 and changed:
                 review.append(inst.charter_number)
                 continue
@@ -421,6 +489,7 @@ class RosterImporter:
             mergers=tuple(mergers),
             closures=tuple(closures),
             quarantined_charters=tuple(quarantined),
+            suppressed_charters=tuple(suppressed),
             review_charters=tuple(review),
             stale_charters=tuple(stale),
             errors=parsed.errors,
@@ -479,6 +548,7 @@ def import_roster(
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     mapping: RosterColumnMapping = DEFAULT_NCUA_MAPPING,
     source_url: str = "https://www.ncua.gov/data/credit-union-roster.csv",
+    denylist: Denylist | None = None,
 ) -> RosterImportReport:
     """Convenience helper to import a roster using RosterImporter."""
     importer = RosterImporter(
@@ -487,6 +557,7 @@ def import_roster(
         clock=clock,
         mapping=mapping,
         source_url=source_url,
+        denylist=denylist,
     )
     return importer.import_roster(
         csv_source,
