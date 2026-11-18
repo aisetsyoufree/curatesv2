@@ -5,13 +5,14 @@ Revises: t012_initial
 Create Date: 2026-11-15
 """
 
+# ruff: noqa: E501  (frozen guard SQL is stored verbatim)
+
 from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op
 
 import cu_rates.db.types
-from cu_rates.db.schema import schema_triggers
 
 revision: str = "t020_roster_import"
 down_revision: str | None = "t012_initial"
@@ -20,9 +21,37 @@ depends_on: str | Sequence[str] | None = None
 
 ROSTER_TABLES = ("roster_imports", "roster_import_entries")
 
+# Guard SQL frozen as it stood when AUD4b sealed roster history (AUD9 #102 h).
+_FROZEN_TRIGGERS: tuple[tuple[str, str], ...] = (
+    (
+        "roster_import_entries_no_delete",
+        "CREATE TRIGGER roster_import_entries_no_delete BEFORE DELETE ON roster_import_entries BEGIN SELECT RAISE(ABORT, 'roster_import_entries is append-only'); END",
+    ),
+    (
+        "roster_import_entries_no_replace",
+        "CREATE TRIGGER roster_import_entries_no_replace BEFORE INSERT ON roster_import_entries WHEN EXISTS (SELECT 1 FROM roster_import_entries WHERE import_id = NEW.import_id AND charter_number = NEW.charter_number) BEGIN SELECT RAISE(ABORT, 'roster_import_entries is append-only'); END",
+    ),
+    (
+        "roster_import_entries_no_update",
+        "CREATE TRIGGER roster_import_entries_no_update BEFORE UPDATE ON roster_import_entries BEGIN SELECT RAISE(ABORT, 'roster_import_entries is append-only'); END",
+    ),
+    (
+        "roster_imports_no_delete",
+        "CREATE TRIGGER roster_imports_no_delete BEFORE DELETE ON roster_imports BEGIN SELECT RAISE(ABORT, 'roster_imports is append-only'); END",
+    ),
+    (
+        "roster_imports_no_replace",
+        "CREATE TRIGGER roster_imports_no_replace BEFORE INSERT ON roster_imports WHEN EXISTS (SELECT 1 FROM roster_imports WHERE import_id = NEW.import_id) BEGIN SELECT RAISE(ABORT, 'roster_imports is append-only'); END",
+    ),
+    (
+        "roster_imports_no_update",
+        "CREATE TRIGGER roster_imports_no_update BEFORE UPDATE ON roster_imports BEGIN SELECT RAISE(ABORT, 'roster_imports is append-only'); END",
+    ),
+)
+
 
 def _append_only_triggers(present: bool) -> None:
-    for name, statement in schema_triggers(ROSTER_TABLES):
+    for name, statement in _FROZEN_TRIGGERS:
         if present:
             op.execute(statement)
         else:
@@ -65,7 +94,7 @@ def upgrade() -> None:
             name="ck_roster_import_entries_charter_number",
         ),
         sa.CheckConstraint(
-            "(status = 'merged' AND successor_charter_number IS NOT NULL AND successor_charter_number != charter_number AND successor_charter_number > 0 AND successor_charter_number < 100000000) OR (status != 'merged' AND successor_charter_number IS NULL)",  # noqa: E501
+            "(status = 'merged' AND successor_charter_number IS NOT NULL AND successor_charter_number != charter_number AND successor_charter_number > 0 AND successor_charter_number < 100000000) OR (status != 'merged' AND successor_charter_number IS NULL)",
             name="ck_roster_import_entries_successor",
         ),
         sa.CheckConstraint(
