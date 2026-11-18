@@ -1,0 +1,12 @@
+[Unit]
+Description=CU-Rates.org Database and Artifact Store Backup Timer
+Documentation=file:///var/lib/cu-rates/app/deploy/README.md https://github.com/aisetsyoufree/curatesv2
+
+[Timer]
+OnCalendar=*-*-* 03:17:00
+RandomizedDelaySec=1800
+Persistent=true
+Unit=cu-rates-backup.service
+
+[Install]
+WantedBy=timers.target

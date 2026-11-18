@@ -40,6 +40,10 @@ def test_systemd_units_exist() -> None:
     assert (SYSTEMD_DIR / "cu-rates-web.service").is_file()
     assert (SYSTEMD_DIR / "cu-rates-worker.service").is_file()
     assert (SYSTEMD_DIR / "cu-rates-worker.timer").is_file()
+    assert (SYSTEMD_DIR / "cu-rates-backup.service").is_file()
+    assert (SYSTEMD_DIR / "cu-rates-backup.timer").is_file()
+    assert (SYSTEMD_DIR / "cu-rates-health.service").is_file()
+    assert (SYSTEMD_DIR / "cu-rates-health.timer").is_file()
 
 
 def test_systemd_hardening_and_resource_limits() -> None:
@@ -256,16 +260,19 @@ def test_execstart_binary_paths_match_readme_venv() -> None:
     service_files = [
         SYSTEMD_DIR / "cu-rates-web.service",
         SYSTEMD_DIR / "cu-rates-worker.service",
+        SYSTEMD_DIR / "cu-rates-backup.service",
+        SYSTEMD_DIR / "cu-rates-health.service",
     ]
     for sf in service_files:
         unit = parse_systemd_unit(sf)
         exec_start_lines = unit.get("Service", {}).get("ExecStart", [])
         assert exec_start_lines, f"{sf.name} is missing ExecStart"
-        binary = exec_start_lines[0].split()[0]
-        expected_prefix = f"{documented_venv}/bin/"
-        assert binary.startswith(expected_prefix), (
-            f"{sf.name} binary '{binary}' is not under documented venv '{expected_prefix}'"
-        )
+        for line in exec_start_lines:
+            binary = line.split()[0]
+            expected_prefix = f"{documented_venv}/bin/"
+            assert binary.startswith(expected_prefix), (
+                f"{sf.name} binary '{binary}' is not under documented venv '{expected_prefix}'"
+            )
 
 
 def test_install_script_syntax() -> None:
@@ -1112,6 +1119,8 @@ def test_units_omit_tmp_from_readwritepaths_with_privatetmp() -> None:
     service_files = [
         SYSTEMD_DIR / "cu-rates-web.service",
         SYSTEMD_DIR / "cu-rates-worker.service",
+        SYSTEMD_DIR / "cu-rates-backup.service",
+        SYSTEMD_DIR / "cu-rates-health.service",
     ]
     for sf in service_files:
         parsed = parse_systemd_unit(sf)
@@ -1329,3 +1338,196 @@ def test_install_script_rejects_unsafe_roots_and_symlinks(tmp_path: Path) -> Non
     )
     assert res_trav.returncode != 0, "install.sh should reject path traversal"
     assert "path traversal" in res_trav.stderr.lower()
+
+
+def test_ops_systemd_units_exist_and_hardened() -> None:
+    """Verify backup and health service units exist and enforce strict hardening."""
+    ops_services = [
+        SYSTEMD_DIR / "cu-rates-backup.service",
+        SYSTEMD_DIR / "cu-rates-health.service",
+    ]
+
+    for service_file in ops_services:
+        assert service_file.is_file(), f"{service_file.name} must exist"
+        parsed = parse_systemd_unit(service_file)
+        service_sec = parsed.get("Service", {})
+
+        # User and unprivileged execution
+        assert service_sec["User"] == ["cu-rates"]
+        assert service_sec["Group"] == ["cu-rates"]
+        assert service_sec["Type"] == ["oneshot"]
+        assert service_sec["Restart"] == ["no"]
+        assert service_sec["UMask"] == ["0077"]
+
+        # Sandboxing and security hardening
+        assert service_sec["NoNewPrivileges"] == ["true"]
+        assert service_sec["PrivateTmp"] == ["true"]
+        assert service_sec["ProtectSystem"] == ["strict"]
+        assert service_sec["ProtectHome"] == ["true"]
+        assert service_sec["PrivateDevices"] == ["true"]
+        assert service_sec["ProtectClock"] == ["true"]
+        assert service_sec["ProtectHostname"] == ["true"]
+        assert service_sec["ProtectKernelTunables"] == ["true"]
+        assert service_sec["ProtectKernelModules"] == ["true"]
+        assert service_sec["ProtectControlGroups"] == ["true"]
+        assert service_sec["RestrictNamespaces"] == ["true"]
+        assert service_sec["RestrictRealtime"] == ["true"]
+        assert service_sec["RestrictSUIDSGID"] == ["true"]
+        assert service_sec["LockPersonality"] == ["true"]
+        assert service_sec["ProtectProc"] == ["invisible"]
+        assert service_sec["ProcSubset"] == ["pid"]
+        assert service_sec["CapabilityBoundingSet"] == [""]
+        assert service_sec["AmbientCapabilities"] == [""]
+        assert service_sec["SystemCallArchitectures"] == ["native"]
+        assert service_sec["SystemCallFilter"] == ["@system-service"]
+
+        # No network: PrivateNetwork=true and AF_UNIX only
+        assert service_sec["PrivateNetwork"] == ["true"]
+        assert service_sec["RestrictAddressFamilies"] == ["AF_UNIX"]
+
+        # StateDirectory must be absent (prevent broad write access)
+        assert "StateDirectory" not in service_sec
+
+        # Resource limits
+        assert any("M" in limit or "G" in limit for limit in service_sec.get("MemoryMax", []))
+        assert any(int(tasks) > 0 for tasks in service_sec.get("TasksMax", []))
+        assert any("%" in quota for quota in service_sec.get("CPUQuota", []))
+
+
+def test_ops_systemd_backup_and_health_filesystem_paths() -> None:
+    """Verify backup writes only backups dir; health has no ReadWritePaths."""
+    # Backup unit checks
+    backup_unit = parse_systemd_unit(SYSTEMD_DIR / "cu-rates-backup.service")
+    backup_sec = backup_unit.get("Service", {})
+    backup_rw = set(" ".join(backup_sec.get("ReadWritePaths", [])).split())
+    backup_ro = set(" ".join(backup_sec.get("ReadOnlyPaths", [])).split())
+
+    # The data directory is writable only so SQLite can create the -shm file for a WAL-mode
+    # read-only open (see tests/test_ops_wal_readonly.py); the artifact store stays read-only.
+    assert backup_rw == {"/var/lib/cu-rates/backups", "/var/lib/cu-rates/data"}, (
+        f"backup service may write only backups and the WAL side files, got {backup_rw}"
+    )
+    assert "/var/lib/cu-rates/artifacts" in backup_ro
+    assert "/var/lib/cu-rates/app" in backup_ro
+    assert "/var/lib/cu-rates/artifacts" not in backup_rw
+    assert "/var/lib/cu-rates/app" not in backup_rw
+
+    # Verify backup ExecStart commands
+    backup_exec = backup_sec.get("ExecStart", [])
+    assert len(backup_exec) == 2, (
+        f"backup service must have exactly 2 ExecStart commands, got {len(backup_exec)}"
+    )
+    assert "cu_rates.ops.backup create" in backup_exec[0]
+    assert "/var/lib/cu-rates/data/operational.sqlite" in backup_exec[0]
+    assert "/var/lib/cu-rates/artifacts" in backup_exec[0]
+    assert "/var/lib/cu-rates/backups" in backup_exec[0]
+    assert "cu_rates.ops.backup prune" in backup_exec[1]
+    assert "--keep 14" in backup_exec[1]
+    assert "/var/lib/cu-rates/backups" in backup_exec[1]
+
+    # Health unit checks
+    health_unit = parse_systemd_unit(SYSTEMD_DIR / "cu-rates-health.service")
+    health_sec = health_unit.get("Service", {})
+    health_rw = set(" ".join(health_sec.get("ReadWritePaths", [])).split())
+    assert health_rw == {"/var/lib/cu-rates/data"}, (
+        f"health service may write only the WAL side files in the data directory, got {health_rw}"
+    )
+
+    health_ro = set(" ".join(health_sec.get("ReadOnlyPaths", [])).split())
+    required_health_ro = {
+        "/var/lib/cu-rates/app",
+        "/var/lib/cu-rates/snapshots",
+        "/var/lib/cu-rates/independent",
+        "/var/lib/cu-rates/backups",
+    }
+    for path in required_health_ro:
+        assert path in health_ro, f"health service missing {path} in ReadOnlyPaths"
+    assert "/var/lib/cu-rates/data" not in health_ro  # it is the one writable path
+
+    # Verify health ExecStart command
+    health_exec = health_sec.get("ExecStart", [])
+    assert len(health_exec) == 1
+    assert "cu_rates.ops.health" in health_exec[0]
+    assert "--snapshot-root /var/lib/cu-rates/snapshots" in health_exec[0]
+    assert "--denylist /var/lib/cu-rates/independent/denylist.json" in health_exec[0]
+    assert "--backup-dir /var/lib/cu-rates/backups" in health_exec[0]
+    assert "--database /var/lib/cu-rates/data/operational.sqlite" in health_exec[0]
+
+
+def test_ops_systemd_timers_calendar_and_persistence() -> None:
+    """Verify backup and health timer units define OnCalendar and Persistent=true."""
+    # Backup timer
+    backup_timer = parse_systemd_unit(SYSTEMD_DIR / "cu-rates-backup.timer")
+    b_timer_sec = backup_timer.get("Timer", {})
+    assert b_timer_sec.get("OnCalendar") == ["*-*-* 03:17:00"]
+    assert b_timer_sec.get("Persistent") == ["true"]
+    assert b_timer_sec.get("Unit") == ["cu-rates-backup.service"]
+    assert "RandomizedDelaySec" in b_timer_sec
+    assert backup_timer.get("Install", {}).get("WantedBy") == ["timers.target"]
+
+    # Health timer
+    health_timer = parse_systemd_unit(SYSTEMD_DIR / "cu-rates-health.timer")
+    h_timer_sec = health_timer.get("Timer", {})
+    assert h_timer_sec.get("OnCalendar") == ["*:00/15:00"]
+    assert h_timer_sec.get("Persistent") == ["true"]
+    assert h_timer_sec.get("Unit") == ["cu-rates-health.service"]
+    assert health_timer.get("Install", {}).get("WantedBy") == ["timers.target"]
+
+
+def test_ops_systemd_install_script_wiring_and_masking() -> None:
+    """Verify install.sh installs the four units, does not enable them, and masks worker units."""
+    install_sh = (DEPLOY_DIR / "install.sh").read_text(encoding="utf-8")
+
+    # install.sh references all four units in UNITS array
+    for unit in [
+        "cu-rates-backup.service",
+        "cu-rates-backup.timer",
+        "cu-rates-health.service",
+        "cu-rates-health.timer",
+    ]:
+        assert f'"{unit}"' in install_sh, f"install.sh must list {unit} in UNITS array"
+
+    # install.sh must NOT enable the backup or health units
+    assert "systemctl enable cu-rates-backup" not in install_sh
+    assert "systemctl enable cu-rates-health" not in install_sh
+
+    # Worker units MUST still be masked
+    assert 'ln -sf /dev/null "${SYSTEMD_DIR}/cu-rates-worker.service"' in install_sh
+    assert 'ln -sf /dev/null "${SYSTEMD_DIR}/cu-rates-worker.timer"' in install_sh
+    assert "systemctl disable cu-rates-worker.service" in install_sh
+    assert "systemctl disable cu-rates-worker.timer" in install_sh
+    assert "systemctl stop cu-rates-worker.service" in install_sh
+    assert "systemctl stop cu-rates-worker.timer" in install_sh
+
+
+def test_ops_readme_scheduled_operations_section() -> None:
+    """Verify README documents scheduled operations, enable commands, and required notices."""
+    readme = (DEPLOY_DIR / "README.md").read_text(encoding="utf-8")
+
+    assert "Scheduled Operations" in readme
+    assert "cu-rates-backup.timer" in readme
+    assert "cu-rates-health.timer" in readme
+    assert "systemctl enable --now cu-rates-backup.timer cu-rates-health.timer" in readme
+    assert "systemctl list-timers" in readme
+    assert "journalctl -u cu-rates-health" in readme
+    assert "journalctl -u cu-rates-backup" in readme
+    notice = "off-device encrypted copies and alert delivery are not implemented yet"
+    assert notice in readme.lower()
+
+
+def test_ops_negative_control_health_readwritepaths_rejected() -> None:
+    """Negative control: the health unit may write ONLY the data directory (WAL side files)."""
+    parsed = parse_systemd_unit(SYSTEMD_DIR / "cu-rates-health.service")
+    rw = set(" ".join(parsed.get("Service", {}).get("ReadWritePaths", [])).split())
+    assert rw == {"/var/lib/cu-rates/data"}
+    assert rw != rw | {"/var/lib/cu-rates/snapshots"}  # anything more is a regression
+
+
+def test_ops_negative_control_backup_timer_persistence_required() -> None:
+    """Negative control: backup timer fails if Persistent=true is missing."""
+    timer_text = (SYSTEMD_DIR / "cu-rates-backup.timer").read_text(encoding="utf-8")
+    assert "Persistent=true" in timer_text
+
+    corrupted = timer_text.replace("Persistent=true", "")
+    with pytest.raises(AssertionError):
+        assert "Persistent=true" in corrupted
