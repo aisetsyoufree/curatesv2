@@ -52,6 +52,7 @@ DEFAULTS: dict[str, Any] = {
     "CANONICAL_ORIGIN": "https://cu-rates.org",
     "SNAPSHOT_ROOT": None,
     "DENYLIST_PATH": None,
+    "AUTOMATIC_DENYLIST_PATH": None,
     "INTAKE_DB": None,
     "SNAPSHOT_CLOCK": None,
 }
@@ -73,7 +74,7 @@ def validated_config(values: Mapping[str, Any]) -> dict[str, Any]:
     ):
         raise ValueError("GA_MEASUREMENT_ID must match G-XXXXXXXXXX (uppercase letters/digits)")
     config["GA_MEASUREMENT_ID"] = measurement_id
-    for key in ("SNAPSHOT_ROOT", "DENYLIST_PATH", "INTAKE_DB"):
+    for key in ("SNAPSHOT_ROOT", "DENYLIST_PATH", "AUTOMATIC_DENYLIST_PATH", "INTAKE_DB"):
         value = config[key]
         if value is not None and (
             not isinstance(value, str)
@@ -101,4 +102,9 @@ def config_from_environment(environ: Mapping[str, str] | None = None) -> dict[st
             values[key] = value == "1"
         else:
             values[key] = value
+    if values.get("DENYLIST_PATH") is not None and values.get("AUTOMATIC_DENYLIST_PATH") is None:
+        # The worker's own blocks live in the automatic ledger. A deployment (such as one that
+        # predates it, whose env file the installer never overwrites) that sets only the
+        # operator ledger would silently show offers the worker was told to suppress.
+        raise ValueError("AUTOMATIC_DENYLIST_PATH must be set whenever DENYLIST_PATH is set")
     return validated_config(values)

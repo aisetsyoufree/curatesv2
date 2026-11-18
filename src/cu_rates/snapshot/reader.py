@@ -21,9 +21,15 @@ class SnapshotReader:
     unavailable: callers must not serve previously cached/unfiltered rates instead.
     """
 
-    def __init__(self, root: Path, denylist_path: Path) -> None:
+    def __init__(
+        self, root: Path, denylist_path: Path, *, automatic_path: Path | None = None
+    ) -> None:
         self.root = root.absolute()
         self._denylist = Denylist(denylist_path)
+        # A second, WORKER-owned ledger of automatic suppressions (blocks, challenges). The
+        # operator ledger stays operator-only; the reader simply enforces both. Once
+        # configured, a missing or invalid automatic ledger blocks public reads (fail closed).
+        self._automatic = None if automatic_path is None else Denylist(automatic_path)
 
     def read(self, *, at: datetime | None = None) -> SnapshotView:
         """Use the server clock by default; `at` is a trusted clock override for tests."""
@@ -38,6 +44,8 @@ class SnapshotReader:
         if info.published_at > now:
             raise SnapshotError("public snapshot is dated in the future")
         active = self._denylist.active_targets(now)
+        if self._automatic is not None:
+            active = active | self._automatic.active_targets(now)
         if ("snapshot", info.snapshot_id) in active:
             return SnapshotView(info=info, offers=())
         visible = []

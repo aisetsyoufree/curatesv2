@@ -123,7 +123,9 @@ class Pilot:
         self.denylist.initialize()
         self.terms_ledger = TermsLedger(root / "private" / "terms.json")
         self.terms_ledger.initialize()
-        self.registry = FetchRegistry(self.database, self.terms_ledger, self.denylist)
+        self.registry = FetchRegistry(
+            self.database, self.terms_ledger, self.denylist, automatic=None
+        )
         self.persist_policy()
 
     def persist_policy(self) -> None:
@@ -1297,6 +1299,67 @@ def test_terms_prohibition_suppresses_before_record_and_retries_idempotently(
     pilot.terms_ledger.record(review, denylist=pilot.denylist)
     assert (pilot.denylist.path.read_bytes(), pilot.terms_ledger.path.read_bytes()) == before
     assert pilot.fetch(ok).reason == "source-withdrawn"
+
+
+def _with_automatic_ledger(pilot: Pilot, root: Path) -> Denylist:
+    automatic = Denylist(root / "automatic" / "denylist.json")
+    automatic.initialize()
+    pilot.registry = FetchRegistry(
+        pilot.database, pilot.terms_ledger, pilot.denylist, automatic=automatic
+    )
+    return automatic
+
+
+def test_a_block_is_recorded_in_the_workers_own_ledger_not_the_operators(
+    pilot: Pilot, tmp_path: Path
+) -> None:
+    """#118: the worker never writes the operator ledger; its blocks go to the automatic one."""
+    automatic = _with_automatic_ledger(pilot, tmp_path)
+    operator_before = pilot.denylist.path.read_bytes()
+    result = pilot.fetch(lambda _: httpx.Response(403, headers={"CF-Mitigated": "challenge"}))
+    assert result.run is not None
+    now = datetime.fromtimestamp(pilot.clock.now(), UTC)
+    assert ("source", pilot.source.source_id) in automatic.active_targets(now)
+    assert pilot.denylist.path.read_bytes() == operator_before  # the operator ledger is untouched
+
+
+def test_an_automatic_block_stops_the_next_fetch_for_every_worker(
+    pilot: Pilot, tmp_path: Path
+) -> None:
+    _with_automatic_ledger(pilot, tmp_path)
+    pilot.fetch(lambda _: httpx.Response(403, headers={"CF-Mitigated": "challenge"}))
+    calls = len(pilot.calls)
+    assert pilot.fetch(ok).reason == "source-withdrawn"
+    assert len(pilot.calls) == calls  # no request was made
+
+
+def test_an_automatic_entry_alone_withdraws_the_source_at_authorization(
+    pilot: Pilot, tmp_path: Path
+) -> None:
+    automatic = _with_automatic_ledger(pilot, tmp_path)
+    now = datetime.fromtimestamp(pilot.clock.now(), UTC)
+    automatic.withdraw(
+        WithdrawalEntry(
+            schema_version=CONTRACT_VERSION,
+            withdrawal_id="auto-manual",
+            scope=WithdrawalScope.SOURCE,
+            target_id=pilot.source.source_id,
+            actor="fetch-worker",
+            withdrawn_at=now - timedelta(seconds=1),
+            reason="test",
+        )
+    )
+    assert pilot.fetch(ok).reason == "source-withdrawn"
+    assert not pilot.calls
+
+
+def test_an_unreadable_automatic_ledger_stops_collection_fail_closed(
+    pilot: Pilot, tmp_path: Path
+) -> None:
+    automatic = _with_automatic_ledger(pilot, tmp_path)
+    automatic.path.write_text("{not json")
+    assert pilot.fetch(ok).reason == "policy-state-unavailable"
+    assert not pilot.calls
 
 
 def _uptime(pilot: Pilot, start: float) -> Callable[[], float]:

@@ -168,6 +168,7 @@ DIRS=(
     "${NVME_ROOT}/snapshots/versions"
     "${NVME_ROOT}/backups"
     "${NVME_ROOT}/intake"
+    "${NVME_ROOT}/automatic"
     "${CONFIG_DIR}"
     "/run/cu-rates-web"
     "/run/cu-rates-worker"
