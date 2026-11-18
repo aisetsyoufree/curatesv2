@@ -337,6 +337,7 @@ def comparison_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[s
         "TESTING": True,
         "SNAPSHOT_ROOT": str(publisher.root),
         "DENYLIST_PATH": str(denylist.path),
+        "AUTOMATIC_DENYLIST_PATH": str(denylist.path),  # the trio is required
         "SNAPSHOT_CLOCK": make.EVALUATED_AT,
     }
 
