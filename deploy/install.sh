@@ -13,7 +13,7 @@ NVME_ROOT="${CU_RATES_ROOT:-$DEFAULT_NVME_ROOT}"
 APP_USER="cu-rates"
 APP_GROUP="cu-rates"
 CONFIG_DIR="/etc/cu-rates"
-SYSTEMD_DIR="/etc/systemd/system"
+SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
@@ -88,10 +88,18 @@ echo "Target root: ${NVME_ROOT}"
 echo "Dedicated user: ${APP_USER}:${APP_GROUP}"
 echo "================================================"
 
-# 1. Guard against invalid, SD-card, or cloud-synchronized paths (MASTER.md §7, D-07, D-10)
+# 1. Guard against invalid, SD-card, cloud-synchronized, or unsafe paths (MASTER.md §7, D-07, D-10)
 validate_path() {
     local target="$1"
+    if [[ -z "${target}" || "${target}" != /* ]]; then
+        echo "Error: Path '${target}' must be a non-empty absolute path." >&2
+        exit 1
+    fi
     case "${target}" in
+        *"/.."*|*"../"*)
+            echo "Error: Path '${target}' contains path traversal ('..'). Exiting." >&2
+            exit 1
+            ;;
         *"Mobile Documents"*|*"iCloud"*|*"Dropbox"*|*"OneDrive"*)
             echo "Error: Path '${target}' appears to be a cloud-synchronized folder. Exiting per MASTER.md §7." >&2
             exit 1
@@ -100,9 +108,33 @@ validate_path() {
             echo "Error: Path '${target}' appears to be on removable/SD media. NVMe SSD required per MASTER.md D-07." >&2
             exit 1
             ;;
+        "/"|"/etc"|"/etc/"*|"/usr"|"/usr/"*|"/bin"|"/bin/"*|"/sbin"|"/sbin/"*|"/boot"|"/boot/"*|"/dev"|"/dev/"*|"/proc"|"/proc/"*|"/sys"|"/sys/"*|"/root"|"/root/"*|"/var"|"/run"|"/home"|"/tmp"|"/private/etc"|"/private/etc/"*|"/private/var")
+            echo "Error: Path '${target}' is an unsafe root directory. Exiting." >&2
+            exit 1
+            ;;
     esac
+    if [[ -L "${target}" || -h "${target}" ]]; then
+        echo "Error: Path '${target}' is a symlink. Symlinks are forbidden." >&2
+        exit 1
+    fi
+    if [[ -e "${target}" && ! -d "${target}" ]]; then
+        echo "Error: Path '${target}' exists but is not a real directory." >&2
+        exit 1
+    fi
 }
 validate_path "${NVME_ROOT}"
+
+confirm_real_directory() {
+    local target="$1"
+    if [[ -L "${target}" || -h "${target}" ]]; then
+        echo "Error: Backing path '${target}' is a symlink. Real directory required." >&2
+        exit 1
+    fi
+    if [[ ! -d "${target}" ]]; then
+        echo "Error: Backing path '${target}' is not a real directory." >&2
+        exit 1
+    fi
+}
 
 # Guard against existing non-empty root directory unless --adopt is given
 if [[ -d "${NVME_ROOT}" ]] && [[ "${ADOPT}" -ne 1 ]]; then
@@ -150,9 +182,58 @@ for dir in "${DIRS[@]}"; do
     fi
 done
 
-# Restrictive permissions on data directories (fail loudly in apply mode)
-run_action "set 0750 permissions on data directories" \
-    chmod 0750 "${NVME_ROOT}/data" "${NVME_ROOT}/artifacts" "${NVME_ROOT}/backups"
+run_action "confirm backing path '${NVME_ROOT}' is a real directory" \
+    confirm_real_directory "${NVME_ROOT}"
+
+# Operator-owned directory for independent withdrawal/denylist ledger (mode 0755, root/operator owned)
+INDEPENDENT_DIR="${NVME_ROOT}/independent"
+if [[ -d "${INDEPENDENT_DIR}" ]]; then
+    echo "Directory '${INDEPENDENT_DIR}' already exists."
+else
+    run_action "create operator-owned independent directory '${INDEPENDENT_DIR}'" \
+        mkdir -p "${INDEPENDENT_DIR}"
+    run_action "set ownership of independent directory '${INDEPENDENT_DIR}' to root" \
+        chown root "${INDEPENDENT_DIR}"
+fi
+run_action "set 0755 permissions on independent directory '${INDEPENDENT_DIR}'" \
+    chmod 0755 "${INDEPENDENT_DIR}"
+
+verify_operator_directory() {
+    local target="$1"
+    if id -u >/dev/null 2>&1 && [[ "$(id -u)" == "0" ]]; then
+        local actual_owner
+        actual_owner="$(stat -c '%U' "${target}" 2>/dev/null || stat -f '%Su' "${target}" 2>/dev/null)"
+        if [[ "${actual_owner}" == "${APP_USER}" ]]; then
+            echo "Error: Independent directory '${target}' must not be owned by service user '${APP_USER}'." >&2
+            exit 1
+        fi
+    fi
+}
+run_action "verify independent directory '${INDEPENDENT_DIR}' is not owned by service user" \
+    verify_operator_directory "${INDEPENDENT_DIR}"
+
+# Restrictive permissions on data and backup directories (fail loudly in apply mode)
+run_action "set 0750 permissions on data and backup directories" \
+    chmod 0750 "${NVME_ROOT}/data" "${NVME_ROOT}/backups"
+
+# Artifact storage must be mode 0700 (ArtifactStore strictly rejects group/other access)
+run_action "set 0700 permissions on artifact storage directory" \
+    chmod 0700 "${NVME_ROOT}/artifacts"
+
+verify_artifact_ownership() {
+    local target="$1"
+    local expected_user="$2"
+    if id -u >/dev/null 2>&1 && [[ "$(id -u)" == "0" ]]; then
+        local actual_user
+        actual_user="$(stat -c '%U' "${target}" 2>/dev/null || stat -f '%Su' "${target}" 2>/dev/null)"
+        if [[ -n "${actual_user}" && "${actual_user}" != "${expected_user}" ]]; then
+            echo "Error: Artifact store '${target}' is owned by '${actual_user}', must be owned by '${expected_user}'." >&2
+            exit 1
+        fi
+    fi
+}
+run_action "verify ownership of '${NVME_ROOT}/artifacts' by ${APP_USER}" \
+    verify_artifact_ownership "${NVME_ROOT}/artifacts" "${APP_USER}"
 
 # 4. Install environment template if /etc/cu-rates/cu-rates.env does not exist
 ENV_FILE="${CONFIG_DIR}/cu-rates.env"
@@ -179,7 +260,7 @@ for unit in "${UNITS[@]}"; do
     fi
 done
 
-# 6. Service activation policy (D-15)
+# 6. Service activation policy (D-15, D-17)
 # Web service: enabled to start on boot
 run_action "reload systemd daemon" \
     systemctl daemon-reload
@@ -187,14 +268,45 @@ run_action "reload systemd daemon" \
 run_action "enable cu-rates-web.service (starts on boot)" \
     systemctl enable cu-rates-web.service
 
-# Worker service and timer: INSTALLED DISABLED per MASTER.md decision D-15
+# Worker service and timer: STOPPED, DISABLED, and MASKED per MASTER.md D-15 and D-17
+run_action "stop cu-rates-worker.service (D-15, D-17)" \
+    systemctl stop cu-rates-worker.service
+
+run_action "stop cu-rates-worker.timer (D-15, D-17)" \
+    systemctl stop cu-rates-worker.timer
+
 run_action "ensure cu-rates-worker.service is disabled (D-15)" \
     systemctl disable cu-rates-worker.service
 
 run_action "ensure cu-rates-worker.timer is disabled (D-15)" \
     systemctl disable cu-rates-worker.timer
 
-# 7. Safety check: never touch existing host services
+run_action "mask cu-rates-worker.service (D-15, D-17)" \
+    ln -sf /dev/null "${SYSTEMD_DIR}/cu-rates-worker.service"
+
+run_action "mask cu-rates-worker.timer (D-15, D-17)" \
+    ln -sf /dev/null "${SYSTEMD_DIR}/cu-rates-worker.timer"
+
+run_action "reload systemd daemon after masking" \
+    systemctl daemon-reload
+
+# 7. Record installed git commit in root-owned state file (D-17)
+COMMIT_FILE="${NVME_ROOT}/installed-commit"
+GIT_COMMIT="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || echo "unknown")"
+
+record_installed_commit() {
+    local target="$1"
+    local commit="$2"
+    printf "%s\n" "${commit}" > "${target}"
+    chmod 0644 "${target}"
+    if id -u >/dev/null 2>&1 && [[ "$(id -u)" == "0" ]]; then
+        chown root "${target}"
+    fi
+}
+run_action "record installed git commit '${GIT_COMMIT}' to '${COMMIT_FILE}' (mode 0644, D-17)" \
+    record_installed_commit "${COMMIT_FILE}" "${GIT_COMMIT}"
+
+# 8. Safety check: never touch existing host services
 echo "Notice: Existing host services, Caddy sites, and other system units were NOT modified."
 
 if [[ "${APPLY}" -eq 1 ]]; then
@@ -205,7 +317,7 @@ if [[ "${APPLY}" -eq 1 ]]; then
     echo "3. Build venv using: sudo -u cu-rates UV_PROJECT_ENVIRONMENT=${NVME_ROOT}/venv UV_CACHE_DIR=${NVME_ROOT}/.cache/uv uv sync --locked --no-dev --group deploy"
     echo "4. Configure Caddy: copy deploy/caddy/Caddyfile to /etc/caddy/conf.d/cu-rates.caddyfile"
     echo "5. Start web service: sudo systemctl start cu-rates-web.service"
-    echo "6. Note: Worker timer remains DISABLED per MASTER.md D-15."
+    echo "6. Note: Worker service and timer remain STOPPED, DISABLED, and MASKED per MASTER.md D-15 and D-17."
 else
     echo "=== Dry-Run Complete ==="
     echo "No filesystem, user, or service changes were made."
