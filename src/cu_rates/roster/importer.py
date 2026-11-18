@@ -15,7 +15,7 @@ import io
 import re
 from collections import defaultdict
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -27,15 +27,23 @@ from cu_rates.artifact_store import (
     ArtifactNotFoundError,
     ArtifactStore,
 )
+from cu_rates.contracts.audit import WithdrawalEntry
 from cu_rates.contracts.base import CONTRACT_VERSION
-from cu_rates.contracts.enums import InstitutionStatus
+from cu_rates.contracts.enums import InstitutionStatus, WithdrawalScope
 from cu_rates.contracts.registry import Institution
-from cu_rates.db.schema import institutions, roster_import_entries, roster_imports
+from cu_rates.db.schema import (
+    institutions,
+    roster_import_entries,
+    roster_imports,
+    withdrawal_lifts,
+)
+from cu_rates.pipeline.trusted import insert_withdrawal
 from cu_rates.roster.mapping import (
     DEFAULT_NCUA_MAPPING,
     RosterColumnMapping,
     map_institution_status,
 )
+from cu_rates.snapshot import Denylist
 
 # Budgets keep one roster file from exhausting memory. They are far above the
 # committed fixtures and are reported instead of raising.
@@ -53,6 +61,18 @@ _UNDATED_STATUSES = frozenset(
         InstitutionStatus.CONVERTED,
     }
 )
+# Statuses that make an institution ineligible for publication.  A roster
+# import reporting an institution in one of these clears eligibility
+# and suppresses existing offers pending human reconciliation.
+_INELIGIBLE_STATUSES = frozenset(
+    {
+        InstitutionStatus.MERGED,
+        InstitutionStatus.LIQUIDATED,
+        InstitutionStatus.CONVERTED,
+    }
+)
+
+_ROSTER_PREFIX = "roster-"
 
 
 @dataclass(frozen=True)
@@ -97,6 +117,7 @@ class RosterImportReport:
     mergers: tuple[int, ...] = field(default_factory=tuple)
     closures: tuple[int, ...] = field(default_factory=tuple)
     quarantined_charters: tuple[int, ...] = field(default_factory=tuple)
+    suppressed_charters: tuple[int, ...] = field(default_factory=tuple)
     review_charters: tuple[int, ...] = field(default_factory=tuple)
     stale_charters: tuple[int, ...] = field(default_factory=tuple)
     errors: tuple[str, ...] = field(default_factory=tuple)
@@ -133,6 +154,7 @@ class _Classified:
     rejected: list[DuplicateConflict] = field(default_factory=list)
     valid_rows: list[tuple[Institution, _ParsedRow]] = field(default_factory=list)
     unresolved_charters: set[int] = field(default_factory=set)
+    inactive_rows: dict[int, _ParsedRow] = field(default_factory=dict)
     file_as_of: str | None = None
     errors: tuple[str, ...] = ()
 
@@ -148,7 +170,9 @@ class RosterImporter:
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         mapping: RosterColumnMapping = DEFAULT_NCUA_MAPPING,
         source_url: str = "https://www.ncua.gov/data/credit-union-roster.csv",
+        denylist: Denylist | None = None,
     ) -> None:
+        self._denylist = denylist
         self._target = engine_or_connection
         self._store = artifact_store
         self._clock = clock
@@ -203,9 +227,6 @@ class RosterImporter:
         existing = self._existing_import(
             conn, artifact_id, raw_bytes, source_version, source_as_of_date
         )
-        if existing is not None:
-            return existing
-
         now = self._clock()
         if len(raw_bytes) > MAX_ROSTER_BYTES:
             return _rejected(
@@ -266,15 +287,16 @@ class RosterImporter:
         if file_as_of is None:
             raise ValueError("source_as_of_date is required when the file states no as-of date")
 
-        import_id = f"roster-import-{uuid4().hex}"
-        self._store.put(
-            raw_bytes,
-            media_type="text/csv; charset=utf-8",
-            source_url=self._source_url,
-            fetched_at=now,
-            http_status=200,
-            fetch_run_id=import_id,
-        )
+        import_id = existing.import_id if existing else f"roster-import-{uuid4().hex}"
+        if existing is None:
+            self._store.put(
+                raw_bytes,
+                media_type="text/csv; charset=utf-8",
+                source_url=self._source_url,
+                fetched_at=now,
+                http_status=200,
+                fetch_run_id=import_id,
+            )
 
         latest_dates = conn.execute(select(roster_imports.c.source_as_of_date)).scalars().all()
         latest_as_of = max(latest_dates) if latest_dates else None
@@ -296,18 +318,19 @@ class RosterImporter:
                 select(institutions.c.charter_number).where(institutions.c.charter_verified == 1)
             ).all()
         }
-
-        conn.execute(
-            insert(roster_imports).values(
-                import_id=import_id,
-                schema_version=CONTRACT_VERSION,
-                source_version=source_version,
-                source_as_of_date=file_as_of,
-                retrieved_at=now,
-                artifact_id=artifact_id,
-                row_count=parsed.total_rows,
-                imported_count=len(parsed.valid_rows),
-            )
+        # A charter whose roster suppression a human has not lifted is still awaiting
+        # reconciliation: a LATER import must not apply an unreviewed identity either.
+        awaiting_reconciliation = (
+            set()
+            if self._denylist is None
+            else {
+                int(e.target_id)
+                for e in self._denylist.entries()
+                if e.scope is WithdrawalScope.INSTITUTION
+                and e.withdrawal_id.startswith(_ROSTER_PREFIX)
+                and e.lifted_at is None
+                and e.target_id.isdigit()
+            }
         )
 
         inserted: list[int] = []
@@ -317,7 +340,63 @@ class RosterImporter:
         closures: list[int] = []
         review: list[int] = []
         stale: list[int] = []
+        suppressed: list[int] = []
         clean: set[int] = set()
+
+        # Inactivity is credible independently of successor identity. Persist the
+        # entire batch's independent protection before ANY operational DB mutation:
+        # even the first roster/withdrawal insert may fail. Stale reports retain
+        # their existing no-change guard.
+        suppressions: dict[int, WithdrawalEntry] = {}
+        valid_charters = {inst.charter_number for inst, _ in parsed.valid_rows}
+        if not stale_file:
+            for charter, row in parsed.inactive_rows.items():
+                if row.source_as_of_date < stored_dates.get(charter, row.source_as_of_date):
+                    continue
+                known = conn.execute(
+                    select(institutions.c.charter_number).where(
+                        institutions.c.charter_number == charter
+                    )
+                ).first()
+                if known is None and charter not in valid_charters:
+                    continue
+                entry = self._prepare_suppression(charter, row.status, artifact_id, now)
+                if entry is not None:
+                    suppressions[charter] = entry
+
+        # All DB changes share the import's transaction/savepoint. Independent
+        # suppression deliberately survives rollback so existing snapshots stay safe.
+        if existing is None:
+            conn.execute(
+                insert(roster_imports).values(
+                    import_id=import_id,
+                    schema_version=CONTRACT_VERSION,
+                    source_version=source_version,
+                    source_as_of_date=file_as_of,
+                    retrieved_at=now,
+                    artifact_id=artifact_id,
+                    row_count=parsed.total_rows,
+                    imported_count=len(parsed.valid_rows),
+                )
+            )
+
+        for charter, entry in suppressions.items():
+            assert self._denylist is not None  # Required by _prepare_suppression.
+            insert_withdrawal(conn, entry, denylist=self._denylist)
+            conn.execute(
+                update(institutions)
+                .where(institutions.c.charter_number == charter)
+                .values(charter_verified=0)
+            )
+            suppressed.append(charter)
+            review.append(charter)
+
+        if existing is not None:
+            return replace(
+                existing,
+                suppressed_charters=tuple(suppressed),
+                review_charters=tuple(dict.fromkeys(review)),
+            )
 
         for inst, row_item in parsed.valid_rows:
             conn.execute(
@@ -358,7 +437,17 @@ class RosterImporter:
                 or current.status != inst.status.value
                 or current.successor_charter_number != inst.successor_charter_number
             )
-            if current is not None and int(current.charter_verified) == 1 and changed:
+
+            # Use the verification state from BEFORE this import's suppression cleared it:
+            # a verified record's changed identity is queued for review, never applied.
+            if (
+                current is not None
+                and (
+                    inst.charter_number in verified
+                    or inst.charter_number in awaiting_reconciliation
+                )
+                and changed
+            ):
                 review.append(inst.charter_number)
                 continue
             if current is None:
@@ -421,10 +510,46 @@ class RosterImporter:
             mergers=tuple(mergers),
             closures=tuple(closures),
             quarantined_charters=tuple(quarantined),
-            review_charters=tuple(review),
+            suppressed_charters=tuple(suppressed),
+            review_charters=tuple(dict.fromkeys(review)),
             stale_charters=tuple(stale),
             errors=parsed.errors,
         )
+
+    def _prepare_suppression(
+        self,
+        charter: int,
+        status: InstitutionStatus,
+        artifact_id: str,
+        now: datetime,
+    ) -> WithdrawalEntry | None:
+        if self._denylist is None:
+            raise ValueError("a denylist is required to import a merger or closure")
+        withdrawal_id = f"{_ROSTER_PREFIX}{artifact_id}.suppress.{charter}"
+        entries = self._denylist.entries()
+        # A retry must reuse every immutable field, especially the original time.
+        # Every roster artifact owns its own deterministic entry: a human lift of one
+        # artifact's evidence must never be undone by replaying another artifact.
+        entry = next((e for e in entries if e.withdrawal_id == withdrawal_id), None)
+        if entry is not None and entry.lifted_at is not None:
+            # A human already reconciled this exact evidence. Replaying it must
+            # neither re-suppress the institution nor clear its verification.
+            return None
+        if entry is None:
+            entry = WithdrawalEntry(
+                schema_version=CONTRACT_VERSION,
+                withdrawal_id=withdrawal_id,
+                scope=WithdrawalScope.INSTITUTION,
+                target_id=str(charter),
+                actor="roster-importer",
+                withdrawn_at=now,
+                reason=(
+                    f"Institution {charter} reported {status.value} "
+                    f"in roster artifact {artifact_id}"
+                ),
+            )
+        self._denylist.withdraw(entry)
+        return entry
 
     def _existing_import(
         self,
@@ -479,6 +604,7 @@ def import_roster(
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     mapping: RosterColumnMapping = DEFAULT_NCUA_MAPPING,
     source_url: str = "https://www.ncua.gov/data/credit-union-roster.csv",
+    denylist: Denylist | None = None,
 ) -> RosterImportReport:
     """Convenience helper to import a roster using RosterImporter."""
     importer = RosterImporter(
@@ -487,6 +613,7 @@ def import_roster(
         clock=clock,
         mapping=mapping,
         source_url=source_url,
+        denylist=denylist,
     )
     return importer.import_roster(
         csv_source,
@@ -600,6 +727,10 @@ def _classify_rows(
                 non_ma.add(charter)
             continue
         result.ma_rows += 1
+        # Successor errors cannot invalidate a credible inactivity report.
+        inactive, _ = _parse_ma_row(row, mapping, line_number, validate_successor=False)
+        if inactive is not None and inactive.status in _INELIGIBLE_STATUSES:
+            result.inactive_rows.setdefault(inactive.charter_number, inactive)
         parsed, reason = _parse_ma_row(row, mapping, line_number)
         if parsed is None:
             result.malformed_rows.append(MalformedRow(line_number, row, reason or "invalid row"))
@@ -648,7 +779,9 @@ def _classify_rows(
             chosen.append(parsed_rows[0])
 
     chosen = _without_bad_successors(chosen, result)
-    dates = {row.source_as_of_date for row in chosen}
+    dates = {row.source_as_of_date for row in chosen} | {
+        row.source_as_of_date for row in result.inactive_rows.values()
+    }
     if declared_as_of is not None and dates and dates != {declared_as_of}:
         result.errors = ("row as-of dates do not match the declared source_as_of_date",)
     elif len(dates) > 1:
@@ -669,7 +802,11 @@ def _classify_rows(
 
 
 def _parse_ma_row(
-    row: dict[str, str], mapping: RosterColumnMapping, line_number: int
+    row: dict[str, str],
+    mapping: RosterColumnMapping,
+    line_number: int,
+    *,
+    validate_successor: bool = True,
 ) -> tuple[_ParsedRow | None, str | None]:
     del line_number
     raw_charter = row.get(mapping.charter_number, "")
@@ -685,7 +822,7 @@ def _parse_ma_row(
         return None, f"Unrecognized status: {raw_status!r}"
     raw_successor = row.get(mapping.successor_charter, "")
     successor: int | None = None
-    if status is InstitutionStatus.MERGED:
+    if validate_successor and status is InstitutionStatus.MERGED:
         successor = _optional_charter(raw_successor)
         if successor is None or successor == charter:
             return None, (
@@ -693,7 +830,7 @@ def _parse_ma_row(
                 if not raw_successor
                 else f"Invalid successor charter {raw_successor!r} for merged institution"
             )
-    elif raw_successor:
+    elif validate_successor and raw_successor:
         return None, f"Non-merged institution cannot have successor charter {raw_successor!r}"
     raw_as_of = row.get(mapping.source_as_of_date, "")
     if not raw_as_of:
@@ -846,3 +983,37 @@ def _parse_date(value: str) -> str | None:
     if parsed.strftime("%Y-%m-%d") != value:
         return None
     return value
+
+
+def lift_roster_suppressions(
+    conn: Connection, denylist: Denylist, charter: int, *, at: datetime, actor: str
+) -> tuple[str, ...]:
+    """Human reconciliation: lift EVERY in-force roster suppression for one charter.
+
+    Each roster artifact owns its own entry, so restoring an institution means lifting
+    all of them, in the independent ledger and in the operational record. This restores
+    nothing else: ``charter_verified`` and the institution's status stay as they are
+    until identity is separately re-verified by a human.
+    """
+    lifted: list[str] = []
+    for entry in denylist.entries():
+        if (
+            entry.scope is WithdrawalScope.INSTITUTION
+            and entry.target_id == str(charter)
+            and entry.withdrawal_id.startswith(_ROSTER_PREFIX)
+            and entry.lifted_at is None
+        ):
+            denylist.lift(entry.withdrawal_id, at=at, actor=actor)
+            already = conn.execute(
+                select(withdrawal_lifts.c.withdrawal_id).where(
+                    withdrawal_lifts.c.withdrawal_id == entry.withdrawal_id
+                )
+            ).first()
+            if already is None:
+                conn.execute(
+                    insert(withdrawal_lifts).values(
+                        withdrawal_id=entry.withdrawal_id, lifted_at=at, lifted_by=actor
+                    )
+                )
+            lifted.append(entry.withdrawal_id)
+    return tuple(lifted)

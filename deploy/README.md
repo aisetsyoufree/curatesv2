@@ -8,7 +8,7 @@
 > 1. **Product Owner Approval:** Formal review and approval of the deployment plan and target environment.
 > 2. **Host Review:** Review of the existing services currently running on the Raspberry Pi 5 to confirm isolated port allocations (127.0.0.1:8080 for Caddy reverse proxy, 127.0.0.1:18200 for Gunicorn), dedicated service user (`cu-rates`), and NVMe filesystem capacity.
 > 3. **Counsel / Policy Clearance:** Verification of data collection and terms boundaries per `MASTER.md` §5 before any collection enablement.
-> 4. **Worker Transport Restriction (Decision D-15):** The worker service and timer MUST remain **INSTALLED DISABLED**. Live collection is prohibited until the gateway pinned dialer (issue #68) is implemented, reviewed, and approved.
+> 4. **Worker Transport Restriction (Decisions D-15, D-17):** The worker service and timer MUST remain **STOPPED, DISABLED, and MASKED**. Live collection is prohibited until the gateway pinned dialer (issue #68) is implemented, reviewed, and approved.
 > 5. **Cloudflare Tunnel Routing:** Verification of the `cloudflared` tunnel ingress configuration routing `cu-rates.org` to the local Caddy reverse proxy on loopback port 8080 (`http://127.0.0.1:8080`) without inbound router ports (`MASTER.md` D-09). Caddy in turn proxies traffic to Gunicorn on `127.0.0.1:18200`.
 
 ---
@@ -41,11 +41,13 @@ All persistent data, code, virtual environments, and evidence artifacts reside u
 ├── .cache/               # uv package cache directory (mode 0755)
 ├── snapshots/            # Public snapshot directory (read-only for web process)
 │   ├── current.json      # Atomic JSON pointer to current active snapshot version
-│   ├── denylist.json     # Emergency withdrawal denylist
 │   └── versions/         # Verified, immutable public SQLite databases
+├── independent/          # Operator-owned independent withdrawal/denylist ledger (mode 0755, root/operator owned)
+│   └── denylist.json     # Emergency withdrawal denylist (mode 0644)
 ├── data/                 # Operational SQLite database (WAL mode; worker only, mode 0750)
-├── artifacts/            # Content-addressed raw evidence store (worker only, mode 0750)
-└── backups/              # Encrypted backup staging area (mode 0750)
+├── artifacts/            # Content-addressed raw evidence store (worker only, mode 0700)
+├── backups/              # Encrypted backup staging area (mode 0750)
+└── installed-commit      # Root-owned deployment commit record (mode 0644, D-17)
 
 /etc/cu-rates/
 └── cu-rates.env          # Externalized environment configuration (mode 0600)
@@ -58,7 +60,7 @@ All persistent data, code, virtual environments, and evidence artifacts reside u
 > **Notice on Hardcoded Unit Paths:** The systemd unit files (`cu-rates-web.service`, `cu-rates-worker.service`, `cu-rates-worker.timer`) assume the hardcoded production root path `/var/lib/cu-rates`. The environment variable `CU_RATES_ROOT` is supported by `deploy/install.sh` solely for installer testing, custom staging, and sandbox validation; it does NOT rewrite or template the hardcoded unit paths in `/etc/systemd/system/`. Deployments intending to use an alternate root path must update the unit files accordingly.
 
 ### Architectural Isolation Principles (`MASTER.md` §6, §7)
-- **Separation of Web and Worker:** The web service process (`cu-rates-web.service`) **NEVER opens or references the worker database** (`/var/lib/cu-rates/data`). The web process reads only verified public snapshots (`/var/lib/cu-rates/snapshots/`) and static application code. Inaccessible paths are enforced in systemd (`InaccessiblePaths=/var/lib/cu-rates/data /var/lib/cu-rates/artifacts /var/lib/cu-rates/backups`). `StateDirectory` is omitted from both web and worker service units so systemd does not grant broad write access to `/var/lib/cu-rates`; the worker unit explicitly restricts writes to `ReadWritePaths=/var/lib/cu-rates/data /var/lib/cu-rates/artifacts /var/lib/cu-rates/snapshots`.
+- **Separation of Web and Worker:** The web service process (`cu-rates-web.service`) **NEVER opens or references the worker database** (`/var/lib/cu-rates/data`). The web process reads only verified public snapshots (`/var/lib/cu-rates/snapshots/`), the independent emergency withdrawal ledger (`/var/lib/cu-rates/independent/`), and static application code. Inaccessible paths are enforced in systemd (`InaccessiblePaths=/var/lib/cu-rates/data /var/lib/cu-rates/artifacts /var/lib/cu-rates/backups`). `StateDirectory` is omitted from both web and worker service units so systemd does not grant broad write access to `/var/lib/cu-rates`; the worker unit explicitly restricts writes to `ReadWritePaths=/var/lib/cu-rates/data /var/lib/cu-rates/artifacts /var/lib/cu-rates/snapshots` and keeps `/var/lib/cu-rates/independent` strictly read-only (`ReadOnlyPaths=/var/lib/cu-rates/app /var/lib/cu-rates/independent`).
 - **Unprivileged Execution:** All services execute as the dedicated system user `cu-rates` (group `cu-rates`) with no interactive shell (`/usr/sbin/nologin`).
 - **Hardened Sandboxing:** Systemd units enforce `ProtectSystem=strict`, `ProtectHome=true`, `PrivateTmp=true`, `NoNewPrivileges=true`, `PrivateDevices=true`, `ProtectClock=true`, `ProtectHostname=true`, `ProtectProc=invisible`, `ProcSubset=pid`, `CapabilityBoundingSet=` (empty), `AmbientCapabilities=` (empty), `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`, `SystemCallArchitectures=native`, `SystemCallFilter=@system-service`, `UMask=0077`, kernel tunables protection, strict `ReadWritePaths`, and resource quotas (`MemoryMax`, `TasksMax`, `CPUQuota`). Private temporary files are protected with `PrivateTmp=true`; `/tmp` is omitted from `ReadWritePaths`.
 
@@ -84,11 +86,12 @@ sudo bash deploy/install.sh --apply
 
 This step:
 - Creates the unprivileged `cu-rates` user and group.
-- Creates the layout under `/var/lib/cu-rates` (including `/var/lib/cu-rates/app` and `/var/lib/cu-rates/.cache`) with safe ownership and permissions (`cu-rates:cu-rates`), chowning only what is created; it never runs `chown -R` on existing directories.
+- Creates the layout under `/var/lib/cu-rates` (including `/var/lib/cu-rates/app`, `/var/lib/cu-rates/.cache`, and operator-owned `/var/lib/cu-rates/independent`) with safe ownership and permissions, chowning only what is created; it never runs `chown -R` on existing directories.
 - Copies `deploy/env.example` to `/etc/cu-rates/cu-rates.env` (mode 0600) if not present.
 - Installs `cu-rates-web.service`, `cu-rates-worker.service`, and `cu-rates-worker.timer` into `/etc/systemd/system/`.
 - Enables `cu-rates-web.service` on boot.
-- **Explicitly ensures `cu-rates-worker.service` and `cu-rates-worker.timer` remain DISABLED per Decision D-15.**
+- **Explicitly ensures `cu-rates-worker.service` and `cu-rates-worker.timer` remain STOPPED, DISABLED, and MASKED (`ln -sf /dev/null /etc/systemd/system/<unit>`) per Decisions D-15 and D-17.**
+- **Records installed commit in root-owned state file `/var/lib/cu-rates/installed-commit` (mode 0644) per Decision D-17.**
 
 ### Step 3: Clone Repository as Service User
 Clone the application repository into the pre-created `/var/lib/cu-rates/app` directory AS the dedicated `cu-rates` service user (avoiding root ownership and git dubious ownership issues):
@@ -105,17 +108,18 @@ sudo -u cu-rates UV_PROJECT_ENVIRONMENT=/var/lib/cu-rates/venv UV_CACHE_DIR=/var
 ```
 
 ### Step 5: Initialize Emergency Withdrawal Ledger
-The emergency withdrawal mechanism requires an initialized ledger file at `/var/lib/cu-rates/snapshots/denylist.json` before any withdrawal records can be appended (uninitialized reads fail closed). Initial provisioning creates the parent directory `/var/lib/cu-rates/snapshots` but does not establish the ledger. Initialize the empty ledger as the `cu-rates` service user:
+The emergency withdrawal mechanism requires an initialized ledger file at `/var/lib/cu-rates/independent/denylist.json` before any withdrawal records can be appended (uninitialized reads fail closed). Initial provisioning creates the parent directory `/var/lib/cu-rates/independent` (operator-owned, mode 0755) but does not establish the ledger. Initialize the empty ledger as the root or operator user:
 ```bash
-sudo -u cu-rates /var/lib/cu-rates/venv/bin/python -c '
+sudo /var/lib/cu-rates/venv/bin/python -c '
 from pathlib import Path
 from cu_rates.snapshot import Denylist
 
-denylist = Denylist(Path("/var/lib/cu-rates/snapshots/denylist.json"))
+denylist = Denylist(Path("/var/lib/cu-rates/independent/denylist.json"))
 denylist.initialize()
 '
+sudo chmod 0644 /var/lib/cu-rates/independent/denylist.json
 ```
-This explicitly establishes the empty ledger with version 1 (`mode 0640`) so subsequent operator withdrawals can append records safely.
+This explicitly establishes the empty ledger with version 1 (`mode 0644`) so subsequent operator withdrawals can append records safely, while the worker service cannot write to or tamper with the independent ledger directory.
 
 ### Step 6: Configure Environment
 Review and edit `/etc/cu-rates/cu-rates.env`:
@@ -290,12 +294,12 @@ Procedure:
 ### Emergency Withdrawal Denylist
 The web application enforces the configured `DENYLIST_PATH` through `SnapshotReader` on each read. An uninitialized, missing, or invalid `denylist.json` fails closed and suppresses offers.
 
-> **Prerequisite:** Withdrawal requires an initialized ledger. If `/var/lib/cu-rates/snapshots/denylist.json` was not already initialized during initial setup, run `Denylist.initialize()` once before appending entries (otherwise uninitialized reads fail closed):
+> **Prerequisite:** Withdrawal requires an initialized ledger. If `/var/lib/cu-rates/independent/denylist.json` was not already initialized during initial setup, run `Denylist.initialize()` once before appending entries (otherwise uninitialized reads fail closed):
 > ```python
 > from pathlib import Path
 > from cu_rates.snapshot import Denylist
 >
-> denylist = Denylist(Path("/var/lib/cu-rates/snapshots/denylist.json"))
+> denylist = Denylist(Path("/var/lib/cu-rates/independent/denylist.json"))
 > denylist.initialize()
 > ```
 
@@ -308,7 +312,7 @@ Procedure:
    from cu_rates.contracts.enums import WithdrawalScope
    from cu_rates.snapshot import Denylist
 
-   denylist = Denylist(Path("/var/lib/cu-rates/snapshots/denylist.json"))
+   denylist = Denylist(Path("/var/lib/cu-rates/independent/denylist.json"))
    entry = WithdrawalEntry(
        schema_version="1.0",
        withdrawal_id="wd-20261117-001",
@@ -320,7 +324,7 @@ Procedure:
    )
    denylist.withdraw(entry)
    ```
-   `Denylist.withdraw()` acquires the writer lock, validates required audit fields (`schema_version`, `withdrawal_id`, `scope`, `target_id`, `actor`, `withdrawn_at`, `reason`), and atomically writes the updated ledger to `/var/lib/cu-rates/snapshots/denylist.json`.
+   `Denylist.withdraw()` acquires the writer lock, validates required audit fields (`schema_version`, `withdrawal_id`, `scope`, `target_id`, `actor`, `withdrawn_at`, `reason`), and atomically writes the updated ledger to `/var/lib/cu-rates/independent/denylist.json`.
 2. The web layer filters denied entities on the next incoming request with zero delay.
 
 ---
@@ -352,10 +356,10 @@ To verify that services survive a host reboot correctly:
    # Expected: enabled
 
    systemctl is-enabled cu-rates-worker.service
-   # Expected: disabled or static
+   # Expected: masked (or disabled)
 
    systemctl is-enabled cu-rates-worker.timer
-   # Expected: disabled
+   # Expected: masked (or disabled)
    ```
 2. **Reboot host:**
    ```bash

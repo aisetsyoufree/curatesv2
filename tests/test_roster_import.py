@@ -20,6 +20,14 @@ from cu_rates.roster import (
     RosterImporter,
     import_roster,
 )
+from cu_rates.snapshot import Denylist
+
+
+def _denylist(tmp_path: Path) -> Denylist:
+    ledger = Denylist(tmp_path / "independent" / "withdrawals.json")
+    ledger.initialize()
+    return ledger
+
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "roster"
 V1_PATH = FIXTURES_DIR / "ncua_roster_v1.csv"
@@ -46,6 +54,7 @@ def test_import_first_version_and_contract_validation(tmp_path: Path) -> None:
         V1_PATH,
         engine_or_connection=engine,
         artifact_store=store,
+        denylist=_denylist(tmp_path),
         source_version="2026-09-01",
         clock=lambda: FROZEN_TIME,
     )
@@ -106,6 +115,7 @@ def test_repeat_import_identical_bytes_is_noop(tmp_path: Path) -> None:
         V1_PATH,
         engine_or_connection=engine,
         artifact_store=store,
+        denylist=_denylist(tmp_path),
         source_version="2026-09-01",
         clock=lambda: FROZEN_TIME,
     )
@@ -115,6 +125,7 @@ def test_repeat_import_identical_bytes_is_noop(tmp_path: Path) -> None:
         V1_PATH,
         engine_or_connection=engine,
         artifact_store=store,
+        denylist=_denylist(tmp_path),
         source_version="2026-09-01",
         clock=lambda: FROZEN_TIME,
     )
@@ -138,6 +149,7 @@ def test_second_source_version_updates_institutions_and_retains_dates(tmp_path: 
         V1_PATH,
         engine_or_connection=engine,
         artifact_store=store,
+        denylist=_denylist(tmp_path),
         source_version="2026-09-01",
         clock=lambda: FROZEN_TIME,
     )
@@ -148,6 +160,7 @@ def test_second_source_version_updates_institutions_and_retains_dates(tmp_path: 
         V2_PATH,
         engine_or_connection=engine,
         artifact_store=store,
+        denylist=_denylist(tmp_path),
         source_version="2026-10-01",
         clock=lambda: time_v2,
     )
@@ -202,6 +215,7 @@ def test_raw_artifact_round_trip(tmp_path: Path) -> None:
         V1_PATH,
         engine_or_connection=engine,
         artifact_store=store,
+        denylist=_denylist(tmp_path),
         source_version="2026-09-01",
         clock=lambda: FROZEN_TIME,
     )
@@ -219,6 +233,7 @@ def test_duplicate_charter_resolution(tmp_path: Path) -> None:
         V1_PATH,
         engine_or_connection=engine,
         artifact_store=store,
+        denylist=_denylist(tmp_path),
         source_version="2026-09-01",
         clock=lambda: FROZEN_TIME,
     )
@@ -253,6 +268,7 @@ def test_closures_and_mergers_explicitly_handled(tmp_path: Path) -> None:
         V1_PATH,
         engine_or_connection=engine,
         artifact_store=store,
+        denylist=_denylist(tmp_path),
         source_version="2026-09-01",
         clock=lambda: FROZEN_TIME,
     )
@@ -285,6 +301,7 @@ def test_malformed_rows_reported_and_not_dropped(tmp_path: Path) -> None:
         V1_PATH,
         engine_or_connection=engine,
         artifact_store=store,
+        denylist=_denylist(tmp_path),
         source_version="2026-09-01",
         clock=lambda: FROZEN_TIME,
     )
@@ -305,6 +322,7 @@ def test_non_ma_rows_skipped_from_registry(tmp_path: Path) -> None:
         V1_PATH,
         engine_or_connection=engine,
         artifact_store=store,
+        denylist=_denylist(tmp_path),
         source_version="2026-09-01",
         clock=lambda: FROZEN_TIME,
     )
@@ -371,6 +389,7 @@ def test_append_only_guards_on_roster_tables(tmp_path: Path) -> None:
         V1_PATH,
         engine_or_connection=engine,
         artifact_store=store,
+        denylist=_denylist(tmp_path),
         source_version="2026-09-01",
         clock=lambda: FROZEN_TIME,
     )
