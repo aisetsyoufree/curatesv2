@@ -506,7 +506,12 @@ def validate_registry(registry: Registry, *, as_of: datetime) -> RegistryReport:
                 add(charter, "products", key, Reason.CLASSIFICATION_CONFLICT)
                 states.add(CoverageState.UNKNOWN)
                 continue
-            if as_of - finding_record.observed_at > timedelta(hours=72):
+            if finding_record.observed_at > as_of:
+                # Dated after the audit time: it cannot have been observed yet, so it can
+                # never count as verified coverage (it is a bad record, not merely stale).
+                add(charter, "product_findings", row["finding_id"], Reason.INVALID_RECORD)
+                states.add(CoverageState.UNKNOWN)
+            elif as_of - finding_record.observed_at > timedelta(hours=72):
                 add(charter, "product_findings", row["finding_id"], Reason.STALE)
                 states.add(CoverageState.STALE)
             elif finding_record.rate_availability == "public_rate":
@@ -614,6 +619,7 @@ def validate_registry(registry: Registry, *, as_of: datetime) -> RegistryReport:
         if (
             row["observed_at"] > as_of
             or as_of - row["observed_at"] > timedelta(hours=72)
+            or row["valid_until"] is None  # unbounded validity can never be fresh
             or row["valid_until"] <= as_of
             or row["valid_until"] > row["observed_at"] + timedelta(hours=96)
         ):
