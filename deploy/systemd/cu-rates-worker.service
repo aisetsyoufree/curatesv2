@@ -44,8 +44,9 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 
 # Filesystem Access: Worker writes to operational data, artifacts, and snapshots.
+# Independent withdrawal ledger (/var/lib/cu-rates/independent) is operator-owned and read-only.
 ReadWritePaths=/var/lib/cu-rates/data /var/lib/cu-rates/artifacts /var/lib/cu-rates/snapshots
-ReadOnlyPaths=/var/lib/cu-rates/app
+ReadOnlyPaths=/var/lib/cu-rates/app /var/lib/cu-rates/independent
 
 # Resource Limits (Raspberry Pi 5 with 16 GB RAM)
 MemoryMax=1G
