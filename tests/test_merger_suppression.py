@@ -177,10 +177,12 @@ class TestMergerClearsEligibility:
             inst = conn.execute(
                 select(institutions).where(institutions.c.charter_number == 60001)
             ).one()
-            # Must be merged, eligibility cleared, even though it was verified.
-            assert inst.status == InstitutionStatus.MERGED.value
+            # Eligibility is cleared and suppression recorded, but a VERIFIED record's
+            # changed identity (status, successor) is queued for human review, never
+            # applied automatically.
+            assert inst.status == InstitutionStatus.ACTIVE.value
             assert inst.charter_verified == 0
-            assert inst.successor_charter_number == 60002
+            assert inst.successor_charter_number is None
 
         # Must appear in both suppressed and review lists.
         assert 60001 in v2_report.suppressed_charters
@@ -353,8 +355,10 @@ class TestReimportIdempotency:
                 )
             ).all()
 
-            # Only one withdrawal from the first transition.
-            assert len(withdrawals) == 1
+            # Each roster artifact owns its own suppression entry (v2 and v3), so a human
+            # lift of one artifact's evidence is never undone by replaying another.
+            assert len(withdrawals) == 2
+            assert len({w.withdrawal_id for w in withdrawals}) == 2
 
         # Every inactive record is reconciled without duplicating suppression.
         assert 60001 in v3_report.suppressed_charters
@@ -462,54 +466,6 @@ class TestRestorationRequiresRecordedReview:
                 ).first()
                 # No lift was auto-recorded.
                 assert lift is None
-
-    def test_withdrawal_can_be_lifted_by_explicit_human_action(self, tmp_path: Path) -> None:
-        """A withdrawal can only be restored by inserting a lift record."""
-        db_path = _database(tmp_path)
-        store = _store(tmp_path)
-        engine = open_operational_database(db_path)
-
-        import_roster(
-            _V1_CSV,
-            engine_or_connection=engine,
-            artifact_store=store,
-            source_version="v1",
-            clock=lambda: FROZEN_V1,
-            denylist=_denylist(tmp_path),
-        )
-        import_roster(
-            _V2_MERGED_CSV,
-            engine_or_connection=engine,
-            artifact_store=store,
-            source_version="v2",
-            clock=lambda: FROZEN_V2,
-            denylist=_denylist(tmp_path),
-        )
-
-        with engine.begin() as conn:
-            w = conn.execute(
-                select(withdrawal_entries.c.withdrawal_id).where(
-                    withdrawal_entries.c.scope == WithdrawalScope.INSTITUTION.value,
-                    withdrawal_entries.c.target_id == "60001",
-                )
-            ).one()
-
-            # Simulate explicit human lift.
-            lift_time = datetime(2026, 12, 1, 12, 0, tzinfo=UTC)
-            conn.execute(
-                withdrawal_lifts.insert().values(
-                    withdrawal_id=w.withdrawal_id,
-                    lifted_at=lift_time,
-                    lifted_by="human-reviewer",
-                )
-            )
-
-        with engine.connect() as conn:
-            lift = conn.execute(
-                select(withdrawal_lifts).where(withdrawal_lifts.c.withdrawal_id == w.withdrawal_id)
-            ).one()
-            assert lift.lifted_by == "human-reviewer"
-            assert lift.lifted_at is not None
 
 
 def test_merger_without_a_denylist_is_refused_and_changes_nothing(tmp_path: Path) -> None:
@@ -823,7 +779,7 @@ def test_snapshot_restoration_requires_explicit_recorded_human_lift(
 
 
 @pytest.mark.parametrize("status", ["Merged", "Liquidated", "Converted"])
-def test_newer_same_status_import_clears_reverification_and_reuses_suppression(
+def test_newer_same_status_import_clears_reverification_and_adds_its_own_suppression(
     stored: StoredFixture, public_snapshot: tuple[SnapshotReader, Denylist], status: str
 ) -> None:
     reader, denylist = public_snapshot
@@ -849,8 +805,11 @@ def test_newer_same_status_import_clears_reverification_and_reuses_suppression(
         ).scalar_one()
         == 0
     )
-    assert denylist.path.read_bytes() == ledger
-    assert len(stored.conn.execute(select(withdrawal_entries)).all()) == 1
+    assert denylist.path.read_bytes() != ledger  # the newer artifact adds its own entry
+    entries = denylist.entries()
+    assert len(entries) == 2 and all(e.lifted_at is None for e in entries)
+    assert len({e.withdrawal_id for e in entries}) == 2
+    assert len(stored.conn.execute(select(withdrawal_entries)).all()) == 2
     assert reader.read(at=_MOMENT + timedelta(seconds=1)).offers == ()
 
 
@@ -1012,3 +971,74 @@ def test_replay_after_recorded_human_lift_preserves_restoration(
         assert verified == 0
         assert reader.read(at=later).offers == ()
         assert len(denylist.entries()) == 2
+
+
+@pytest.mark.parametrize("status", ["Merged", "Liquidated", "Converted"])
+def test_replaying_one_artifact_never_undoes_a_human_lift_across_artifacts(
+    stored: StoredFixture, public_snapshot: tuple[SnapshotReader, Denylist], status: str
+) -> None:
+    """Review P2: artifact B must own its entry, so lifting A and B survives a replay of B."""
+    reader, denylist = public_snapshot
+    successor = "60002" if status == "Merged" else ""
+    csv_a = _snapshot_roster(status, successor=successor)
+    csv_b = _snapshot_roster(status, successor=successor, as_of="2026-11-17")
+    _snapshot_import(stored, denylist, csv_a)
+    _snapshot_import(stored, denylist, csv_b, moment=_MOMENT + timedelta(seconds=1))
+    entries = denylist.entries()
+    assert len(entries) == 2 and len({e.withdrawal_id for e in entries}) == 2
+    later = _MOMENT + timedelta(minutes=1)
+    for entry in entries:
+        stored.conn.execute(
+            withdrawal_lifts.insert().values(
+                withdrawal_id=entry.withdrawal_id, lifted_at=later, lifted_by="human-reviewer"
+            )
+        )
+        denylist.lift(entry.withdrawal_id, at=later, actor="human-reviewer")
+    stored.conn.execute(
+        update(institutions)
+        .where(institutions.c.charter_number == CHARTER)
+        .values(status="active", successor_charter_number=None, charter_verified=1)
+    )
+    ledger = denylist.path.read_bytes()
+    assert {o.institution_charter for o in reader.read(at=later).offers} == {CHARTER}
+    report = _snapshot_import(stored, denylist, csv_b, moment=later)
+    assert report.is_noop
+    assert report.suppressed_charters == report.review_charters == ()
+    assert denylist.path.read_bytes() == ledger
+    assert (
+        stored.conn.execute(
+            select(institutions.c.charter_verified).where(institutions.c.charter_number == CHARTER)
+        ).scalar_one()
+        == 1
+    )
+    assert {o.institution_charter for o in reader.read(at=later).offers} == {CHARTER}
+
+
+@pytest.mark.parametrize("status", ["Merged", "Liquidated", "Converted"])
+def test_verified_institutions_changed_identity_is_held_not_applied(
+    stored: StoredFixture, public_snapshot: tuple[SnapshotReader, Denylist], status: str
+) -> None:
+    """Review P3: suppression must not let an unreviewed status/successor be written."""
+    reader, denylist = public_snapshot
+    stored.conn.execute(
+        update(institutions)
+        .where(institutions.c.charter_number == CHARTER)
+        .values(charter_verified=1)
+    )
+    before = stored.conn.execute(
+        select(institutions.c.status, institutions.c.successor_charter_number).where(
+            institutions.c.charter_number == CHARTER
+        )
+    ).one()
+    report = _snapshot_import(
+        stored, denylist, _snapshot_roster(status, successor="60002" if status == "Merged" else "")
+    )
+    after = stored.conn.execute(
+        select(institutions.c.status, institutions.c.successor_charter_number).where(
+            institutions.c.charter_number == CHARTER
+        )
+    ).one()
+    assert tuple(after) == tuple(before)
+    assert CHARTER not in report.updated_charters
+    assert report.review_charters == (CHARTER,)
+    assert reader.read(at=_MOMENT).offers == ()

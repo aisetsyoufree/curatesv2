@@ -374,7 +374,7 @@ class RosterImporter:
             return replace(
                 existing,
                 suppressed_charters=tuple(suppressed),
-                review_charters=tuple(review),
+                review_charters=tuple(dict.fromkeys(review)),
             )
 
         for inst, row_item in parsed.valid_rows:
@@ -417,7 +417,9 @@ class RosterImporter:
                 or current.successor_charter_number != inst.successor_charter_number
             )
 
-            if current is not None and int(current.charter_verified) == 1 and changed:
+            # Use the verification state from BEFORE this import's suppression cleared it:
+            # a verified record's changed identity is queued for review, never applied.
+            if current is not None and inst.charter_number in verified and changed:
                 review.append(inst.charter_number)
                 continue
             if current is None:
@@ -481,7 +483,7 @@ class RosterImporter:
             closures=tuple(closures),
             quarantined_charters=tuple(quarantined),
             suppressed_charters=tuple(suppressed),
-            review_charters=tuple(review),
+            review_charters=tuple(dict.fromkeys(review)),
             stale_charters=tuple(stale),
             errors=parsed.errors,
         )
@@ -498,24 +500,13 @@ class RosterImporter:
         withdrawal_id = f"roster-{artifact_id}.suppress.{charter}"
         entries = self._denylist.entries()
         # A retry must reuse every immutable field, especially the original time.
-        # An existing unlifted suppression also covers a newer roster artifact.
+        # Every roster artifact owns its own deterministic entry: a human lift of one
+        # artifact's evidence must never be undone by replaying another artifact.
         entry = next((e for e in entries if e.withdrawal_id == withdrawal_id), None)
         if entry is not None and entry.lifted_at is not None:
             # A human already reconciled this exact evidence. Replaying it must
             # neither re-suppress the institution nor clear its verification.
             return None
-        if entry is None:
-            entry = next(
-                (
-                    e
-                    for e in entries
-                    if e.scope is WithdrawalScope.INSTITUTION
-                    and e.target_id == str(charter)
-                    and e.lifted_at is None
-                    and e.in_force_at(now)
-                ),
-                None,
-            )
         if entry is None:
             entry = WithdrawalEntry(
                 schema_version=CONTRACT_VERSION,
