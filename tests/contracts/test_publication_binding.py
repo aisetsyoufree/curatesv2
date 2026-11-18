@@ -37,7 +37,12 @@ from cu_rates.contracts import (
 )
 from cu_rates.contracts.base import CONTRACT_VERSION
 from cu_rates.contracts.enums import EvidenceKind, FetchMethod, RateType
-from cu_rates.contracts.publication import SUPPRESS_REASONS
+from cu_rates.contracts.fingerprints import offer_evidence_sha256
+from cu_rates.contracts.publication import (
+    SUPPRESS_REASONS,
+    corroborated_paths,
+    publication_evidence_sha256,
+)
 from cu_rates.contracts.sources import profile_sha256
 
 from .factories import (
@@ -646,13 +651,25 @@ def test_unbound_correction_forces_review_until_the_state_is_reviewed() -> None:
     correction = _correction(corrected_value="6.125", evidence=(provenance("6.125%"),))
     # The review from before the new capture does not cover its fresh evidence.
     blocked(decide(offer, corrections=(correction,)), R.CORRECTION_PENDING, RV)
+    v2_digest = publication_evidence_sha256(offer, corroborated_paths(offer, context(offer)))
     after_capture = prior(offer).model_copy(
         update={
-            "review": review(offer).model_copy(update={"decided_at": T0}),
+            "review": review(offer).model_copy(
+                update={"decided_at": T0, "reviewed_evidence_sha256": v2_digest}
+            ),
             "published": published_snapshot(offer, published_at=T0),
         }
     )
     assert decide(offer, prior=after_capture, corrections=(correction,)).publishable_now
+    # AUD7-12(b): a review bound only to the protocol-1 offer digest does not clear it.
+    v1_only = after_capture.model_copy(
+        update={
+            "review": review(offer).model_copy(
+                update={"decided_at": T0, "reviewed_evidence_sha256": offer_evidence_sha256(offer)}
+            )
+        }
+    )
+    blocked(decide(offer, prior=v1_only, corrections=(correction,)), R.CORRECTION_PENDING, RV)
     no_evidence = correction.model_copy(update={"evidence": ()})
     blocked(
         decide(offer, prior=after_capture, corrections=(no_evidence,)), R.CORRECTION_PENDING, RV

@@ -1323,7 +1323,10 @@ def _corrections_cleared(offer: NormalizedOffer, ctx: PublicationContext) -> boo
         review is not None
         and review.approved
         and review.reviewed_fingerprints == current
-        and review.reviewed_evidence_sha256 == offer_evidence_sha256(offer)
+        # Protocol 2: a review binds the corroborated evidence pair (the same digest every other
+        # human-review check uses), not the bare offer evidence of protocol 1.
+        and review.reviewed_evidence_sha256
+        == publication_evidence_sha256(offer, corroborated_paths(offer, ctx))
         and review.subject_id == offer.offer_id
         and review.decided_at <= ctx.evaluated_at
     )
