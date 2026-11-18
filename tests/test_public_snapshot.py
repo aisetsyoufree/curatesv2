@@ -8,8 +8,10 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from threading import Event
+from typing import Any
 
 import pytest
+from sqlalchemy import select
 
 from cu_rates.contracts.audit import PublishedSnapshot, SnapshotEntry, snapshot_manifest_sha256
 from cu_rates.contracts.enums import (
@@ -20,10 +22,11 @@ from cu_rates.contracts.enums import (
 )
 from cu_rates.contracts.fingerprints import OfferFingerprints, offer_fingerprints
 from cu_rates.contracts.publication import Placement, evaluate_publication
-from cu_rates.db import open_operational_database
+from cu_rates.db import metadata, open_operational_database
+from cu_rates.db.schema import withdrawal_entries
 from cu_rates.pipeline.extract import extract_fixture
 from cu_rates.pipeline.slice import GIT_SHA
-from cu_rates.pipeline.trusted import load_publication_context
+from cu_rates.pipeline.trusted import insert_withdrawal, load_publication_context
 from cu_rates.snapshot import Denylist, PublicOffer, SnapshotError, SnapshotReader, builder
 from cu_rates.snapshot._database import database_digest
 from cu_rates.snapshot._models import (
@@ -648,3 +651,66 @@ def test_protocol2_admission_survives_public_read_and_rollback(tmp_path: Path) -
         assert len(pair) == 2
         for key in ("artifact_id", "content_sha256", "capture_id", "observed_at"):
             assert pair[0][key] != pair[1][key]
+
+
+@pytest.mark.parametrize("scope", list(WithdrawalScope))
+def test_database_withdrawal_suppresses_public_snapshot_before_sql_and_survives_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scope: WithdrawalScope
+) -> None:
+    publisher, reader, denylist = setup_storage(tmp_path)
+    item = row()
+    publisher.build(release("first", item), [item])
+    moment = _BIRTH + timedelta(minutes=1)
+    target = {
+        WithdrawalScope.SOURCE: item.offer.source_id,
+        WithdrawalScope.OFFER: item.offer.offer_id,
+        WithdrawalScope.PRODUCT: item.offer.product_id,
+        WithdrawalScope.INSTITUTION: str(item.offer.institution_charter),
+        WithdrawalScope.SNAPSHOT: "first",
+    }[scope]
+    entry = make.withdrawal(scope, target, withdrawn_at=moment)
+    engine = open_operational_database(tmp_path / "operational.sqlite")
+    metadata.create_all(engine)
+    assert reader.read(at=moment).offers
+    with engine.begin() as conn:
+        original = conn.execute
+
+        def crash(*args: Any, **kwargs: Any) -> Any:
+            assert reader.read(at=moment).offers == ()
+            raise RuntimeError("crash before any database withdrawal record")
+
+        monkeypatch.setattr(conn, "execute", crash)
+        with pytest.raises(RuntimeError, match="crash before"):
+            insert_withdrawal(conn, entry, denylist=denylist)
+        monkeypatch.setattr(conn, "execute", original)
+    assert reader.read(at=moment).offers == ()
+    with pytest.raises(RuntimeError, match="transaction rollback"), engine.begin() as conn:
+        insert_withdrawal(conn, entry, denylist=denylist)
+        raise RuntimeError("transaction rollback")
+    with engine.connect() as conn:
+        assert not conn.execute(select(withdrawal_entries)).all()
+    ledger = denylist.path.read_bytes()
+    for _ in range(2):
+        with engine.begin() as conn:
+            insert_withdrawal(conn, entry, denylist=denylist)
+    assert denylist.path.read_bytes() == ledger
+    with engine.connect() as conn:
+        assert len(conn.execute(select(withdrawal_entries)).all()) == 1
+    assert reader.read(at=moment).offers == ()
+    engine.dispose()
+
+
+def test_denylist_idempotency_cannot_overwrite_or_reactivate_a_lifted_entry(tmp_path: Path) -> None:
+    _, _, denylist = setup_storage(tmp_path)
+    entry = make.withdrawal(WithdrawalScope.SOURCE, "source-one", withdrawn_at=_BIRTH)
+    denylist.withdraw(entry)
+    before = denylist.path.read_bytes()
+    denylist.withdraw(entry)
+    assert denylist.path.read_bytes() == before
+    with pytest.raises(ValueError, match="different content"):
+        denylist.withdraw(entry.model_copy(update={"target_id": "source-two"}))
+    denylist.lift(entry.withdrawal_id, at=_BIRTH + timedelta(seconds=1), actor="Synthetic owner")
+    before = denylist.path.read_bytes()
+    with pytest.raises(ValueError, match="different content"):
+        denylist.withdraw(entry)
+    assert denylist.path.read_bytes() == before

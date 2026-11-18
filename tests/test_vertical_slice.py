@@ -70,6 +70,7 @@ from cu_rates.pipeline.trusted import (
     stored_provenance,
 )
 from cu_rates.pipeline.validate import validate_offer
+from cu_rates.snapshot import Denylist
 
 from .pub2_fixtures import reviewed_fixture
 
@@ -392,6 +393,7 @@ def test_each_denylist_scope_independently_suppresses(
                 withdrawn_at=now,
                 reason="Synthetic withdrawal.",
             ),
+            denylist=Denylist(tmp_path / "independent" / "withdrawals.json"),
         )
     after = _view(run)
     decision = evaluate_publication(after.offer, after.context)

@@ -20,8 +20,9 @@ import httpx
 from pydantic import ValidationError
 
 from cu_rates.artifact_store import ArtifactStore, ArtifactStoreError
-from cu_rates.contracts.base import CONTRACT_VERSION, HttpUrlText, Sha256Hex
-from cu_rates.contracts.enums import EvidenceKind, FetchMethod, RunStatus
+from cu_rates.contracts.audit import WithdrawalEntry
+from cu_rates.contracts.base import CONTRACT_VERSION
+from cu_rates.contracts.enums import EvidenceKind, FetchMethod, RunStatus, WithdrawalScope
 from cu_rates.contracts.evidence import RawArtifact
 from cu_rates.contracts.sources import (
     ConditionalValidator,
@@ -38,11 +39,13 @@ from cu_rates.fetch_dialer import (
     globally_routable,
     normalize_address,
 )
+from cu_rates.fetch_policy import FetchRegistry, PolicyError
+from cu_rates.fetch_policy import TermsReview as TermsReview
 from cu_rates.fetch_robots import PRODUCT, RobotsPolicy, parse_robots
+from cu_rates.snapshot._files import SnapshotError
 
 USER_AGENT = f"{PRODUCT}/2 (+https://github.com/aisetsyoufree/curatesv2)"
 ROBOTS_TTL = 24 * 60 * 60
-TERMS_TTL = 90 * ROBOTS_TTL
 MAX_RETRY_DELAY = 15 * 60
 MAX_BODY = 8 * 1024 * 1024
 MAX_ROBOTS = 512 * 1024
@@ -59,13 +62,6 @@ class FetchApproval(SourceApproval):
 
     profile: FetchProfile
     evidence_kind: EvidenceKind
-
-
-class TermsReview(SourceApproval):
-    """A separate human terms decision, directly bound to the source."""
-
-    terms_url: HttpUrlText
-    terms_sha256: Sha256Hex
 
 
 @dataclass(frozen=True)
@@ -263,6 +259,7 @@ class FetchWorker:
         transport: TransportFactory,
         *,
         git_sha: str,
+        registry: FetchRegistry,
         clock: Callable[[], float] = time.time,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
@@ -278,6 +275,7 @@ class FetchWorker:
         self._git_sha, self._clock, self._sleep = git_sha, clock, sleep
         self._monotonic = monotonic
         self._resolve = resolve if resolve is not None else _resolution_disabled
+        self._registry = registry
 
     @contextmanager
     def _state(self) -> Iterator[sqlite3.Connection]:
@@ -335,9 +333,11 @@ class FetchWorker:
         timeout: int,
         *,
         limit: int,
+        authorize: Callable[[], None],
         spacing: int = 5,
         attempt: int | None = None,
     ) -> _Response:
+        authorize()
         validated = _require_routable(url.host, self._resolve)
         origin = f"https://{url.host}"
         self._wait(
@@ -354,6 +354,7 @@ class FetchWorker:
                 float(self._get(db, "pressure-tick") or 0),
             ),
         )
+        authorize()  # Re-read revocations/withdrawals after spacing or retry waits.
         started = self._clock()
         tick = self._monotonic()
         self._set(db, "next-global", str(started + 5))
@@ -443,7 +444,13 @@ class FetchWorker:
                 raise _Stopped("response-time-limit")
         return _Response(code, headers, bytes(body), delay)
 
-    def _robots(self, db: sqlite3.Connection, url: httpx.URL, timeout: int) -> RobotsPolicy:
+    def _robots(
+        self,
+        db: sqlite3.Connection,
+        url: httpx.URL,
+        timeout: int,
+        authorize: Callable[[], None],
+    ) -> RobotsPolicy:
         origin = f"https://{url.host}"
         key = f"robots:{origin}"
         cached = self._get(db, key)
@@ -461,6 +468,7 @@ class FetchWorker:
                 {},
                 timeout,
                 limit=MAX_ROBOTS,
+                authorize=authorize,
                 spacing=spacing,
             )
         except httpx.HTTPError as exc:
@@ -510,46 +518,35 @@ class FetchWorker:
             self._set(db, "pressure-tick", str(tick + delay))
         return delay
 
-    def fetch(
-        self,
-        source: RateSource,
-        profile: FetchProfile,
-        approval: FetchApproval,
-        terms: TermsReview,
-        *,
-        withdrawn: bool = False,
-    ) -> FetchResult:
-        now = datetime.fromtimestamp(self._clock(), UTC)
-        for decision in (approval, terms):
-            if (
-                not decision.approved
-                or decision.source_id != source.source_id
-                or decision.source_url != source.url
-                or decision.decided_at > now
-            ):
-                return FetchResult("source-not-approved")
-        if (now - terms.decided_at).total_seconds() >= TERMS_TTL:
-            return FetchResult("terms-review-expired")
-        if approval.approval_id == terms.approval_id:
-            return FetchResult("terms-review-not-independent-record")
+    def _authorize(self, source: RateSource, profile: FetchProfile) -> None:
+        try:
+            terms = self._registry.authorize(
+                source, profile, datetime.fromtimestamp(self._clock(), UTC)
+            )
+            _public_url(terms.terms_url)
+        except PolicyError as exc:
+            raise _Stopped(str(exc)) from exc
+
+    def fetch(self, source: RateSource, profile: FetchProfile) -> FetchResult:
+        """Resolve authorization from persisted records; callers cannot supply decisions."""
         if (
-            withdrawn
-            or profile.source_id != source.source_id
+            profile.source_id != source.source_id
             or profile.method is not FetchMethod.HTTP_GET
             or source.evidence_kind not in _MEDIA
-            or approval.profile != profile
-            or approval.evidence_kind is not source.evidence_kind
         ):
             return FetchResult("withdrawn-or-unsupported-profile")
         try:
             url = _public_url(source.url)
-            _public_url(terms.terms_url)
+            self._authorize(source, profile)
             with self._state() as db:
+                self._authorize(source, profile)
                 return self._fetch(db, url, source, profile)
         except _Stopped as exc:
             return FetchResult(str(exc))
         except BlockingIOError:
             return FetchResult("worker-busy")
+        except (OSError, sqlite3.Error, SnapshotError):
+            return FetchResult("policy-or-state-unavailable")
 
     def _fetch(
         self,
@@ -586,7 +583,9 @@ class FetchWorker:
         validator = None
         echoed = None
         try:
-            robots = self._robots(db, url, profile.timeout_seconds)
+            robots = self._robots(
+                db, url, profile.timeout_seconds, lambda: self._authorize(source, profile)
+            )
             if robots.permits(url.path):
                 artifact, observed, validator, echoed = self._retrieve(
                     db, source, profile, url, run_id, max(5, robots.delay)
@@ -607,11 +606,24 @@ class FetchWorker:
             "http-429-deferred",
         }
         barred = 1 + int(self._get(db, f"barred:{key}") or 0) if terminal_denial else 0
-        self._set(db, f"failures:{key}", str(failures))
-        self._set(db, f"barred:{key}", str(barred))
         if reason in {"access-challenge", "robots-disallowed"} or barred >= 3 or failures >= 5:
+            # Independent suppression is durable BEFORE any database block record.
+            # A crash/rollback below leaves public reads and the next worker stopped.
+            self._registry.denylist.withdraw(
+                WithdrawalEntry(
+                    schema_version=CONTRACT_VERSION,
+                    withdrawal_id=f"fetch-block-{run_id}",
+                    scope=WithdrawalScope.SOURCE,
+                    target_id=key,
+                    actor="fetch-worker",
+                    withdrawn_at=datetime.fromtimestamp(self._clock(), UTC),
+                    reason=reason,
+                )
+            )
             self._set(db, f"paused:{key}", reason)
             status = RunStatus.BLOCKED
+        self._set(db, f"failures:{key}", str(failures))
+        self._set(db, f"barred:{key}", str(barred))
         end = datetime.fromtimestamp(max(now, self._clock()), UTC)
         if observed is not None and validator is not None:
             db.execute(
@@ -702,6 +714,7 @@ class FetchWorker:
                     headers,
                     profile.timeout_seconds,
                     limit=MAX_BODY,
+                    authorize=lambda: self._authorize(source, profile),
                     spacing=spacing,
                     attempt=attempt,
                 )
