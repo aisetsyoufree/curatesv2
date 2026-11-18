@@ -5,11 +5,12 @@ Revises:
 Create Date: 2026-11-15
 """
 
+# ruff: noqa: E501  (frozen guard SQL is stored verbatim)
+
 import sqlalchemy as sa
 from alembic import op
 
 import cu_rates.db.types
-from cu_rates.db.schema import schema_triggers
 
 revision = "t012_initial"
 down_revision = None
@@ -21,8 +22,314 @@ depends_on = None
 # replace guards, and the offer lifecycle path). CREATE TABLE stays hand-written.
 
 
+# Guard SQL frozen as it stood when AUD4b sealed roster history (AUD9 #102 h): this revision
+# must never regenerate guards from the live schema module, which keeps gaining keys.
+_FROZEN_TRIGGERS: tuple[tuple[str, str], ...] = (
+    (
+        "artifact_blobs_no_delete",
+        "CREATE TRIGGER artifact_blobs_no_delete BEFORE DELETE ON artifact_blobs BEGIN SELECT RAISE(ABORT, 'artifact_blobs is append-only'); END",
+    ),
+    (
+        "artifact_blobs_no_replace",
+        "CREATE TRIGGER artifact_blobs_no_replace BEFORE INSERT ON artifact_blobs WHEN EXISTS (SELECT 1 FROM artifact_blobs WHERE artifact_id = NEW.artifact_id) BEGIN SELECT RAISE(ABORT, 'artifact_blobs is append-only'); END",
+    ),
+    (
+        "artifact_blobs_no_update",
+        "CREATE TRIGGER artifact_blobs_no_update BEFORE UPDATE ON artifact_blobs BEGIN SELECT RAISE(ABORT, 'artifact_blobs is append-only'); END",
+    ),
+    (
+        "artifact_observations_no_delete",
+        "CREATE TRIGGER artifact_observations_no_delete BEFORE DELETE ON artifact_observations BEGIN SELECT RAISE(ABORT, 'artifact_observations is append-only'); END",
+    ),
+    (
+        "artifact_observations_no_replace",
+        "CREATE TRIGGER artifact_observations_no_replace BEFORE INSERT ON artifact_observations WHEN EXISTS (SELECT 1 FROM artifact_observations WHERE fetch_run_id = NEW.fetch_run_id AND source_url = NEW.source_url) BEGIN SELECT RAISE(ABORT, 'artifact_observations is append-only'); END",
+    ),
+    (
+        "artifact_observations_no_update",
+        "CREATE TRIGGER artifact_observations_no_update BEFORE UPDATE ON artifact_observations BEGIN SELECT RAISE(ABORT, 'artifact_observations is append-only'); END",
+    ),
+    (
+        "correction_evidence_no_delete",
+        "CREATE TRIGGER correction_evidence_no_delete BEFORE DELETE ON correction_evidence BEGIN SELECT RAISE(ABORT, 'correction_evidence is append-only'); END",
+    ),
+    (
+        "correction_evidence_no_replace",
+        "CREATE TRIGGER correction_evidence_no_replace BEFORE INSERT ON correction_evidence WHEN EXISTS (SELECT 1 FROM correction_evidence WHERE correction_id = NEW.correction_id AND provenance_id = NEW.provenance_id) BEGIN SELECT RAISE(ABORT, 'correction_evidence is append-only'); END",
+    ),
+    (
+        "correction_evidence_no_update",
+        "CREATE TRIGGER correction_evidence_no_update BEFORE UPDATE ON correction_evidence BEGIN SELECT RAISE(ABORT, 'correction_evidence is append-only'); END",
+    ),
+    (
+        "corrections_no_delete",
+        "CREATE TRIGGER corrections_no_delete BEFORE DELETE ON corrections BEGIN SELECT RAISE(ABORT, 'corrections is append-only'); END",
+    ),
+    (
+        "corrections_no_replace",
+        "CREATE TRIGGER corrections_no_replace BEFORE INSERT ON corrections WHEN EXISTS (SELECT 1 FROM corrections WHERE correction_id = NEW.correction_id) BEGIN SELECT RAISE(ABORT, 'corrections is append-only'); END",
+    ),
+    (
+        "corrections_no_update",
+        "CREATE TRIGGER corrections_no_update BEFORE UPDATE ON corrections BEGIN SELECT RAISE(ABORT, 'corrections is append-only'); END",
+    ),
+    (
+        "extracted_candidates_no_delete",
+        "CREATE TRIGGER extracted_candidates_no_delete BEFORE DELETE ON extracted_candidates BEGIN SELECT RAISE(ABORT, 'extracted_candidates is append-only'); END",
+    ),
+    (
+        "extracted_candidates_no_replace",
+        "CREATE TRIGGER extracted_candidates_no_replace BEFORE INSERT ON extracted_candidates WHEN EXISTS (SELECT 1 FROM extracted_candidates WHERE candidate_id = NEW.candidate_id) BEGIN SELECT RAISE(ABORT, 'extracted_candidates is append-only'); END",
+    ),
+    (
+        "extracted_candidates_no_update",
+        "CREATE TRIGGER extracted_candidates_no_update BEFORE UPDATE ON extracted_candidates BEGIN SELECT RAISE(ABORT, 'extracted_candidates is append-only'); END",
+    ),
+    (
+        "extraction_runs_no_delete",
+        "CREATE TRIGGER extraction_runs_no_delete BEFORE DELETE ON extraction_runs BEGIN SELECT RAISE(ABORT, 'extraction_runs is append-only'); END",
+    ),
+    (
+        "extraction_runs_no_replace",
+        "CREATE TRIGGER extraction_runs_no_replace BEFORE INSERT ON extraction_runs WHEN EXISTS (SELECT 1 FROM extraction_runs WHERE run_id = NEW.run_id) BEGIN SELECT RAISE(ABORT, 'extraction_runs is append-only'); END",
+    ),
+    (
+        "extraction_runs_no_update",
+        "CREATE TRIGGER extraction_runs_no_update BEFORE UPDATE ON extraction_runs BEGIN SELECT RAISE(ABORT, 'extraction_runs is append-only'); END",
+    ),
+    (
+        "fetch_runs_no_delete",
+        "CREATE TRIGGER fetch_runs_no_delete BEFORE DELETE ON fetch_runs BEGIN SELECT RAISE(ABORT, 'fetch_runs is append-only'); END",
+    ),
+    (
+        "fetch_runs_no_replace",
+        "CREATE TRIGGER fetch_runs_no_replace BEFORE INSERT ON fetch_runs WHEN EXISTS (SELECT 1 FROM fetch_runs WHERE run_id = NEW.run_id) BEGIN SELECT RAISE(ABORT, 'fetch_runs is append-only'); END",
+    ),
+    (
+        "fetch_runs_no_update",
+        "CREATE TRIGGER fetch_runs_no_update BEFORE UPDATE ON fetch_runs BEGIN SELECT RAISE(ABORT, 'fetch_runs is append-only'); END",
+    ),
+    (
+        "finding_evidence_no_delete",
+        "CREATE TRIGGER finding_evidence_no_delete BEFORE DELETE ON finding_evidence BEGIN SELECT RAISE(ABORT, 'finding_evidence is append-only'); END",
+    ),
+    (
+        "finding_evidence_no_replace",
+        "CREATE TRIGGER finding_evidence_no_replace BEFORE INSERT ON finding_evidence WHEN EXISTS (SELECT 1 FROM finding_evidence WHERE finding_id = NEW.finding_id AND provenance_id = NEW.provenance_id) BEGIN SELECT RAISE(ABORT, 'finding_evidence is append-only'); END",
+    ),
+    (
+        "finding_evidence_no_update",
+        "CREATE TRIGGER finding_evidence_no_update BEFORE UPDATE ON finding_evidence BEGIN SELECT RAISE(ABORT, 'finding_evidence is append-only'); END",
+    ),
+    (
+        "finding_purposes_no_delete",
+        "CREATE TRIGGER finding_purposes_no_delete BEFORE DELETE ON finding_purposes BEGIN SELECT RAISE(ABORT, 'finding_purposes is append-only'); END",
+    ),
+    (
+        "finding_purposes_no_replace",
+        "CREATE TRIGGER finding_purposes_no_replace BEFORE INSERT ON finding_purposes WHEN EXISTS (SELECT 1 FROM finding_purposes WHERE finding_id = NEW.finding_id AND purpose = NEW.purpose) BEGIN SELECT RAISE(ABORT, 'finding_purposes is append-only'); END",
+    ),
+    (
+        "finding_purposes_no_update",
+        "CREATE TRIGGER finding_purposes_no_update BEFORE UPDATE ON finding_purposes BEGIN SELECT RAISE(ABORT, 'finding_purposes is append-only'); END",
+    ),
+    (
+        "normalized_offers_lifecycle_only",
+        "CREATE TRIGGER normalized_offers_lifecycle_only BEFORE UPDATE ON normalized_offers WHEN OLD.offer_id IS NOT NEW.offer_id OR OLD.schema_version IS NOT NEW.schema_version OR OLD.institution_charter IS NOT NEW.institution_charter OR OLD.product_id IS NOT NEW.product_id OR OLD.source_id IS NOT NEW.source_id OR OLD.details_json IS NOT NEW.details_json OR OLD.scenario_id IS NOT NEW.scenario_id OR OLD.scenario_matches_json IS NOT NEW.scenario_matches_json OR OLD.note_rate IS NOT NEW.note_rate OR OLD.apr IS NOT NEW.apr OR OLD.points IS NOT NEW.points OR OLD.note_rate_provenance_id IS NOT NEW.note_rate_provenance_id OR OLD.apr_provenance_id IS NOT NEW.apr_provenance_id OR OLD.points_provenance_id IS NOT NEW.points_provenance_id OR OLD.conditions_json IS NOT NEW.conditions_json OR OLD.tiers_json IS NOT NEW.tiers_json OR OLD.headline_is_as_low_as IS NOT NEW.headline_is_as_low_as OR OLD.effective_at IS NOT NEW.effective_at OR OLD.observed_at IS NOT NEW.observed_at OR OLD.valid_until IS NOT NEW.valid_until OR (OLD.published_at IS NOT NULL AND OLD.published_at IS NOT NEW.published_at) BEGIN SELECT RAISE(ABORT, 'normalized_offers allows only a lifecycle status change'); END",
+    ),
+    (
+        "normalized_offers_no_delete",
+        "CREATE TRIGGER normalized_offers_no_delete BEFORE DELETE ON normalized_offers BEGIN SELECT RAISE(ABORT, 'normalized_offers is append-only'); END",
+    ),
+    (
+        "normalized_offers_no_replace",
+        "CREATE TRIGGER normalized_offers_no_replace BEFORE INSERT ON normalized_offers WHEN EXISTS (SELECT 1 FROM normalized_offers WHERE offer_id = NEW.offer_id) BEGIN SELECT RAISE(ABORT, 'normalized_offers is append-only'); END",
+    ),
+    (
+        "not_modified_observations_no_delete",
+        "CREATE TRIGGER not_modified_observations_no_delete BEFORE DELETE ON not_modified_observations BEGIN SELECT RAISE(ABORT, 'not_modified_observations is append-only'); END",
+    ),
+    (
+        "not_modified_observations_no_replace",
+        "CREATE TRIGGER not_modified_observations_no_replace BEFORE INSERT ON not_modified_observations WHEN EXISTS (SELECT 1 FROM not_modified_observations WHERE run_id = NEW.run_id) BEGIN SELECT RAISE(ABORT, 'not_modified_observations is append-only'); END",
+    ),
+    (
+        "not_modified_observations_no_update",
+        "CREATE TRIGGER not_modified_observations_no_update BEFORE UPDATE ON not_modified_observations BEGIN SELECT RAISE(ABORT, 'not_modified_observations is append-only'); END",
+    ),
+    (
+        "offer_evidence_no_delete",
+        "CREATE TRIGGER offer_evidence_no_delete BEFORE DELETE ON offer_evidence BEGIN SELECT RAISE(ABORT, 'offer_evidence is append-only'); END",
+    ),
+    (
+        "offer_evidence_no_replace",
+        "CREATE TRIGGER offer_evidence_no_replace BEFORE INSERT ON offer_evidence WHEN EXISTS (SELECT 1 FROM offer_evidence WHERE offer_id = NEW.offer_id AND provenance_id = NEW.provenance_id AND role = NEW.role AND field_path = NEW.field_path) BEGIN SELECT RAISE(ABORT, 'offer_evidence is append-only'); END",
+    ),
+    (
+        "offer_evidence_no_update",
+        "CREATE TRIGGER offer_evidence_no_update BEFORE UPDATE ON offer_evidence BEGIN SELECT RAISE(ABORT, 'offer_evidence is append-only'); END",
+    ),
+    (
+        "product_findings_no_delete",
+        "CREATE TRIGGER product_findings_no_delete BEFORE DELETE ON product_findings BEGIN SELECT RAISE(ABORT, 'product_findings is append-only'); END",
+    ),
+    (
+        "product_findings_no_replace",
+        "CREATE TRIGGER product_findings_no_replace BEFORE INSERT ON product_findings WHEN EXISTS (SELECT 1 FROM product_findings WHERE finding_id = NEW.finding_id) BEGIN SELECT RAISE(ABORT, 'product_findings is append-only'); END",
+    ),
+    (
+        "product_findings_no_update",
+        "CREATE TRIGGER product_findings_no_update BEFORE UPDATE ON product_findings BEGIN SELECT RAISE(ABORT, 'product_findings is append-only'); END",
+    ),
+    (
+        "provenance_no_delete",
+        "CREATE TRIGGER provenance_no_delete BEFORE DELETE ON provenance BEGIN SELECT RAISE(ABORT, 'provenance is append-only'); END",
+    ),
+    (
+        "provenance_no_replace",
+        "CREATE TRIGGER provenance_no_replace BEFORE INSERT ON provenance WHEN EXISTS (SELECT 1 FROM provenance WHERE provenance_id = NEW.provenance_id) BEGIN SELECT RAISE(ABORT, 'provenance is append-only'); END",
+    ),
+    (
+        "provenance_no_update",
+        "CREATE TRIGGER provenance_no_update BEFORE UPDATE ON provenance BEGIN SELECT RAISE(ABORT, 'provenance is append-only'); END",
+    ),
+    (
+        "published_snapshots_no_delete",
+        "CREATE TRIGGER published_snapshots_no_delete BEFORE DELETE ON published_snapshots BEGIN SELECT RAISE(ABORT, 'published_snapshots is append-only'); END",
+    ),
+    (
+        "published_snapshots_no_replace",
+        "CREATE TRIGGER published_snapshots_no_replace BEFORE INSERT ON published_snapshots WHEN EXISTS (SELECT 1 FROM published_snapshots WHERE snapshot_id = NEW.snapshot_id) BEGIN SELECT RAISE(ABORT, 'published_snapshots is append-only'); END",
+    ),
+    (
+        "published_snapshots_no_update",
+        "CREATE TRIGGER published_snapshots_no_update BEFORE UPDATE ON published_snapshots BEGIN SELECT RAISE(ABORT, 'published_snapshots is append-only'); END",
+    ),
+    (
+        "review_decisions_no_delete",
+        "CREATE TRIGGER review_decisions_no_delete BEFORE DELETE ON review_decisions BEGIN SELECT RAISE(ABORT, 'review_decisions is append-only'); END",
+    ),
+    (
+        "review_decisions_no_replace",
+        "CREATE TRIGGER review_decisions_no_replace BEFORE INSERT ON review_decisions WHEN EXISTS (SELECT 1 FROM review_decisions WHERE review_id = NEW.review_id) BEGIN SELECT RAISE(ABORT, 'review_decisions is append-only'); END",
+    ),
+    (
+        "review_decisions_no_update",
+        "CREATE TRIGGER review_decisions_no_update BEFORE UPDATE ON review_decisions BEGIN SELECT RAISE(ABORT, 'review_decisions is append-only'); END",
+    ),
+    (
+        "review_evidence_no_delete",
+        "CREATE TRIGGER review_evidence_no_delete BEFORE DELETE ON review_evidence BEGIN SELECT RAISE(ABORT, 'review_evidence is append-only'); END",
+    ),
+    (
+        "review_evidence_no_replace",
+        "CREATE TRIGGER review_evidence_no_replace BEFORE INSERT ON review_evidence WHEN EXISTS (SELECT 1 FROM review_evidence WHERE review_id = NEW.review_id AND provenance_id = NEW.provenance_id) BEGIN SELECT RAISE(ABORT, 'review_evidence is append-only'); END",
+    ),
+    (
+        "review_evidence_no_update",
+        "CREATE TRIGGER review_evidence_no_update BEFORE UPDATE ON review_evidence BEGIN SELECT RAISE(ABORT, 'review_evidence is append-only'); END",
+    ),
+    (
+        "snapshot_entries_no_delete",
+        "CREATE TRIGGER snapshot_entries_no_delete BEFORE DELETE ON snapshot_entries BEGIN SELECT RAISE(ABORT, 'snapshot_entries is append-only'); END",
+    ),
+    (
+        "snapshot_entries_no_replace",
+        "CREATE TRIGGER snapshot_entries_no_replace BEFORE INSERT ON snapshot_entries WHEN EXISTS (SELECT 1 FROM snapshot_entries WHERE snapshot_id = NEW.snapshot_id AND offer_id = NEW.offer_id) BEGIN SELECT RAISE(ABORT, 'snapshot_entries is append-only'); END",
+    ),
+    (
+        "snapshot_entries_no_update",
+        "CREATE TRIGGER snapshot_entries_no_update BEFORE UPDATE ON snapshot_entries BEGIN SELECT RAISE(ABORT, 'snapshot_entries is append-only'); END",
+    ),
+    (
+        "snapshot_reviews_no_delete",
+        "CREATE TRIGGER snapshot_reviews_no_delete BEFORE DELETE ON snapshot_reviews BEGIN SELECT RAISE(ABORT, 'snapshot_reviews is append-only'); END",
+    ),
+    (
+        "snapshot_reviews_no_replace",
+        "CREATE TRIGGER snapshot_reviews_no_replace BEFORE INSERT ON snapshot_reviews WHEN EXISTS (SELECT 1 FROM snapshot_reviews WHERE snapshot_id = NEW.snapshot_id AND review_id = NEW.review_id) BEGIN SELECT RAISE(ABORT, 'snapshot_reviews is append-only'); END",
+    ),
+    (
+        "snapshot_reviews_no_update",
+        "CREATE TRIGGER snapshot_reviews_no_update BEFORE UPDATE ON snapshot_reviews BEGIN SELECT RAISE(ABORT, 'snapshot_reviews is append-only'); END",
+    ),
+    (
+        "source_approval_evidence_no_delete",
+        "CREATE TRIGGER source_approval_evidence_no_delete BEFORE DELETE ON source_approval_evidence BEGIN SELECT RAISE(ABORT, 'source_approval_evidence is append-only'); END",
+    ),
+    (
+        "source_approval_evidence_no_replace",
+        "CREATE TRIGGER source_approval_evidence_no_replace BEFORE INSERT ON source_approval_evidence WHEN EXISTS (SELECT 1 FROM source_approval_evidence WHERE approval_id = NEW.approval_id AND provenance_id = NEW.provenance_id) BEGIN SELECT RAISE(ABORT, 'source_approval_evidence is append-only'); END",
+    ),
+    (
+        "source_approval_evidence_no_update",
+        "CREATE TRIGGER source_approval_evidence_no_update BEFORE UPDATE ON source_approval_evidence BEGIN SELECT RAISE(ABORT, 'source_approval_evidence is append-only'); END",
+    ),
+    (
+        "source_approvals_no_delete",
+        "CREATE TRIGGER source_approvals_no_delete BEFORE DELETE ON source_approvals BEGIN SELECT RAISE(ABORT, 'source_approvals is append-only'); END",
+    ),
+    (
+        "source_approvals_no_replace",
+        "CREATE TRIGGER source_approvals_no_replace BEFORE INSERT ON source_approvals WHEN EXISTS (SELECT 1 FROM source_approvals WHERE approval_id = NEW.approval_id) BEGIN SELECT RAISE(ABORT, 'source_approvals is append-only'); END",
+    ),
+    (
+        "source_approvals_no_update",
+        "CREATE TRIGGER source_approvals_no_update BEFORE UPDATE ON source_approvals BEGIN SELECT RAISE(ABORT, 'source_approvals is append-only'); END",
+    ),
+    (
+        "source_fingerprints_no_delete",
+        "CREATE TRIGGER source_fingerprints_no_delete BEFORE DELETE ON source_fingerprints BEGIN SELECT RAISE(ABORT, 'source_fingerprints is append-only'); END",
+    ),
+    (
+        "source_fingerprints_no_replace",
+        "CREATE TRIGGER source_fingerprints_no_replace BEFORE INSERT ON source_fingerprints WHEN EXISTS (SELECT 1 FROM source_fingerprints WHERE fingerprint_id = NEW.fingerprint_id) BEGIN SELECT RAISE(ABORT, 'source_fingerprints is append-only'); END",
+    ),
+    (
+        "source_fingerprints_no_update",
+        "CREATE TRIGGER source_fingerprints_no_update BEFORE UPDATE ON source_fingerprints BEGIN SELECT RAISE(ABORT, 'source_fingerprints is append-only'); END",
+    ),
+    (
+        "validation_results_no_delete",
+        "CREATE TRIGGER validation_results_no_delete BEFORE DELETE ON validation_results BEGIN SELECT RAISE(ABORT, 'validation_results is append-only'); END",
+    ),
+    (
+        "validation_results_no_replace",
+        "CREATE TRIGGER validation_results_no_replace BEFORE INSERT ON validation_results WHEN EXISTS (SELECT 1 FROM validation_results WHERE validation_id = NEW.validation_id) BEGIN SELECT RAISE(ABORT, 'validation_results is append-only'); END",
+    ),
+    (
+        "validation_results_no_update",
+        "CREATE TRIGGER validation_results_no_update BEFORE UPDATE ON validation_results BEGIN SELECT RAISE(ABORT, 'validation_results is append-only'); END",
+    ),
+    (
+        "withdrawal_entries_no_delete",
+        "CREATE TRIGGER withdrawal_entries_no_delete BEFORE DELETE ON withdrawal_entries BEGIN SELECT RAISE(ABORT, 'withdrawal_entries is append-only'); END",
+    ),
+    (
+        "withdrawal_entries_no_replace",
+        "CREATE TRIGGER withdrawal_entries_no_replace BEFORE INSERT ON withdrawal_entries WHEN EXISTS (SELECT 1 FROM withdrawal_entries WHERE withdrawal_id = NEW.withdrawal_id) BEGIN SELECT RAISE(ABORT, 'withdrawal_entries is append-only'); END",
+    ),
+    (
+        "withdrawal_entries_no_update",
+        "CREATE TRIGGER withdrawal_entries_no_update BEFORE UPDATE ON withdrawal_entries BEGIN SELECT RAISE(ABORT, 'withdrawal_entries is append-only'); END",
+    ),
+    (
+        "withdrawal_lifts_no_delete",
+        "CREATE TRIGGER withdrawal_lifts_no_delete BEFORE DELETE ON withdrawal_lifts BEGIN SELECT RAISE(ABORT, 'withdrawal_lifts is append-only'); END",
+    ),
+    (
+        "withdrawal_lifts_no_replace",
+        "CREATE TRIGGER withdrawal_lifts_no_replace BEFORE INSERT ON withdrawal_lifts WHEN EXISTS (SELECT 1 FROM withdrawal_lifts WHERE withdrawal_id = NEW.withdrawal_id) BEGIN SELECT RAISE(ABORT, 'withdrawal_lifts is append-only'); END",
+    ),
+    (
+        "withdrawal_lifts_no_update",
+        "CREATE TRIGGER withdrawal_lifts_no_update BEFORE UPDATE ON withdrawal_lifts BEGIN SELECT RAISE(ABORT, 'withdrawal_lifts is append-only'); END",
+    ),
+)
+
+
 def _append_only_triggers(present: bool) -> None:
-    for name, statement in schema_triggers():
+    for name, statement in _FROZEN_TRIGGERS:
         if present:
             op.execute(statement)
         else:
@@ -39,7 +346,7 @@ def upgrade() -> None:
         sa.Column("successor_charter_number", sa.Integer(), nullable=True),
         sa.Column("charter_verified", sa.Integer(), nullable=False),
         sa.CheckConstraint(
-            "(status = 'merged' AND successor_charter_number IS NOT NULL AND successor_charter_number != charter_number AND successor_charter_number > 0 AND successor_charter_number < 100000000) OR (status != 'merged' AND successor_charter_number IS NULL)",  # noqa: E501
+            "(status = 'merged' AND successor_charter_number IS NOT NULL AND successor_charter_number != charter_number AND successor_charter_number > 0 AND successor_charter_number < 100000000) OR (status != 'merged' AND successor_charter_number IS NULL)",
             name="ck_institutions_successor",
         ),
         sa.CheckConstraint(
@@ -96,7 +403,7 @@ def upgrade() -> None:
         sa.Column("fingerprints_json", cu_rates.db.types.JsonDocument(), nullable=True),
         sa.Column("reviewed_product_sha256", sa.Text(), nullable=True),
         sa.CheckConstraint(
-            "(subject = 'offer' AND fingerprints_json IS NOT NULL AND reviewed_product_sha256 IS NULL) OR (subject = 'product' AND fingerprints_json IS NULL AND reviewed_product_sha256 IS NOT NULL)",  # noqa: E501
+            "(subject = 'offer' AND fingerprints_json IS NOT NULL AND reviewed_product_sha256 IS NULL) OR (subject = 'product' AND fingerprints_json IS NULL AND reviewed_product_sha256 IS NOT NULL)",
             name="ck_review_decisions_binding",
         ),
         sa.CheckConstraint("subject IN ('offer', 'product')", name="ck_review_decisions_subject"),
@@ -213,7 +520,7 @@ def upgrade() -> None:
             "lifecycle IN ('active', 'discontinued', 'under_review')", name="ck_products_lifecycle"
         ),
         sa.CheckConstraint(
-            "rate_availability IN ('public_rate', 'quote_only', 'login_required', 'blocked', 'no_public_rate', 'not_offered', 'unknown')",  # noqa: E501
+            "rate_availability IN ('public_rate', 'quote_only', 'login_required', 'blocked', 'no_public_rate', 'not_offered', 'unknown')",
             name="ck_products_rate_availability",
         ),
         sa.ForeignKeyConstraint(
@@ -284,11 +591,11 @@ def upgrade() -> None:
         sa.Column("validator_kind", sa.Text(), nullable=True),
         sa.Column("validator_value", sa.Text(), nullable=True),
         sa.CheckConstraint(
-            "(status = 'succeeded' AND error IS NULL) OR (status IN ('failed', 'blocked') AND error IS NOT NULL)",  # noqa: E501
+            "(status = 'succeeded' AND error IS NULL) OR (status IN ('failed', 'blocked') AND error IS NOT NULL)",
             name="ck_fetch_runs_error",
         ),
         sa.CheckConstraint(
-            "(validator_kind IS NULL AND validator_value IS NULL) OR (validator_kind IN ('etag', 'last_modified') AND validator_value IS NOT NULL AND status = 'succeeded')",  # noqa: E501
+            "(validator_kind IS NULL AND validator_value IS NULL) OR (validator_kind IN ('etag', 'last_modified') AND validator_value IS NOT NULL AND status = 'succeeded')",
             name="ck_fetch_runs_validator",
         ),
         sa.CheckConstraint(
@@ -318,7 +625,7 @@ def upgrade() -> None:
         sa.Column("approved_by", sa.Text(), nullable=True),
         sa.Column("approved_at", cu_rates.db.types.UtcDateTime(), nullable=True),
         sa.CheckConstraint(
-            "(kind = 'first_party' AND provider_id IS NULL) OR (kind IN ('provider_hosted', 'partner_published') AND provider_id IS NOT NULL)",  # noqa: E501
+            "(kind = 'first_party' AND provider_id IS NULL) OR (kind IN ('provider_hosted', 'partner_published') AND provider_id IS NOT NULL)",
             name="ck_relationships_provider",
         ),
         sa.CheckConstraint(
@@ -326,7 +633,7 @@ def upgrade() -> None:
             name="ck_institution_source_relationships_kind",
         ),
         sa.CheckConstraint(
-            "(approved_by IS NULL AND approved_at IS NULL) OR (approved_by IS NOT NULL AND approved_at IS NOT NULL)",  # noqa: E501
+            "(approved_by IS NULL AND approved_at IS NULL) OR (approved_by IS NOT NULL AND approved_at IS NOT NULL)",
             name="ck_relationships_approval",
         ),
         sa.ForeignKeyConstraint(
@@ -383,22 +690,22 @@ def upgrade() -> None:
         sa.Column("reviewed_at", cu_rates.db.types.UtcDateTime(), nullable=True),
         sa.Column("review_rationale", sa.Text(), nullable=True),
         sa.CheckConstraint(
-            "(review_state = 'proposed' AND reviewed_by IS NULL AND reviewed_at IS NULL AND review_rationale IS NULL) OR (review_state IN ('verified', 'rejected') AND reviewed_by IS NOT NULL AND reviewed_at IS NOT NULL AND review_rationale IS NOT NULL AND NOT (review_state = 'verified' AND scope = 'unknown'))",  # noqa: E501
+            "(review_state = 'proposed' AND reviewed_by IS NULL AND reviewed_at IS NULL AND review_rationale IS NULL) OR (review_state IN ('verified', 'rejected') AND reviewed_by IS NOT NULL AND reviewed_at IS NOT NULL AND review_rationale IS NOT NULL AND NOT (review_state = 'verified' AND scope = 'unknown'))",
             name="ck_product_findings_review",
         ),
         sa.CheckConstraint(
-            "(scope = 'in_scope' AND family IS NOT NULL AND rate_availability IS NOT NULL AND out_of_scope_product IS NULL) OR (scope = 'out_of_scope' AND family IS NULL AND product_id IS NULL AND out_of_scope_product IS NOT NULL AND rate_availability IS NULL) OR (scope = 'unknown' AND family IS NULL AND product_id IS NULL AND out_of_scope_product IS NULL AND (rate_availability IS NULL OR rate_availability = 'unknown'))",  # noqa: E501
+            "(scope = 'in_scope' AND family IS NOT NULL AND rate_availability IS NOT NULL AND out_of_scope_product IS NULL) OR (scope = 'out_of_scope' AND family IS NULL AND product_id IS NULL AND out_of_scope_product IS NOT NULL AND rate_availability IS NULL) OR (scope = 'unknown' AND family IS NULL AND product_id IS NULL AND out_of_scope_product IS NULL AND (rate_availability IS NULL OR rate_availability = 'unknown'))",
             name="ck_product_findings_scope",
         ),
         sa.CheckConstraint(
             "family IN ('mortgage', 'home_equity_loan', 'heloc')", name="ck_product_findings_family"
         ),
         sa.CheckConstraint(
-            "out_of_scope_product IN ('vehicle', 'unsecured_personal', 'construction', 'renovation', 'land', 'reverse_mortgage', 'commercial', 'deposit', 'other_consumer')",  # noqa: E501
+            "out_of_scope_product IN ('vehicle', 'unsecured_personal', 'construction', 'renovation', 'land', 'reverse_mortgage', 'commercial', 'deposit', 'other_consumer')",
             name="ck_product_findings_out_of_scope_product",
         ),
         sa.CheckConstraint(
-            "rate_availability IN ('public_rate', 'quote_only', 'login_required', 'blocked', 'no_public_rate', 'not_offered', 'unknown')",  # noqa: E501
+            "rate_availability IN ('public_rate', 'quote_only', 'login_required', 'blocked', 'no_public_rate', 'not_offered', 'unknown')",
             name="ck_product_findings_rate_availability",
         ),
         sa.CheckConstraint(
@@ -451,7 +758,7 @@ def upgrade() -> None:
         sa.Column("candidate_count", sa.Integer(), nullable=False),
         sa.Column("error", sa.Text(), nullable=True),
         sa.CheckConstraint(
-            "(status = 'succeeded' AND error IS NULL) OR (status IN ('failed', 'blocked') AND error IS NOT NULL AND candidate_count = 0)",  # noqa: E501
+            "(status = 'succeeded' AND error IS NULL) OR (status IN ('failed', 'blocked') AND error IS NOT NULL AND candidate_count = 0)",
             name="ck_extraction_runs_error",
         ),
         sa.CheckConstraint(
@@ -683,11 +990,11 @@ def upgrade() -> None:
         sa.Column("published_at", cu_rates.db.types.UtcDateTime(), nullable=True),
         sa.Column("valid_until", cu_rates.db.types.UtcDateTime(), nullable=True),
         sa.CheckConstraint(
-            "scenario_id IN ('purchase_30y_fixed', 'rate_term_refi_30y_fixed', 'fixed_home_equity_10y', 'heloc')",  # noqa: E501
+            "scenario_id IN ('purchase_30y_fixed', 'rate_term_refi_30y_fixed', 'fixed_home_equity_10y', 'heloc')",
             name="ck_normalized_offers_scenario_id",
         ),
         sa.CheckConstraint(
-            "status IN ('candidate', 'quarantined', 'approved', 'published', 'withdrawn', 'superseded')",  # noqa: E501
+            "status IN ('candidate', 'quarantined', 'approved', 'published', 'withdrawn', 'superseded')",
             name="ck_normalized_offers_status",
         ),
         sa.CheckConstraint(
@@ -715,15 +1022,15 @@ def upgrade() -> None:
             name="ck_normalized_offers_valid_until",
         ),
         sa.CheckConstraint(
-            "note_rate IS NULL OR lower(note_rate) NOT IN ('nan', '-nan', '+nan', 'inf', '-inf', '+inf', 'infinity', '-infinity', '+infinity', 'snan', '-snan', '+snan')",  # noqa: E501
+            "note_rate IS NULL OR lower(note_rate) NOT IN ('nan', '-nan', '+nan', 'inf', '-inf', '+inf', 'infinity', '-infinity', '+infinity', 'snan', '-snan', '+snan')",
             name="ck_normalized_offers_note_rate_finite",
         ),
         sa.CheckConstraint(
-            "apr IS NULL OR lower(apr) NOT IN ('nan', '-nan', '+nan', 'inf', '-inf', '+inf', 'infinity', '-infinity', '+infinity', 'snan', '-snan', '+snan')",  # noqa: E501
+            "apr IS NULL OR lower(apr) NOT IN ('nan', '-nan', '+nan', 'inf', '-inf', '+inf', 'infinity', '-infinity', '+infinity', 'snan', '-snan', '+snan')",
             name="ck_normalized_offers_apr_finite",
         ),
         sa.CheckConstraint(
-            "points IS NULL OR lower(points) NOT IN ('nan', '-nan', '+nan', 'inf', '-inf', '+inf', 'infinity', '-infinity', '+infinity', 'snan', '-snan', '+snan')",  # noqa: E501
+            "points IS NULL OR lower(points) NOT IN ('nan', '-nan', '+nan', 'inf', '-inf', '+inf', 'infinity', '-infinity', '+infinity', 'snan', '-snan', '+snan')",
             name="ck_normalized_offers_points_finite",
         ),
         sa.CheckConstraint(
