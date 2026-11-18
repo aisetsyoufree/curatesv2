@@ -20,6 +20,7 @@ from cu_rates.contracts.base import (
     Text,
     UtcDatetime,
     VersionedModel,
+    contract_arithmetic,
 )
 from cu_rates.contracts.enums import (
     CanonicalScenarioId,
@@ -319,9 +320,10 @@ class HelocDetails(ContractModel):
         )
         if missing or index is None or margin is None or floor is None:
             return None, missing
-        rate = max(index.value + margin.value, floor.value)
-        if self.ceiling is not None:
-            rate = min(rate, self.ceiling.value)
+        with contract_arithmetic():
+            rate = max(index.value + margin.value, floor.value)
+            if self.ceiling is not None:
+                rate = min(rate, self.ceiling.value)
         if rate > 100:
             return None, ("derived_rate_out_of_range",)
         return rate, ()

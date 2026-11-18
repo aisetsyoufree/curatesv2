@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime
+from decimal import Decimal
 from typing import Literal, Self
 
 from pydantic import JsonValue, model_validator
@@ -21,6 +22,7 @@ from cu_rates.contracts.base import (
     SignedPercent,
     Text,
     UtcDatetime,
+    contract_arithmetic,
 )
 from cu_rates.contracts.enums import (
     CanonicalScenarioId,
@@ -105,6 +107,15 @@ def public_evidence_sha256(
     return hashlib.sha256(
         ("public-publication-evidence-v2:" + json.dumps(payload, sort_keys=True)).encode()
     ).hexdigest()
+
+
+def derived_post_intro_rate(
+    index: Decimal, margin: Decimal, floor: Decimal, ceiling: Decimal | None
+) -> Decimal:
+    """``max(index + margin, floor)`` capped by the ceiling, in the fixed contract context."""
+    with contract_arithmetic():
+        rate = max(index + margin, floor)
+        return rate if ceiling is None else min(rate, ceiling)
 
 
 def require_ranked_assumptions(
@@ -203,10 +214,9 @@ class PublicOffer(ContractModel):
                     or not self.details.get("index_name")
                 ):
                     raise ValueError("HELOC derivation requires all sourced inputs")
-                expected = max(index + margin, floor)
-                ceiling = rates.get("details.ceiling")
-                if ceiling is not None:
-                    expected = min(expected, ceiling)
+                expected = derived_post_intro_rate(
+                    index, margin, floor, rates.get("details.ceiling")
+                )
             if post_intro != expected:
                 raise ValueError("HELOC post-intro value does not match its sourced inputs")
         if self.placement is Placement.RANKED:

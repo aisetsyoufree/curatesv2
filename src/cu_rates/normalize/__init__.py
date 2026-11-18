@@ -7,7 +7,7 @@ encode why a nullable field is empty or link evidence to a scenario dimension.
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from decimal import Context, Decimal, localcontext
+from decimal import Decimal
 from enum import StrEnum
 from typing import cast
 
@@ -19,6 +19,7 @@ from cu_rates.contracts.base import (
     ContractModel,
     Identifier,
     UtcDatetime,
+    contract_arithmetic,
 )
 from cu_rates.contracts.enums import (
     CanonicalScenarioId,
@@ -685,7 +686,7 @@ def _make_offer(
 
 
 def _check_heloc_formula(details: HelocDetails) -> None:
-    with localcontext(Context(prec=28)):
+    with contract_arithmetic():
         if "derived_rate_out_of_range" in details.post_intro().missing_inputs:
             raise NormalizationError("details.post_intro_rate", "derived rate is outside bounds")
         stated = details.stated_post_intro_apr
