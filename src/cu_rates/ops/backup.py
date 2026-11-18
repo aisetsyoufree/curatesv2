@@ -1,4 +1,4 @@
-"""Offline-testable backup and restore tooling for the database and artifact store."""
+"""Private, verified recovery bundles for operational and optional publication state."""
 
 import argparse
 import fcntl
@@ -7,12 +7,19 @@ import json
 import os
 import shutil
 import sqlite3
+import stat
 import sys
 import uuid
 from collections.abc import Sequence
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
+
+from cu_rates.contracts.audit import WithdrawalEntry
+from cu_rates.snapshot import Denylist, SnapshotError
+from cu_rates.snapshot._database import read_version, verify_database
+
+_LEDGER_PATHS = frozenset({"independent/denylist.json", "automatic/denylist.json"})
 
 
 class BackupError(Exception):
@@ -54,6 +61,8 @@ def _safe_member(name: object, *, plain: bool = False) -> Path:
         raise BackupError(f"unsafe path in manifest: {name!r}")
     if plain and len(parts) != 1:
         raise BackupError(f"unsafe path in manifest: {name!r}")
+    if path.as_posix() != name:
+        raise BackupError(f"unsafe aliased path in manifest: {name!r}")
     return path
 
 
@@ -72,14 +81,253 @@ def _check_no_symlinks(root: Path) -> None:
                 raise BackupError(f"Symlink file rejected: {p}")
 
 
+def _require_regular(path: Path) -> None:
+    # lstat before resolving, including intermediate components. Never follow an alias
+    # supplied as an optional input or a restore target.
+    if any(parent.is_symlink() for parent in (path, *path.parents)):
+        raise BackupError("Symlink path rejected")
+    try:
+        metadata = path.stat()
+        regular = stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1
+    except OSError as exc:
+        raise BackupError("State file missing or inaccessible") from exc
+    if not regular:
+        raise BackupError("State input is not a regular file")
+
+
+def _sqlite_integrity(path: Path) -> None:
+    try:
+        conn = sqlite3.connect(path.as_uri() + "?immutable=1&mode=ro", uri=True)
+        try:
+            ok = conn.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        # In particular, never include intake data or SQLite diagnostic payloads.
+        raise BackupError("Database integrity check failed") from exc
+    if not ok:
+        raise BackupError("Database integrity check failed")
+
+
+def _backup_sqlite(source: Path, target: Path) -> None:
+    # Pre-create privately: a permissive caller umask must never expose reply contacts.
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(fd)
+    try:
+        src = sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)
+        try:
+            dst = sqlite3.connect(target)
+            try:
+                src.backup(dst)
+                dst.execute("PRAGMA journal_mode=DELETE")
+            finally:
+                dst.close()
+        finally:
+            src.close()
+    except sqlite3.Error as exc:
+        raise BackupError("Database online backup failed") from exc
+    target.chmod(0o600)
+    _sqlite_integrity(target)
+
+
+def _copy_state(source: Path, target: Path, *, sealed: bool = False) -> None:
+    _require_regular(source)
+    before = _sha256_file(source)
+    shutil.copy2(source, target)
+    target.chmod(0o400 if sealed else 0o600)
+    if _sha256_file(target) != before or _sha256_file(source) != before:
+        raise BackupError("State changed or was corrupted during copy")
+
+
+def _state_path(name: object) -> Path:
+    rel = _safe_member(name)
+    if rel.as_posix() in _LEDGER_PATHS | {"intake/intake.sqlite", "snapshots/current.json"}:
+        return rel
+    if (
+        len(rel.parts) == 4
+        and rel.parts[:2] == ("snapshots", "versions")
+        and not rel.parts[2].startswith(".")
+        and rel.parts[3] in {"published.sqlite", "version.json"}
+    ):
+        return rel
+    raise BackupError("unsafe state path in manifest")
+
+
+def _ledger_entries(path: Path) -> dict[str, WithdrawalEntry]:
+    try:
+        return {row.withdrawal_id: row for row in Denylist(path).entries()}
+    except (OSError, SnapshotError, ValueError) as exc:
+        raise BackupError("Withdrawal ledger missing or invalid") from exc
+
+
+def _check_snapshots(root: Path) -> None:
+    try:
+        pointer = read_version(root / "current.json")
+        selected = root / "versions" / _safe_member(pointer.snapshot_id, plain=True)
+        if read_version(selected / "version.json") != pointer:
+            raise BackupError("Snapshot pointer does not match its version")
+        for directory in (root / "versions").iterdir():
+            version = read_version(directory / "version.json")
+            if directory.name != version.snapshot_id:
+                raise BackupError("Snapshot version directory does not match descriptor")
+            verify_database(directory, version)
+    except (OSError, SnapshotError, ValueError) as exc:
+        raise BackupError("Snapshot state missing or invalid") from exc
+
+
+def _create_state(temp: Path, inputs: dict[str, Path]) -> list[dict[str, object]]:
+    names = {
+        "denylist_path": "independent/denylist.json",
+        "automatic_denylist_path": "automatic/denylist.json",
+        "intake_database": "intake/intake.sqlite",
+    }
+    for key, name in names.items():
+        if key not in inputs:
+            continue
+        target = temp / name
+        target.parent.mkdir(mode=0o700)
+        if key == "intake_database":
+            _backup_sqlite(inputs[key], target)
+        else:
+            _copy_state(inputs[key], target)
+            _ledger_entries(target)
+    if "snapshot_root" in inputs:
+        source = inputs["snapshot_root"]
+        _check_no_symlinks(source)
+        _require_regular(source / "current.json")
+        pointer = (source / "current.json").read_bytes()
+        target = temp / "snapshots"
+        target.mkdir(mode=0o700)
+        (target / "versions").mkdir(mode=0o700)
+        # Published versions are immutable. Ignore the publisher lock and uncommitted
+        # .build-* staging directories; they are not activated releases.
+        for directory in sorted((source / "versions").iterdir()):
+            if directory.name.startswith(".build-"):
+                continue
+            if not directory.is_dir():
+                raise BackupError("Unexpected snapshot version member")
+            if {p.name for p in directory.iterdir()} != {"published.sqlite", "version.json"}:
+                raise BackupError("Unexpected file in committed snapshot version")
+            for name in ("published.sqlite", "version.json"):
+                dst = target / "versions" / directory.name / name
+                dst.parent.mkdir(mode=0o700, exist_ok=True)
+                _copy_state(directory / name, dst, sealed=True)
+        _copy_state(source / "current.json", target / "current.json")
+        if (target / "current.json").read_bytes() != pointer or (
+            source / "current.json"
+        ).read_bytes() != pointer:
+            raise BackupError("Snapshot pointer changed during backup; retry")
+        _check_snapshots(target)
+    records = []
+    for path in sorted(temp.rglob("*")):
+        rel = path.relative_to(temp)
+        if path.is_file() and rel.parts[0] in {"independent", "automatic", "intake", "snapshots"}:
+            records.append(
+                {"path": rel.as_posix(), "sha256": _sha256_file(path), "size": path.stat().st_size}
+            )
+    return records
+
+
+def _verify_state(backup: Path, raw: object) -> set[Path]:
+    if not isinstance(raw, list):
+        raise BackupError("Missing state list in manifest")
+    expected: set[Path] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            raise BackupError("Invalid state item in manifest")
+        rel = _state_path(item.get("path"))
+        path = backup / rel
+        if path in expected:
+            raise BackupError("Duplicate state path in manifest")
+        _require_regular(path)
+        if _file_size(path) != item.get("size") or _sha256_file(path) != item.get("sha256"):
+            raise BackupError("State hash or size mismatch")
+        if rel.as_posix() == "intake/intake.sqlite":
+            _sqlite_integrity(path)
+        if rel.as_posix() in _LEDGER_PATHS:
+            _ledger_entries(path)
+        expected.add(path)
+    if any(path.is_relative_to(backup / "snapshots") for path in expected):
+        _check_snapshots(backup / "snapshots")
+    return expected
+
+
+def _restore_ledger_guard(backup: Path, target: Path, *, allow_rollback: bool) -> None:
+    for name in _LEDGER_PATHS:
+        current, saved = target / name, backup / name
+        if not current.exists():
+            continue
+        _require_regular(current)
+        if not saved.is_file():
+            raise BackupError("Existing ledger has no backed-up replacement")
+        if allow_rollback:
+            continue
+        old = _ledger_entries(current)
+        new = _ledger_entries(saved)
+        for key, row in old.items():
+            # A lift may be added in a newer backup, but never removed or changed.
+            # All other withdrawal fields are immutable. Counts/timestamps alone
+            # cannot detect disjoint histories or changed suppression targets.
+            candidate = new.get(key)
+            if candidate is None:
+                raise BackupError(
+                    "Restore would lower withdrawal ledger; explicit rollback required"
+                )
+            # Values are WithdrawalEntry records; avoid dumping them in diagnostics.
+            if row != candidate and (
+                row.lifted_at is not None
+                or row.model_dump(exclude={"lifted_at", "lifted_by"})
+                != candidate.model_dump(exclude={"lifted_at", "lifted_by"})
+            ):
+                raise BackupError(
+                    "Restore would lower withdrawal ledger; explicit rollback required"
+                )
+
+
+def _check_restore_target(
+    backup: Path, target: Path, *, replace_ledgers: bool, allow_rollback: bool
+) -> None:
+    if target.is_symlink() or any(parent.is_symlink() for parent in target.parents):
+        raise BackupError("Symlink restore target rejected")
+    target = target.resolve()
+    if target == backup or target.is_relative_to(backup) or backup.is_relative_to(target):
+        raise BackupError("Restore target cannot overlap backup")
+    if not target.exists():
+        return
+    if not target.is_dir():
+        raise BackupError(f"Target exists and is not a directory: {target}")
+    _check_no_symlinks(target)
+    if not any(target.iterdir()):
+        return
+    if not replace_ledgers:
+        raise BackupError(f"Target directory exists and is non-empty: {target}")
+    for path in target.rglob("*"):
+        rel = path.relative_to(target).as_posix()
+        if not (
+            (path.is_dir() and rel in {"independent", "automatic"})
+            or (
+                path.is_file()
+                and rel
+                in _LEDGER_PATHS
+                | {"independent/.denylist.json.lock", "automatic/.denylist.json.lock"}
+            )
+        ):
+            raise BackupError("Target directory exists and is non-empty beyond ledgers")
+    _restore_ledger_guard(backup, target, allow_rollback=allow_rollback)
+
+
 def create_backup(
     database: Path,
     artifact_root: Path,
     destination: Path,
     *,
     now: datetime,
+    denylist_path: Path | None = None,
+    automatic_denylist_path: Path | None = None,
+    intake_database: Path | None = None,
+    snapshot_root: Path | None = None,
 ) -> Path:
-    """Create an offline-testable backup of the database and artifact store.
+    """Create a private backup, optionally including ledgers, intake and snapshot state.
 
     Parameters
     ----------
@@ -95,6 +343,46 @@ def create_backup(
     database = Path(database).resolve()
     artifact_root = Path(artifact_root).resolve()
     destination = Path(destination).resolve()
+
+    inputs = {
+        key: path.absolute()
+        for key, path in {
+            "denylist_path": denylist_path,
+            "automatic_denylist_path": automatic_denylist_path,
+            "intake_database": intake_database,
+            "snapshot_root": snapshot_root,
+        }.items()
+        if path is not None
+    }
+    try:
+        for key, path in inputs.items():
+            if not path.is_absolute() or any(p.is_symlink() for p in (path, *path.parents)):
+                raise BackupError("Optional input must be an absolute path without symlinks")
+            path = path.resolve()
+            inputs[key] = path
+            root = path if key == "snapshot_root" else path.parent
+            if destination == root or destination.is_relative_to(root):
+                raise BackupError("Destination cannot be inside a state input directory")
+            if key == "snapshot_root":
+                if not path.is_dir():
+                    raise BackupError("Snapshot root does not exist")
+            else:
+                _require_regular(path)
+        files = [database, *(path for key, path in inputs.items() if key != "snapshot_root")]
+        for index, path in enumerate(files):
+            if any(path.samefile(other) for other in files[:index]):
+                raise BackupError("Backup inputs cannot alias each other")
+    except OSError as exc:
+        raise BackupError("State input missing or inaccessible") from exc
+    if database.name in {
+        "manifest.json",
+        "artifacts",
+        "independent",
+        "automatic",
+        "intake",
+        "snapshots",
+    }:
+        raise BackupError("Database filename aliases a reserved backup member")
 
     if not database.is_file():
         raise BackupError(f"Operational database does not exist: {database}")
@@ -133,47 +421,11 @@ def create_backup(
         temp_dir.mkdir(mode=0o700)
 
         try:
-            # 1. Copy database using SQLite online backup API from read-only URI
+            # Both databases use the online API, including committed WAL pages.
             db_filename = database.name
             temp_db_path = temp_dir / db_filename
-            src_uri = f"file:{database.as_posix()}?mode=ro"
-
-            try:
-                src_conn = sqlite3.connect(src_uri, uri=True)
-            except sqlite3.Error as exc:
-                raise BackupError(f"Failed to open source database: {exc}") from exc
-
-            try:
-                dest_conn = sqlite3.connect(temp_db_path.as_posix())
-                try:
-                    src_conn.backup(dest_conn)
-                    dest_conn.execute("PRAGMA journal_mode=DELETE")
-                finally:
-                    dest_conn.close()
-            except sqlite3.Error as exc:
-                raise BackupError(f"Database online backup failed: {exc}") from exc
-            finally:
-                src_conn.close()
-
-            temp_db_path.chmod(0o600)
-
-            # Check integrity of copied database
-            try:
-                check_conn = sqlite3.connect(
-                    f"file:{temp_db_path.as_posix()}?immutable=1&mode=ro", uri=True
-                )
-                try:
-                    cursor = check_conn.cursor()
-                    cursor.execute("PRAGMA integrity_check")
-                    rows = cursor.fetchall()
-                finally:
-                    check_conn.close()
-            except sqlite3.Error as exc:
-                raise BackupError(f"Database integrity check failed: {exc}") from exc
-
-            if len(rows) != 1 or rows[0][0] != "ok":
-                raise BackupError(f"Database integrity check failed: {rows}")
-            integrity_result = rows[0][0]
+            _backup_sqlite(database, temp_db_path)
+            integrity_result = "ok"
 
             db_sha256 = _sha256_file(temp_db_path)
             db_size = _file_size(temp_db_path)
@@ -217,9 +469,10 @@ def create_backup(
 
             artifact_records.sort(key=lambda r: str(r["path"]))
 
-            # 3. Write manifest.json (version 1)
+            state = _create_state(temp_dir, inputs)
+            # Legacy calls remain v1; optional state requires a v2-aware verifier.
             manifest = {
-                "version": 1,
+                "version": 2 if inputs else 1,
                 "created_at": now_utc.isoformat(),
                 "database": {
                     "filename": db_filename,
@@ -230,12 +483,18 @@ def create_backup(
                 },
                 "artifacts": artifact_records,
             }
+            if inputs:
+                manifest["state"] = state
             manifest_path = temp_dir / "manifest.json"
             manifest_path.write_text(
                 json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
             )
             manifest_path.chmod(0o600)
 
+            for directory in temp_dir.rglob("*"):
+                if directory.is_dir():
+                    directory.chmod(0o700)
+            verify_backup(temp_dir)
             # Atomically rename into place
             temp_dir.rename(final_dir)
             _sync_dir(destination)
@@ -282,8 +541,8 @@ def verify_backup(backup_dir: Path) -> None:
     except Exception as exc:
         raise BackupError(f"Failed to parse manifest.json: {exc}") from exc
 
-    if not isinstance(manifest, dict) or manifest.get("version") != 1:
-        raise BackupError(f"Unsupported manifest format or version: {manifest.get('version')}")
+    if not isinstance(manifest, dict) or manifest.get("version") not in {1, 2}:
+        raise BackupError("Unsupported manifest format or version")
 
     db_meta = manifest.get("database")
     if not isinstance(db_meta, dict):
@@ -293,6 +552,11 @@ def verify_backup(backup_dir: Path) -> None:
     if not db_name or not isinstance(db_name, str):
         raise BackupError("Database filename missing in manifest")
     _safe_member(db_name, plain=True)
+    if (
+        db_name in {"manifest.json", "artifacts", "independent", "automatic", "intake", "snapshots"}
+        or db_meta.get("path") != db_name
+    ):
+        raise BackupError("unsafe or aliased database path in manifest")
 
     db_path = backup_dir / db_name
     if db_path.is_symlink():
@@ -367,6 +631,9 @@ def verify_backup(backup_dir: Path) -> None:
 
         expected_files.add(art_path.resolve())
 
+    if manifest["version"] == 2 or "state" in manifest:
+        expected_files.update(_verify_state(backup_dir, manifest.get("state")))
+
     # Reject extra files, missing files, or any symlinks
     for dirpath, dirnames, filenames in os.walk(backup_dir, followlinks=False):
         dp = Path(dirpath)
@@ -386,7 +653,13 @@ def verify_backup(backup_dir: Path) -> None:
                 raise BackupError(f"Extra file rejected in backup: {p}")
 
 
-def restore_backup(backup_dir: Path, target: Path) -> None:
+def restore_backup(
+    backup_dir: Path,
+    target: Path,
+    *,
+    replace_ledgers: bool = False,
+    allow_ledger_rollback: bool = False,
+) -> None:
     """Restore a verified backup into the target path.
 
     Parameters
@@ -394,7 +667,10 @@ def restore_backup(backup_dir: Path, target: Path) -> None:
     backup_dir:
         Path to the backup directory to restore.
     target:
-        Path to the target directory. Must be non-existent or empty.
+        Path to the target directory. Must be non-existent or empty by default.
+        ``replace_ledgers`` permits only surviving ledgers (and writer locks); loss
+        of their history additionally requires ``allow_ledger_rollback``. All writers
+        must be stopped during this offline recovery operation.
 
     Raises
     ------
@@ -402,17 +678,14 @@ def restore_backup(backup_dir: Path, target: Path) -> None:
         If verification fails or target exists and is non-empty.
     """
     backup_dir = Path(backup_dir).resolve()
-    target = Path(target).resolve()
+    target = Path(target).absolute()
 
     # 1. Verify backup first
     verify_backup(backup_dir)
 
-    # 2. Refuse if target exists and is non-empty
-    if target.exists():
-        if not target.is_dir() or target.is_symlink():
-            raise BackupError(f"Target exists and is not a directory: {target}")
-        if any(target.iterdir()):
-            raise BackupError(f"Target directory exists and is non-empty: {target}")
+    _check_restore_target(
+        backup_dir, target, replace_ledgers=replace_ledgers, allow_rollback=allow_ledger_rollback
+    )
 
     target_parent = target.parent
     target_parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -448,6 +721,14 @@ def restore_backup(backup_dir: Path, target: Path) -> None:
             (dst_artifacts / "blobs").mkdir(mode=0o700, exist_ok=True)
             (dst_artifacts / "observations").mkdir(mode=0o700, exist_ok=True)
 
+        # Restore optional state only at fixed, validated paths within staging.
+        for item in manifest.get("state", []):
+            rel = _state_path(item["path"])
+            dst = temp_target / rel
+            dst.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            shutil.copy2(backup_dir / rel, dst)
+            dst.chmod(0o400 if rel.parts[:2] == ("snapshots", "versions") else 0o600)
+
         # Restore manifest
         dst_manifest = temp_target / "manifest.json"
         shutil.copy2(backup_dir / "manifest.json", dst_manifest)
@@ -459,10 +740,26 @@ def restore_backup(backup_dir: Path, target: Path) -> None:
             for d in dirnames:
                 os.chmod(os.path.join(dirpath, d), 0o700)
 
-        # Atomically rename into place
+        verify_backup(temp_target)
+        # Recheck immediately before changing a ledger-only destination. Restore is
+        # offline: stop all ledger writers/readers first, as documented in the runbook.
+        _check_restore_target(
+            backup_dir,
+            target,
+            replace_ledgers=replace_ledgers,
+            allow_rollback=allow_ledger_rollback,
+        )
+        previous = target_parent / f".previous-restore-{uuid.uuid4().hex}"
         if target.exists():
-            target.rmdir()
-        temp_target.rename(target)
+            target.rename(previous)
+        try:
+            temp_target.rename(target)
+        except Exception:
+            if previous.exists():
+                previous.rename(target)
+            raise
+        if previous.exists():
+            shutil.rmtree(previous)
         _sync_dir(target_parent)
         target.chmod(0o700)
 
@@ -586,6 +883,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_create.add_argument("--destination", type=Path, dest="opt_destination")
     p_create.add_argument("--now", type=datetime.fromisoformat, default=None)
 
+    for flag in ("denylist-path", "automatic-denylist-path", "intake-database", "snapshot-root"):
+        p_create.add_argument(f"--{flag}", type=Path)
+
     # verify
     p_verify = subparsers.add_parser("verify", help="Verify a backup")
     p_verify.add_argument("pos_backup_dir", nargs="?", type=Path, help="Backup directory")
@@ -597,6 +897,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_restore.add_argument("pos_target", nargs="?", type=Path, help="Target restore directory")
     p_restore.add_argument("--backup-dir", type=Path, dest="opt_backup_dir")
     p_restore.add_argument("--target", type=Path, dest="opt_target")
+
+    p_restore.add_argument(
+        "--replace-ledgers",
+        action="store_true",
+        help="Permit replacing a target containing only withdrawal ledgers",
+    )
+    p_restore.add_argument(
+        "--allow-ledger-rollback",
+        action="store_true",
+        help="Explicitly permit losing newer withdrawal history",
+    )
 
     # prune
     p_prune = subparsers.add_parser("prune", help="Prune old backups")
@@ -624,7 +935,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise BackupError(f"destination path must be absolute: {destination}")
 
             now = args.now or datetime.now(UTC)
-            res = create_backup(database, artifact_root, destination, now=now)
+            optional = {
+                key: getattr(args, key)
+                for key in (
+                    "denylist_path",
+                    "automatic_denylist_path",
+                    "intake_database",
+                    "snapshot_root",
+                )
+            }
+            if any(path is not None and not path.is_absolute() for path in optional.values()):
+                raise BackupError("Optional input paths must be absolute")
+            res = create_backup(database, artifact_root, destination, now=now, **optional)
             print(f"Created backup: {res}")
 
         elif args.command == "verify":
@@ -647,7 +969,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not target.is_absolute():
                 raise BackupError(f"target path must be absolute: {target}")
 
-            restore_backup(backup_dir, target)
+            restore_backup(
+                backup_dir,
+                target,
+                replace_ledgers=args.replace_ledgers,
+                allow_ledger_rollback=args.allow_ledger_rollback,
+            )
             print(f"Restored backup to: {target}")
 
         elif args.command == "prune":
@@ -669,7 +996,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         return 0
 
-    except BackupError as exc:
+    except (BackupError, OSError) as exc:
         sys.stderr.write(f"BackupError: {exc}\n")
         return 1
 

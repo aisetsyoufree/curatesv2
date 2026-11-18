@@ -1426,9 +1426,11 @@ def test_ops_systemd_backup_and_health_filesystem_paths() -> None:
 
     # The data directory is writable only so SQLite can create the -shm file for a WAL-mode
     # read-only open (see tests/test_ops_wal_readonly.py); the artifact store stays read-only.
-    assert backup_rw == {"/var/lib/cu-rates/backups", "/var/lib/cu-rates/data"}, (
-        f"backup service may write only backups and the WAL side files, got {backup_rw}"
-    )
+    assert backup_rw == {
+        "/var/lib/cu-rates/backups",
+        "/var/lib/cu-rates/data",
+        "/var/lib/cu-rates/intake",
+    }, f"backup service may write only backups and the WAL side files, got {backup_rw}"
     assert "/var/lib/cu-rates/artifacts" in backup_ro
     assert "/var/lib/cu-rates/app" in backup_ro
     assert "/var/lib/cu-rates/artifacts" not in backup_rw
@@ -1440,6 +1442,26 @@ def test_ops_systemd_backup_and_health_filesystem_paths() -> None:
         f"backup service must have exactly 2 ExecStart commands, got {len(backup_exec)}"
     )
     assert "cu_rates.ops.backup create" in backup_exec[0]
+    for flag, path in {
+        "--denylist-path": "/var/lib/cu-rates/independent/denylist.json",
+        "--automatic-denylist-path": "/var/lib/cu-rates/automatic/denylist.json",
+        "--intake-database": "/var/lib/cu-rates/intake/intake.sqlite",
+        "--snapshot-root": "/var/lib/cu-rates/snapshots",
+    }.items():
+        assert f"{flag} {path}" in backup_exec[0]
+    assert {
+        "/var/lib/cu-rates/independent",
+        "/var/lib/cu-rates/automatic",
+        "/var/lib/cu-rates/snapshots",
+    } <= backup_ro
+    assert (
+        not {
+            "/var/lib/cu-rates/independent",
+            "/var/lib/cu-rates/automatic",
+            "/var/lib/cu-rates/snapshots",
+        }
+        & backup_rw
+    )
     assert "/var/lib/cu-rates/data/operational.sqlite" in backup_exec[0]
     assert "/var/lib/cu-rates/artifacts" in backup_exec[0]
     assert "/var/lib/cu-rates/backups" in backup_exec[0]
@@ -1706,3 +1728,17 @@ def test_worker_wiring_is_documented_and_the_worker_unit_is_still_the_disabled_s
     assert "cu_rates.worker_config" not in worker  # the config check is not a way to start it
     readme = (DEPLOY_DIR / "README.md").read_text(encoding="utf-8")
     assert "Worker wiring check" in readme and "read-only" in readme
+
+
+def test_backup_scope_runbook() -> None:
+    readme = (DEPLOY_DIR / "README.md").read_text()
+    for term in (
+        "--denylist-path",
+        "--automatic-denylist-path",
+        "--intake-database",
+        "--snapshot-root",
+        "--replace-ledgers",
+        "--allow-ledger-rollback",
+    ):
+        assert term in readme
+    assert "0600" in readme and "0700" in readme
