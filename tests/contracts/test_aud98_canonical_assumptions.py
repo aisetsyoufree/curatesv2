@@ -10,12 +10,9 @@ count the missing dimension as UNSTATED, the overall result would be MATCHES,
 and the test would fail (the offer would rank when it must not).
 """
 
-import pytest
-
 from cu_rates.contracts import (
     CanonicalScenarioId,
     DimensionMatch,
-    MatchState,
     Placement,
     PublicationOutcome,
     ReasonCode,
@@ -30,7 +27,6 @@ from .factories import (
     heloc_offer,
     matches_all,
     product,
-    provenance,
     purchase_offer,
     refinance_offer,
 )
@@ -52,27 +48,28 @@ def _drop_dimension(
 
 def test_property_value_required_in_purchase_scenario() -> None:
     """PROPERTY_VALUE must be in REQUIRED_DIMENSIONS for purchase."""
-    assert ScenarioDimension.PROPERTY_VALUE in REQUIRED_DIMENSIONS[
-        CanonicalScenarioId.PURCHASE_30Y_FIXED
-    ]
+    assert (
+        ScenarioDimension.PROPERTY_VALUE
+        in REQUIRED_DIMENSIONS[CanonicalScenarioId.PURCHASE_30Y_FIXED]
+    )
 
 
 def test_property_value_required_in_refi_scenario() -> None:
-    assert ScenarioDimension.PROPERTY_VALUE in REQUIRED_DIMENSIONS[
-        CanonicalScenarioId.RATE_TERM_REFI_30Y_FIXED
-    ]
+    assert (
+        ScenarioDimension.PROPERTY_VALUE
+        in REQUIRED_DIMENSIONS[CanonicalScenarioId.RATE_TERM_REFI_30Y_FIXED]
+    )
 
 
 def test_property_value_required_in_home_equity_scenario() -> None:
-    assert ScenarioDimension.PROPERTY_VALUE in REQUIRED_DIMENSIONS[
-        CanonicalScenarioId.FIXED_HOME_EQUITY_10Y
-    ]
+    assert (
+        ScenarioDimension.PROPERTY_VALUE
+        in REQUIRED_DIMENSIONS[CanonicalScenarioId.FIXED_HOME_EQUITY_10Y]
+    )
 
 
 def test_property_value_required_in_heloc_scenario() -> None:
-    assert ScenarioDimension.PROPERTY_VALUE in REQUIRED_DIMENSIONS[
-        CanonicalScenarioId.HELOC
-    ]
+    assert ScenarioDimension.PROPERTY_VALUE in REQUIRED_DIMENSIONS[CanonicalScenarioId.HELOC]
 
 
 # ---------------------------------------------------------------------------
@@ -81,15 +78,14 @@ def test_property_value_required_in_heloc_scenario() -> None:
 
 
 def test_autopay_required_in_purchase_scenario() -> None:
-    assert ScenarioDimension.AUTOPAY in REQUIRED_DIMENSIONS[
-        CanonicalScenarioId.PURCHASE_30Y_FIXED
-    ]
+    assert ScenarioDimension.AUTOPAY in REQUIRED_DIMENSIONS[CanonicalScenarioId.PURCHASE_30Y_FIXED]
 
 
 def test_autopay_required_in_refi_scenario() -> None:
-    assert ScenarioDimension.AUTOPAY in REQUIRED_DIMENSIONS[
-        CanonicalScenarioId.RATE_TERM_REFI_30Y_FIXED
-    ]
+    assert (
+        ScenarioDimension.AUTOPAY
+        in REQUIRED_DIMENSIONS[CanonicalScenarioId.RATE_TERM_REFI_30Y_FIXED]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -98,15 +94,14 @@ def test_autopay_required_in_refi_scenario() -> None:
 
 
 def test_first_lien_balance_required_in_home_equity_scenario() -> None:
-    assert ScenarioDimension.FIRST_LIEN_BALANCE in REQUIRED_DIMENSIONS[
-        CanonicalScenarioId.FIXED_HOME_EQUITY_10Y
-    ]
+    assert (
+        ScenarioDimension.FIRST_LIEN_BALANCE
+        in REQUIRED_DIMENSIONS[CanonicalScenarioId.FIXED_HOME_EQUITY_10Y]
+    )
 
 
 def test_first_lien_balance_required_in_heloc_scenario() -> None:
-    assert ScenarioDimension.FIRST_LIEN_BALANCE in REQUIRED_DIMENSIONS[
-        CanonicalScenarioId.HELOC
-    ]
+    assert ScenarioDimension.FIRST_LIEN_BALANCE in REQUIRED_DIMENSIONS[CanonicalScenarioId.HELOC]
 
 
 # ---------------------------------------------------------------------------

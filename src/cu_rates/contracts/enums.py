@@ -150,7 +150,7 @@ class ScenarioDimension(StrEnum):
     CASH_OUT = "cash_out"
     RELATIONSHIP_DISCOUNT = "relationship_discount"
     PROPERTY_VALUE = "property_value"
-    AUTOPAY = "autopay"
+    AUTOPAY = "autopay_discount"
     FIRST_LIEN_BALANCE = "first_lien_balance"
 
 

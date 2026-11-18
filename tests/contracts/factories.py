@@ -365,12 +365,12 @@ def matches_all(scenario_id: CanonicalScenarioId) -> tuple[DimensionMatch, ...]:
         DimensionMatch(
             dimension=dimension,
             state=MatchState.MATCHES,
-            source_text=texts[dimension],
+            source_text=text,
             stated=matching_statement(scenario, dimension),
-            provenance=provenance(texts[dimension]),
+            provenance=provenance(text),
         )
         for dimension in sorted(REQUIRED_DIMENSIONS[scenario_id])
-        if texts.get(dimension) is not None
+        if (text := texts.get(dimension)) is not None
     )
 
 

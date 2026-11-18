@@ -1,5 +1,5 @@
 """Extend verified_scenario_statements.dimension CHECK to include the three new
-canonical scenario dimensions: property_value, autopay, first_lien_balance.
+canonical scenario dimensions: property_value, autopay_discount, first_lien_balance.
 
 These dimensions were added to ScenarioDimension (issue #98 / AUD7-8) so that
 publication can require source-stated evidence for every canonical assumption.
@@ -17,10 +17,7 @@ Create Date: 2026-11-17
 
 from collections.abc import Sequence
 
-import sqlalchemy as sa
 from alembic import op
-
-import cu_rates.db.types
 
 revision: str = "aud98_canonical_dimensions"
 down_revision: str | None = "aud73_unique_guards"
@@ -33,13 +30,20 @@ _PK = "statement_id"
 _TRIGGER_ACTIONS = ("update", "delete", "replace")
 
 _OLD_DIMENSIONS = (
-    "occupancy", "property_type", "rate_type", "term_months",
-    "ltv", "cltv", "loan_amount", "credit_score", "lock_days",
-    "points", "cash_out", "relationship_discount",
+    "occupancy",
+    "property_type",
+    "rate_type",
+    "term_months",
+    "ltv",
+    "cltv",
+    "loan_amount",
+    "credit_score",
+    "lock_days",
+    "points",
+    "cash_out",
+    "relationship_discount",
 )
-_NEW_DIMENSIONS = _OLD_DIMENSIONS + (
-    "property_value", "autopay", "first_lien_balance",
-)
+_NEW_DIMENSIONS = (*_OLD_DIMENSIONS, "property_value", "autopay_discount", "first_lien_balance")
 
 _CK_OLD = "ck_verified_scenario_statements_dimension"
 _CK_NEW = "ck_verified_scenario_statements_dimension"
