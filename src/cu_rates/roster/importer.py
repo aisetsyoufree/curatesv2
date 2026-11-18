@@ -252,10 +252,15 @@ class RosterImporter:
             )
 
         required = {
-            self._mapping.charter_number,
-            self._mapping.legal_name,
-            self._mapping.state,
-            self._mapping.status,
+            name
+            for name in (
+                self._mapping.charter_number,
+                self._mapping.legal_name,
+                self._mapping.state,
+                self._mapping.status,
+                self._mapping.source_as_of_date,
+            )
+            if name is not None
         }
         if not required.issubset(headers):
             missing = sorted(required - set(headers))
@@ -823,11 +828,17 @@ def _parse_ma_row(
     legal_name = row.get(mapping.legal_name, "")
     if not legal_name:
         return None, "Missing legal name"
-    raw_status = row.get(mapping.status, "")
-    status = map_institution_status(raw_status)
+    if mapping.status is None:
+        status = mapping.implied_status  # the file lists active institutions only
+        raw_status = ""
+    else:
+        raw_status = row.get(mapping.status, "")
+        status = map_institution_status(raw_status)
     if status is None:
         return None, f"Unrecognized status: {raw_status!r}"
-    raw_successor = row.get(mapping.successor_charter, "")
+    raw_successor = (
+        "" if mapping.successor_charter is None else row.get(mapping.successor_charter, "")
+    )
     successor: int | None = None
     if validate_successor and status is InstitutionStatus.MERGED:
         successor = _optional_charter(raw_successor)
@@ -842,14 +853,19 @@ def _parse_ma_row(
     raw_as_of = row.get(mapping.source_as_of_date, "")
     if not raw_as_of:
         return None, "Missing source as-of date"
-    if _parse_date(raw_as_of) is None:
+    as_of = mapping.iso_date(raw_as_of)
+    if as_of is None or _parse_date(as_of) is None:
         return None, f"Invalid as-of date: {raw_as_of!r}"
-    raw_inactive = row.get(mapping.closure_or_merger_date, "")
+    raw_inactive = (
+        ""
+        if mapping.closure_or_merger_date is None
+        else row.get(mapping.closure_or_merger_date, "")
+    )
     inactive: str | None
     if raw_inactive:
-        if _parse_date(raw_inactive) is None:
+        inactive = mapping.iso_date(raw_inactive)
+        if inactive is None or _parse_date(inactive) is None:
             return None, f"Invalid inactive date: {raw_inactive!r}"
-        inactive = raw_inactive
     else:
         inactive = None
     if status in _UNDATED_STATUSES and inactive is not None:
@@ -864,7 +880,7 @@ def _parse_ma_row(
             successor_charter_number=successor,
             city=row.get(mapping.city, "") or None,
             closure_or_merger_date=inactive,
-            source_as_of_date=raw_as_of,
+            source_as_of_date=as_of,
             raw_dict=row,
         ),
         None,
@@ -938,18 +954,22 @@ def _difference_fields(rows: list[_ParsedRow], mapping: RosterColumnMapping) -> 
     first = rows[0]
     fields: set[str] = set()
     for other in rows[1:]:
-        if other.legal_name != first.legal_name:
-            fields.add(mapping.legal_name)
-        if other.status != first.status:
-            fields.add(mapping.status)
-        if other.successor_charter_number != first.successor_charter_number:
-            fields.add(mapping.successor_charter)
-        if other.city != first.city:
-            fields.add(mapping.city)
-        if other.closure_or_merger_date != first.closure_or_merger_date:
-            fields.add(mapping.closure_or_merger_date)
-        if other.source_as_of_date != first.source_as_of_date:
-            fields.add(mapping.source_as_of_date)
+        for differs, column in (
+            (other.legal_name != first.legal_name, mapping.legal_name),
+            (other.status != first.status, mapping.status),
+            (
+                other.successor_charter_number != first.successor_charter_number,
+                mapping.successor_charter,
+            ),
+            (other.city != first.city, mapping.city),
+            (
+                other.closure_or_merger_date != first.closure_or_merger_date,
+                mapping.closure_or_merger_date,
+            ),
+            (other.source_as_of_date != first.source_as_of_date, mapping.source_as_of_date),
+        ):
+            if differs and column is not None:
+                fields.add(column)
     return tuple(sorted(fields))
 
 
