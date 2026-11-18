@@ -57,9 +57,9 @@
       "media_type": "text/html; charset=utf-8",
       "http_status": 200,
       "fetch_run_id": "t014-athol-style-dated",
-      "artifact_id": "61e8fd3cb1aee1ce5047ea5f30ebf79056a70574f974c737174e1513c8a94691",
+      "artifact_id": "b35c4d16e18cd36a21a30aaec89681ec3153bde37234ec8f0088e70ca3d3a7af",
       "byte_length": 1736,
-      "effective_at": "2026-11-16T14:00:00Z",
+      "effective_at": "2026-11-16T09:00:00Z",
       "page_kind": "static_mortgage_rate_table",
       "rows": [
         {
@@ -88,7 +88,7 @@
         }
       ],
       "evidence_phrases": [
-        "2026-11-16T14:00:00Z",
+        "2026-11-16T09:00:00Z",
         "id=\"purchase-30-year\"",
         "6.375%",
         "6.441%",

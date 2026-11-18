@@ -34,7 +34,7 @@ def reviewed_fixture(root: Path) -> SliceRun:
         original_run = next(
             r for r in first.context.fetch_runs if r.run_id == original.fetch_run_id
         )
-        earlier = original.fetched_at - timedelta(minutes=1)
+        earlier = original.fetched_at - timedelta(hours=4)  # D-20: spacing of at least 3 hours
         # Authored whitespace variation gives a second actual stored body; the parser
         # checks the same financial facts independently in both captured documents.
         artifact = run.store.put(

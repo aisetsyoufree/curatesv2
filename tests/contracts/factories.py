@@ -134,7 +134,7 @@ def corroborating_path(
     value: str | Decimal = "6.125",
     artifact_id: str = ARTIFACT_ID_2,
     capture_id: str = "fetch-002",
-    observed_at: datetime = T0 - timedelta(hours=1),
+    observed_at: datetime = T0 - timedelta(hours=4),
     product_id: str = PRODUCT_ID,
     scenario_id: CanonicalScenarioId | None = CanonicalScenarioId.PURCHASE_30Y_FIXED,
     source_class: str = "html",
@@ -177,13 +177,13 @@ def fixture_captures() -> tuple[tuple[RawArtifact, FetchRun], ...]:
             raw_artifact(
                 artifact_id=ARTIFACT_ID_2,
                 fetch_run_id="fetch-002",
-                fetched_at=T0 - timedelta(hours=1),
+                fetched_at=T0 - timedelta(hours=4),
             ),
             fetch_run(
                 ARTIFACT_ID_2,
                 run_id="fetch-002",
-                started_at=T0 - timedelta(hours=1, minutes=1),
-                finished_at=T0 - timedelta(minutes=59),
+                started_at=T0 - timedelta(hours=4, minutes=1),
+                finished_at=T0 - timedelta(hours=3, minutes=59),
             ),
         ),
     )

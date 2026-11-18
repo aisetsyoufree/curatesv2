@@ -37,6 +37,7 @@ from cu_rates.contracts.fingerprints import OfferFingerprints, RateValue, value_
 from cu_rates.contracts.offers import TierBound
 from cu_rates.contracts.publication import (
     AUTHORITATIVE_SOURCE_CLASSES,
+    DUAL_EVIDENCE_MIN_SPACING,
     DUAL_EVIDENCE_TIME_WINDOW,
     Placement,
 )
@@ -245,9 +246,10 @@ class PublicOffer(ContractModel):
                 raise ValueError("publication evidence is not bound to the public value")
         for path in values:
             pair = [p for p in paths if p.path == path]
-            if len(pair) != 2 or any(
-                getattr(pair[0], key) == getattr(pair[1], key)
-                for key in ("artifact_id", "content_sha256", "capture_id", "observed_at")
+            if (
+                len(pair) != 2
+                or pair[0].capture_id == pair[1].capture_id  # D-20: separate fetches
+                or abs(pair[0].observed_at - pair[1].observed_at) < DUAL_EVIDENCE_MIN_SPACING
             ):
                 raise ValueError("public value requires two independent evidence paths")
         return admission

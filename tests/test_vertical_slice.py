@@ -174,7 +174,7 @@ def test_dated_review_then_verified_304_rank_only_30y(tmp_path: Path) -> None:
     assert original.effective_at is not None
     assert original.effective_at < original.observed_at
     assert any(
-        claim_text(run.store, p) == "2026-11-16T14:00:00Z" for p in original.iter_provenance()
+        claim_text(run.store, p) == "2026-11-16T09:00:00Z" for p in original.iter_provenance()
     )
     assert all(claim_text(run.store, p) == p.source_text for p in original.iter_provenance())
     view = _view(run)
