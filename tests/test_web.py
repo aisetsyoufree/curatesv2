@@ -2614,7 +2614,7 @@ def test_compare_reads_a_snapshot_admitted_from_persisted_pipeline_evidence(tmp_
     manifest = pilot.reviewed_snapshot.model_copy(
         update={"snapshot_id": "web-verified", "supersedes": None}
     )
-    publisher = SnapshotPublisher(tmp_path / "snapshots")
+    publisher = SnapshotPublisher(tmp_path / "snapshots", allow_fixture=True)
     engine = open_operational_database(pilot.database)
     with engine.connect() as conn:
         publisher.build(manifest, conn=conn, store=pilot.store)

@@ -79,8 +79,23 @@ class SnapshotCandidate(ContractModel):
     current_review: ReviewDecision | None = None
 
 
+_RESERVED_SUFFIXES = (".example", ".test", ".invalid", ".localhost")
+
+
+def _reject_fixture_source(url: str) -> None:
+    """Synthetic fixture sources (reserved TLDs, RFC 2606) can never reach a public snapshot."""
+    host = (urlsplit(url).hostname or "").rstrip(".").lower()
+    if host.endswith(_RESERVED_SUFFIXES) or host in {"example", "test", "localhost"}:
+        raise SnapshotError(f"fixture or reserved source host refused for publication: {host}")
+
+
 def _load_candidate(
-    conn: Connection, store: ArtifactStore, offer_id: str, manifest: PublishedSnapshot
+    conn: Connection,
+    store: ArtifactStore,
+    offer_id: str,
+    manifest: PublishedSnapshot,
+    *,
+    allow_fixture: bool = False,
 ) -> SnapshotCandidate:
     view = load_publication_context(conn, offer_id, manifest.published_at, store=store)
     # The trusted loader re-verifies every separately persisted capture against its
@@ -101,6 +116,8 @@ def _load_candidate(
     if primary is None:
         # T045 does not accept a refreshed 304 observation in place of a direct capture.
         raise SnapshotError(f"T045 refused offer without a direct stored capture: {offer_id}")
+    if not allow_fixture:
+        _reject_fixture_source(view.context.source.url)
     candidates, _ = verified_offer_candidates(
         view.context.source, view.offer, store.read(primary), primary
     )
@@ -306,8 +323,10 @@ class SnapshotPublisher:
     Failed admission, staging, or verification never changes the current pointer.
     """
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, allow_fixture: bool = False) -> None:
+        """`allow_fixture` is for synthetic-slice tests only."""
         self.root = root.absolute()
+        self._allow_fixture = allow_fixture
 
     def _activate(self, version: Version) -> None:
         atomic_write(self.root / POINTER, version.model_dump_json().encode(), mode=0o644)
@@ -333,7 +352,16 @@ class SnapshotPublisher:
             offers = tuple(
                 sorted(
                     (
-                        _admit(_load_candidate(conn, store, entry.offer_id, manifest), manifest)
+                        _admit(
+                            _load_candidate(
+                                conn,
+                                store,
+                                entry.offer_id,
+                                manifest,
+                                allow_fixture=self._allow_fixture,
+                            ),
+                            manifest,
+                        )
                         for entry in manifest.entries
                     ),
                     key=lambda o: o.offer_id,
