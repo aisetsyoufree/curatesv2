@@ -87,3 +87,42 @@ def test_the_new_tables_enforce_their_checks_and_foreign_keys(tmp_path: Path) ->
                 f"INSERT INTO institution_identity_reviews {columns} "
                 f"VALUES ('r', '1.0', {charter}, 'n', 2, 1, 'x', '2026-01-01T00:00:00Z', 'y')"
             )
+
+
+def _insert_dummy_row(raw: sqlite3.Connection, table: str) -> None:
+    """Populate one row of arbitrary content (FKs off) to prove the guard keys on row count."""
+    raw.execute("PRAGMA foreign_keys=OFF")
+    raw.execute("PRAGMA ignore_check_constraints=ON")
+    columns = [c for c in raw.execute(f"PRAGMA table_info({table})") if c[3] or c[5]]
+    names = ", ".join(c[1] for c in columns)
+    values = ", ".join("1" if "INT" in (c[2] or "").upper() else "'x'" for c in columns)
+    raw.execute(f"INSERT INTO {table} ({names}) VALUES ({values})")
+    raw.commit()
+
+
+@pytest.mark.parametrize("table", NEW_TABLES)
+def test_downgrade_refuses_while_identity_reviews_exist(tmp_path: Path, table: str) -> None:
+    path = tmp_path / "history.sqlite"
+    _deployed(path)
+    upgrade_database(path)
+    with closing(sqlite3.connect(path)) as raw:
+        _insert_dummy_row(raw, table)
+    with pytest.raises(RuntimeError, match="refusing downgrade of aud94"):
+        downgrade_database(path, PREVIOUS)
+    assert current_revision(path) == REVISION
+    with closing(sqlite3.connect(path)) as raw:
+        assert raw.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize(
+    "table",
+    ("slice_offer_captures", "slice_snapshot_baselines", "verified_scenario_statements"),
+)
+def test_t014_downgrade_refuses_while_trusted_history_exists(tmp_path: Path, table: str) -> None:
+    path = tmp_path / "history.sqlite"
+    upgrade_database(path, "t014_trusted_records")
+    with closing(sqlite3.connect(path)) as raw:
+        _insert_dummy_row(raw, table)
+    with pytest.raises(RuntimeError, match="refusing downgrade of t014"):
+        downgrade_database(path, "t020_roster_import")
+    assert current_revision(path) == "t014_trusted_records"

@@ -168,6 +168,18 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    bind = op.get_bind()
+    for table in (
+        *_SLICE_TABLES,
+        *_NEW_TABLES,
+        "verified_scenario_conditions",
+        "verified_scenario_statements",
+    ):
+        if int(bind.exec_driver_sql(f"SELECT COUNT(*) FROM {table}").scalar_one()) > 0:
+            raise RuntimeError(
+                f"refusing downgrade of t014_trusted_records while {table} holds rows: "
+                "append-only captures, snapshots and baselines must not be dropped"
+            )
     _triggers(_SLICE_TABLES, present=False)
     for table in reversed(_SLICE_TABLES):
         op.drop_table(table)

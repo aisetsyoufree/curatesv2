@@ -106,6 +106,13 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    bind = op.get_bind()
+    for table in ("institution_identity_reviews", "institution_identity_evidence"):
+        if int(bind.exec_driver_sql(f"SELECT COUNT(*) FROM {table}").scalar_one()) > 0:
+            raise RuntimeError(
+                "refusing downgrade of aud94_identity_reviews while human identity reviews "
+                "exist: append-only review history must not be dropped"
+            )
     for name, _ in reversed(_TRIGGERS):
         op.execute(f"DROP TRIGGER IF EXISTS {name}")
     op.execute("DROP TABLE IF EXISTS institution_identity_evidence")
