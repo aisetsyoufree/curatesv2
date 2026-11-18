@@ -48,6 +48,8 @@ _MORTGAGE_DIMENSIONS = frozenset(
         _D.POINTS,
         _D.CASH_OUT,
         _D.RELATIONSHIP_DISCOUNT,
+        _D.PROPERTY_VALUE,
+        _D.AUTOPAY,
     }
 )
 _EQUITY_DIMENSIONS = frozenset(
@@ -59,6 +61,8 @@ _EQUITY_DIMENSIONS = frozenset(
         _D.LOAN_AMOUNT,
         _D.CREDIT_SCORE,
         _D.RELATIONSHIP_DISCOUNT,
+        _D.PROPERTY_VALUE,
+        _D.FIRST_LIEN_BALANCE,
     }
 )
 _HELOC_DIMENSIONS = _EQUITY_DIMENSIONS - {_D.TERM_MONTHS}
@@ -251,6 +255,12 @@ _EXPLICIT_TOKENS: Mapping[ScenarioDimension, Mapping[str, str]] = {
         "no relationship discount": "no",
         "relationship discount required": "yes",
     },
+    _D.AUTOPAY: {
+        "no autopay discount": "no",
+        "no autopay": "no",
+        "autopay discount required": "yes",
+        "autopay required": "yes",
+    },
 }
 
 
@@ -277,6 +287,8 @@ def _dimension_number(text: str, dimension: ScenarioDimension) -> Decimal | None
         _D.CREDIT_SCORE: (r"([0-9]{3})", 300, 850),
         _D.LOCK_DAYS: (r"([0-9]{1,3})[ -]days?(?: lock)?", 1, 366),
         _D.POINTS: (rf"({_NUM})(?:\s*%|\s+points?)?", 0, 10),
+        _D.PROPERTY_VALUE: (rf"(?:\$\s*|usd\s+)({_MONEY})", 0, 999_999_999_999),
+        _D.FIRST_LIEN_BALANCE: (rf"(?:\$\s*|usd\s+)({_MONEY})", 0, 999_999_999_999),
     }
     spec = patterns.get(dimension)
     if spec is None:
@@ -371,6 +383,10 @@ def expected_dimension_number(
         raw = scenario.lock_days
     elif dimension is _D.POINTS:
         raw = scenario.points
+    elif dimension is _D.PROPERTY_VALUE:
+        raw = scenario.property_value
+    elif dimension is _D.FIRST_LIEN_BALANCE:
+        raw = scenario.first_lien_balance
     else:
         return None
     if isinstance(raw, Decimal):
@@ -398,6 +414,8 @@ def expected_dimension_token(
         return "no"
     if dimension is _D.RELATIONSHIP_DISCOUNT:
         return "yes" if scenario.relationship_discount_applied else "no"
+    if dimension is _D.AUTOPAY:
+        return "yes" if scenario.autopay_discount_applied else "no"
     return None
 
 
