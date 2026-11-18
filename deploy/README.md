@@ -291,6 +291,10 @@ Procedure:
    `SnapshotPublisher.rollback()` verifies the retained snapshot database and version descriptor in `/var/lib/cu-rates/snapshots/versions/<snapshot_id>` before atomically activating it by writing `/var/lib/cu-rates/snapshots/current.json`.
 2. The web application dynamically re-reads the snapshot version from `current.json` on request without requiring a service restart.
 
+### Worker wiring check (issue #115)
+
+Nothing starts the worker, and `cu-rates-worker.service` remains the disabled stub. `python -m cu_rates.worker_config check` (as the service user, with the settings from `env.example` in the environment) is a **read-only** check that every path the worker will need exists and is sane: the operational database opens, the terms ledger and both denylists parse, the state and artifact directories are private, and the operator and automatic ledgers are separate files in separate directories. It creates nothing and prints JSON; exit status 1 means something is missing or invalid. The terms ledger is written only by the operator (`TermsLedger.record`), never by the worker.
+
 ### Automatic suppression ledger (issue #118)
 
 The independent denylist above is **operator-owned**: the collection worker can only read it. When a source blocks or challenges the (currently masked) worker, the worker records the suppression in a **separate ledger it owns**, `/var/lib/cu-rates/automatic/denylist.json` (`AUTOMATIC_DENYLIST_PATH`). The public site enforces **both** ledgers, and once `AUTOMATIC_DENYLIST_PATH` is set a missing or invalid automatic ledger blocks public reads (fail closed), so create it once, as the service user, before setting the variable:
