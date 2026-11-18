@@ -15,7 +15,7 @@ import io
 import re
 from collections import defaultdict
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -57,7 +57,7 @@ _UNDATED_STATUSES = frozenset(
     }
 )
 # Statuses that make an institution ineligible for publication.  A roster
-# import transitioning an institution *into* one of these clears eligibility
+# import reporting an institution in one of these clears eligibility
 # and suppresses existing offers pending human reconciliation.
 _INELIGIBLE_STATUSES = frozenset(
     {
@@ -147,6 +147,7 @@ class _Classified:
     rejected: list[DuplicateConflict] = field(default_factory=list)
     valid_rows: list[tuple[Institution, _ParsedRow]] = field(default_factory=list)
     unresolved_charters: set[int] = field(default_factory=set)
+    inactive_rows: dict[int, _ParsedRow] = field(default_factory=dict)
     file_as_of: str | None = None
     errors: tuple[str, ...] = ()
 
@@ -219,9 +220,6 @@ class RosterImporter:
         existing = self._existing_import(
             conn, artifact_id, raw_bytes, source_version, source_as_of_date
         )
-        if existing is not None:
-            return existing
-
         now = self._clock()
         if len(raw_bytes) > MAX_ROSTER_BYTES:
             return _rejected(
@@ -282,15 +280,16 @@ class RosterImporter:
         if file_as_of is None:
             raise ValueError("source_as_of_date is required when the file states no as-of date")
 
-        import_id = f"roster-import-{uuid4().hex}"
-        self._store.put(
-            raw_bytes,
-            media_type="text/csv; charset=utf-8",
-            source_url=self._source_url,
-            fetched_at=now,
-            http_status=200,
-            fetch_run_id=import_id,
-        )
+        import_id = existing.import_id if existing else f"roster-import-{uuid4().hex}"
+        if existing is None:
+            self._store.put(
+                raw_bytes,
+                media_type="text/csv; charset=utf-8",
+                source_url=self._source_url,
+                fetched_at=now,
+                http_status=200,
+                fetch_run_id=import_id,
+            )
 
         latest_dates = conn.execute(select(roster_imports.c.source_as_of_date)).scalars().all()
         latest_as_of = max(latest_dates) if latest_dates else None
@@ -313,18 +312,19 @@ class RosterImporter:
             ).all()
         }
 
-        conn.execute(
-            insert(roster_imports).values(
-                import_id=import_id,
-                schema_version=CONTRACT_VERSION,
-                source_version=source_version,
-                source_as_of_date=file_as_of,
-                retrieved_at=now,
-                artifact_id=artifact_id,
-                row_count=parsed.total_rows,
-                imported_count=len(parsed.valid_rows),
+        if existing is None:
+            conn.execute(
+                insert(roster_imports).values(
+                    import_id=import_id,
+                    schema_version=CONTRACT_VERSION,
+                    source_version=source_version,
+                    source_as_of_date=file_as_of,
+                    retrieved_at=now,
+                    artifact_id=artifact_id,
+                    row_count=parsed.total_rows,
+                    imported_count=len(parsed.valid_rows),
+                )
             )
-        )
 
         inserted: list[int] = []
         updated: list[int] = []
@@ -335,6 +335,37 @@ class RosterImporter:
         stale: list[int] = []
         suppressed: list[int] = []
         clean: set[int] = set()
+
+        # Inactivity is credible independently of successor identity. Reconcile it
+        # before applying (or rejecting) identity changes, including legacy rows and
+        # exact artifact replays. Stale reports retain their existing no-change guard.
+        valid_charters = {inst.charter_number for inst, _ in parsed.valid_rows}
+        if not stale_file:
+            for charter, row in parsed.inactive_rows.items():
+                if row.source_as_of_date < stored_dates.get(charter, row.source_as_of_date):
+                    continue
+                known = conn.execute(
+                    select(institutions.c.charter_number).where(
+                        institutions.c.charter_number == charter
+                    )
+                ).first()
+                if known is None and charter not in valid_charters:
+                    continue
+                self._suppress(conn, charter, row.status, artifact_id, now)
+                conn.execute(
+                    update(institutions)
+                    .where(institutions.c.charter_number == charter)
+                    .values(charter_verified=0)
+                )
+                suppressed.append(charter)
+                review.append(charter)
+
+        if existing is not None:
+            return replace(
+                existing,
+                suppressed_charters=tuple(suppressed),
+                review_charters=tuple(review),
+            )
 
         for inst, row_item in parsed.valid_rows:
             conn.execute(
@@ -375,56 +406,6 @@ class RosterImporter:
                 or current.status != inst.status.value
                 or current.successor_charter_number != inst.successor_charter_number
             )
-
-            # When a roster file reports an institution as merged, liquidated
-            # or converted, fail closed: clear publication eligibility and
-            # suppress existing offers immediately, regardless of whether the
-            # charter was previously verified.  The institution is routed to
-            # review for human reconciliation; nothing is auto-restored.
-            if (
-                current is not None
-                and inst.status in _INELIGIBLE_STATUSES
-                and current.status != inst.status.value
-            ):
-                was_verified = int(current.charter_verified) == 1
-                conn.execute(
-                    update(institutions)
-                    .where(institutions.c.charter_number == inst.charter_number)
-                    .values(
-                        legal_name=inst.legal_name,
-                        status=inst.status.value,
-                        successor_charter_number=inst.successor_charter_number,
-                        charter_verified=0,
-                    )
-                )
-                # Record an institution-scoped withdrawal to suppress any
-                # published offers at read time.  Lifting requires explicit
-                # human review — nothing is auto-restored.
-                if self._denylist is None:
-                    # Fail closed: never record a merger without the independent
-                    # suppression that the public reader actually enforces.
-                    raise ValueError("a denylist is required to import a merger or closure")
-                insert_withdrawal(
-                    conn,
-                    WithdrawalEntry(
-                        schema_version=CONTRACT_VERSION,
-                        withdrawal_id=f"{import_id}.suppress.{inst.charter_number}",
-                        scope=WithdrawalScope.INSTITUTION,
-                        target_id=str(inst.charter_number),
-                        actor="roster-importer",
-                        withdrawn_at=now,
-                        reason=(
-                            f"Institution {inst.charter_number} status changed to "
-                            f"{inst.status.value} in roster import {import_id}"
-                        ),
-                    ),
-                    denylist=self._denylist,
-                )
-                suppressed.append(inst.charter_number)
-                updated.append(inst.charter_number)
-                if was_verified:
-                    review.append(inst.charter_number)
-                continue
 
             if current is not None and int(current.charter_verified) == 1 and changed:
                 review.append(inst.charter_number)
@@ -494,6 +475,48 @@ class RosterImporter:
             stale_charters=tuple(stale),
             errors=parsed.errors,
         )
+
+    def _suppress(
+        self,
+        conn: Connection,
+        charter: int,
+        status: InstitutionStatus,
+        artifact_id: str,
+        now: datetime,
+    ) -> None:
+        if self._denylist is None:
+            raise ValueError("a denylist is required to import a merger or closure")
+        withdrawal_id = f"roster-{artifact_id}.suppress.{charter}"
+        entries = self._denylist.entries()
+        # A retry must reuse every immutable field, especially the original time.
+        # An existing unlifted suppression also covers a newer roster artifact.
+        entry = next((e for e in entries if e.withdrawal_id == withdrawal_id), None)
+        if entry is None:
+            entry = next(
+                (
+                    e
+                    for e in entries
+                    if e.scope is WithdrawalScope.INSTITUTION
+                    and e.target_id == str(charter)
+                    and e.lifted_at is None
+                    and e.in_force_at(now)
+                ),
+                None,
+            )
+        if entry is None:
+            entry = WithdrawalEntry(
+                schema_version=CONTRACT_VERSION,
+                withdrawal_id=withdrawal_id,
+                scope=WithdrawalScope.INSTITUTION,
+                target_id=str(charter),
+                actor="roster-importer",
+                withdrawn_at=now,
+                reason=(
+                    f"Institution {charter} reported {status.value} "
+                    f"in roster artifact {artifact_id}"
+                ),
+            )
+        insert_withdrawal(conn, entry, denylist=self._denylist)
 
     def _existing_import(
         self,
@@ -671,6 +694,10 @@ def _classify_rows(
                 non_ma.add(charter)
             continue
         result.ma_rows += 1
+        # Successor errors cannot invalidate a credible inactivity report.
+        inactive, _ = _parse_ma_row(row, mapping, line_number, validate_successor=False)
+        if inactive is not None and inactive.status in _INELIGIBLE_STATUSES:
+            result.inactive_rows.setdefault(inactive.charter_number, inactive)
         parsed, reason = _parse_ma_row(row, mapping, line_number)
         if parsed is None:
             result.malformed_rows.append(MalformedRow(line_number, row, reason or "invalid row"))
@@ -719,7 +746,9 @@ def _classify_rows(
             chosen.append(parsed_rows[0])
 
     chosen = _without_bad_successors(chosen, result)
-    dates = {row.source_as_of_date for row in chosen}
+    dates = {row.source_as_of_date for row in chosen} | {
+        row.source_as_of_date for row in result.inactive_rows.values()
+    }
     if declared_as_of is not None and dates and dates != {declared_as_of}:
         result.errors = ("row as-of dates do not match the declared source_as_of_date",)
     elif len(dates) > 1:
@@ -740,7 +769,11 @@ def _classify_rows(
 
 
 def _parse_ma_row(
-    row: dict[str, str], mapping: RosterColumnMapping, line_number: int
+    row: dict[str, str],
+    mapping: RosterColumnMapping,
+    line_number: int,
+    *,
+    validate_successor: bool = True,
 ) -> tuple[_ParsedRow | None, str | None]:
     del line_number
     raw_charter = row.get(mapping.charter_number, "")
@@ -756,7 +789,7 @@ def _parse_ma_row(
         return None, f"Unrecognized status: {raw_status!r}"
     raw_successor = row.get(mapping.successor_charter, "")
     successor: int | None = None
-    if status is InstitutionStatus.MERGED:
+    if validate_successor and status is InstitutionStatus.MERGED:
         successor = _optional_charter(raw_successor)
         if successor is None or successor == charter:
             return None, (
@@ -764,7 +797,7 @@ def _parse_ma_row(
                 if not raw_successor
                 else f"Invalid successor charter {raw_successor!r} for merged institution"
             )
-    elif raw_successor:
+    elif validate_successor and raw_successor:
         return None, f"Non-merged institution cannot have successor charter {raw_successor!r}"
     raw_as_of = row.get(mapping.source_as_of_date, "")
     if not raw_as_of:

@@ -10,7 +10,7 @@ from cu_rates.db import open_operational_database, upgrade_database
 from cu_rates.db.schema import institutions, roster_imports
 from cu_rates.roster import RosterImporter, import_roster
 from cu_rates.roster.importer import MAX_FIELD_LENGTH, MAX_ROSTER_BYTES, MAX_ROSTER_ROWS
-from tests.test_roster_import import FIXTURES_DIR, _database, _store
+from tests.test_roster_import import FIXTURES_DIR, _database, _denylist, _store
 
 FROZEN = datetime(2026, 9, 2, 12, 0, tzinfo=UTC)
 HEADER = "Charter,Credit Union Name,State,Status,City,Date Inactive,Successor Charter,As of Date"
@@ -61,6 +61,7 @@ def test_older_snapshot_does_not_reactivate_a_verified_merger(tmp_path: Path) ->
         newer,
         engine_or_connection=engine,
         artifact_store=store,
+        denylist=_denylist(tmp_path),
         source_version="2026-10-01",
         clock=lambda: FROZEN,
     )
@@ -228,6 +229,7 @@ def test_identical_reimport_checks_stored_evidence(tmp_path: Path) -> None:
         body,
         engine_or_connection=engine,
         artifact_store=store,
+        denylist=_denylist(tmp_path),
         source_version="2026-09-01",
         clock=lambda: FROZEN,
     )
@@ -236,6 +238,7 @@ def test_identical_reimport_checks_stored_evidence(tmp_path: Path) -> None:
             body,
             engine_or_connection=engine,
             artifact_store=store,
+            denylist=_denylist(tmp_path),
             source_version="different-version",
             clock=lambda: FROZEN,
         )
@@ -246,6 +249,7 @@ def test_identical_reimport_checks_stored_evidence(tmp_path: Path) -> None:
             body,
             engine_or_connection=engine,
             artifact_store=store,
+            denylist=_denylist(tmp_path),
             source_version="2026-09-01",
             clock=lambda: FROZEN,
         )
@@ -423,6 +427,7 @@ def test_merger_cycles_and_inactive_dates_are_rejected(tmp_path: Path) -> None:
         ),
         engine_or_connection=engine,
         artifact_store=store,
+        denylist=_denylist(tmp_path),
         source_version="chain",
         clock=lambda: FROZEN,
     )
