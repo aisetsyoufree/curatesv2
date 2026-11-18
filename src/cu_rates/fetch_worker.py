@@ -219,6 +219,7 @@ def _retry_after(headers: httpx.Headers, now: float) -> float:
 
 
 _PROCESS_TOKEN = f"process-{uuid4().hex}"
+_BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
 
 
 def _read_boot_id() -> str:
@@ -229,7 +230,7 @@ def _read_boot_id() -> str:
     earlier boot), but ticks written by this process, or by workers sharing it, are.
     """
     try:
-        text = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+        text = _BOOT_ID_PATH.read_text(encoding="ascii").strip()
     except OSError:
         return _PROCESS_TOKEN
     return text or _PROCESS_TOKEN

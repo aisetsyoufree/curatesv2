@@ -1339,10 +1339,11 @@ def test_wall_clock_politeness_survives_a_reboot(pilot: Pilot) -> None:
 
 
 def test_a_platform_without_a_boot_id_trusts_ticks_only_within_a_process(
-    pilot: Pilot, monkeypatch: pytest.MonkeyPatch
+    pilot: Pilot, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     from cu_rates import fetch_worker
 
+    monkeypatch.setattr(fetch_worker, "_BOOT_ID_PATH", tmp_path / "no-boot-id")  # absent
     monkeypatch.setattr(fetch_worker, "_PROCESS_TOKEN", "process-a")
     a = pilot.worker(ok, monotonic=_uptime(pilot, 9_000_000.0))  # default boot_id: this process
     assert _fetched(a.fetch(pilot.source, pilot.profile))
@@ -1350,3 +1351,18 @@ def test_a_platform_without_a_boot_id_trusts_ticks_only_within_a_process(
     monkeypatch.setattr(fetch_worker, "_PROCESS_TOKEN", "process-b")  # a new process, later
     b = pilot.worker(ok, monotonic=_uptime(pilot, 50.0))
     assert _fetched(b.fetch(pilot.source, pilot.profile))
+
+
+def test_the_boot_identity_is_the_linux_boot_id_when_the_platform_has_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from cu_rates import fetch_worker
+
+    present = tmp_path / "boot_id"
+    present.write_text("3f2c1b9e-0000-4000-8000-123456789abc\n", encoding="ascii")
+    monkeypatch.setattr(fetch_worker, "_BOOT_ID_PATH", present)
+    assert fetch_worker._read_boot_id() == "3f2c1b9e-0000-4000-8000-123456789abc"
+    present.write_text("\n", encoding="ascii")  # empty: fall back rather than trust nothing
+    assert fetch_worker._read_boot_id() == fetch_worker._PROCESS_TOKEN
+    monkeypatch.setattr(fetch_worker, "_BOOT_ID_PATH", tmp_path / "missing")
+    assert fetch_worker._read_boot_id() == fetch_worker._PROCESS_TOKEN
