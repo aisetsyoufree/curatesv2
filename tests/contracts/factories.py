@@ -558,7 +558,9 @@ def identity_review(**overrides: Any) -> InstitutionIdentityReview:
         "legal_name": institution().legal_name,
         "identity_confirmed": True,
         "massachusetts_scope_confirmed": True,
-        "evidence": (provenance("Example Synthetic Credit Union Massachusetts"),),
+        "evidence": (
+            provenance(f"Example Synthetic Credit Union - NCUA charter {CHARTER} - Massachusetts"),
+        ),
         "reviewer": "Sid",
         "decided_at": T0 - timedelta(days=30),
         "rationale": "Charter number, legal name and Massachusetts location match the cited page.",
@@ -735,9 +737,15 @@ def context(
     if "identity_review" not in overrides:
         # By default the review describes the institution this context carries; tests of
         # a stale, mismatched or missing review pass ``identity_review`` explicitly.
+        named = kwargs["institution"]
         kwargs["identity_review"] = identity_review(
-            institution_charter=kwargs["institution"].charter_number,
-            legal_name=kwargs["institution"].legal_name,
+            institution_charter=named.charter_number,
+            legal_name=named.legal_name,
+            evidence=(
+                provenance(
+                    f"{named.legal_name} - NCUA charter {named.charter_number} - Massachusetts"
+                ),
+            ),
         )
     # Most contract tests override the primary record to exercise a separate rule.
     # Keep the explicitly modeled second fixture capture unless paths are supplied

@@ -687,9 +687,14 @@ def _identity_reasons(institution: Institution, ctx: PublicationContext) -> set[
     ):
         return {R.IDENTITY_REVIEW_MISSING}
     reasons: set[ReasonCode] = set()
-    if not review.identity_confirmed or review.legal_name != institution.legal_name:
+    # A review is a human claim; the text it cites must itself say what it claims.
+    if (
+        not review.identity_confirmed
+        or review.legal_name != institution.legal_name
+        or not review.evidence_states_identity
+    ):
         reasons.add(R.IDENTITY_NOT_CONFIRMED)
-    if not review.massachusetts_scope_confirmed:
+    if not review.massachusetts_scope_confirmed or not review.evidence_states_massachusetts:
         reasons.add(R.SCOPE_NOT_CONFIRMED)
     if ctx.evaluated_at - review.decided_at > IDENTITY_REVIEW_MAX_AGE:
         reasons.add(R.IDENTITY_REVIEW_STALE)

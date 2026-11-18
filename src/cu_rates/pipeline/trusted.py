@@ -7,7 +7,7 @@ from datetime import timedelta
 from hashlib import sha256
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.engine import Connection
 
 from cu_rates.artifact_store import ArtifactStore, ArtifactStoreError
@@ -20,7 +20,7 @@ from cu_rates.contracts.audit import (
     snapshot_manifest_sha256,
 )
 from cu_rates.contracts.base import CONTRACT_VERSION, UtcDatetime
-from cu_rates.contracts.enums import OfferStatus, RunStatus
+from cu_rates.contracts.enums import OfferStatus, RunStatus, WithdrawalScope
 from cu_rates.contracts.evidence import HtmlLocator, ParserVersion, Provenance, RawArtifact
 from cu_rates.contracts.fingerprints import (
     OfferFingerprints,
@@ -707,7 +707,22 @@ def _identity_review(
     decided = [r for r in load_identity_reviews(conn, charter) if r.decided_at <= evaluated_at]
     if not decided:
         return None
-    review = decided[0]
+    # Reviews sharing the newest decision time are ordered by nothing meaningful, so an
+    # approval must never hide a rejection decided at the same moment: fail closed.
+    newest = [r for r in decided if r.decided_at == decided[0].decided_at]
+    review = next((r for r in newest if not r.approves), newest[0])
+    # The roster importer clears verification when an institution is reported inactive or
+    # leaves the Massachusetts roster. A review older than that event cannot vouch for it.
+    cleared_at = conn.execute(
+        select(func.max(withdrawal_entries.c.withdrawn_at)).where(
+            withdrawal_entries.c.scope == WithdrawalScope.INSTITUTION.value,
+            withdrawal_entries.c.target_id == str(charter),
+            withdrawal_entries.c.actor == "roster-importer",
+            withdrawal_entries.c.withdrawn_at <= evaluated_at,
+        )
+    ).scalar()
+    if cleared_at is not None and cleared_at > review.decided_at:
+        return None
     try:
         for evidence in review.evidence:
             verify_located_claim(store.read_body(evidence.artifact_id), evidence)

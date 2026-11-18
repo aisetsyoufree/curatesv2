@@ -751,9 +751,16 @@ institution_identity_evidence = Table(
         ForeignKey("institution_identity_reviews.review_id"),
         primary_key=True,
     ),
-    Column("provenance_id", SqlText, ForeignKey("provenance.provenance_id"), primary_key=True),
+    Column("provenance_id", SqlText, primary_key=True),
+    Column("institution_charter", Integer, nullable=False),
     Column("ordinal", Integer, nullable=False),
     CheckConstraint("ordinal >= 0", name="ck_institution_identity_evidence_ordinal"),
+    # Evidence must belong to the SAME institution as the review that cites it.
+    ForeignKeyConstraint(
+        ["institution_charter", "provenance_id"],
+        ["provenance.institution_charter", "provenance.provenance_id"],
+        name="fk_institution_identity_evidence_provenance_institution",
+    ),
 )
 
 withdrawal_entries = Table(

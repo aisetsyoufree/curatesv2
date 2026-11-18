@@ -1,5 +1,6 @@
 """Institutions, membership, providers, source relationships, and product identity."""
 
+import re
 from typing import Annotated, Self
 
 from pydantic import Field, model_validator
@@ -27,6 +28,8 @@ from cu_rates.contracts.enums import (
     SourceRelationshipKind,
 )
 from cu_rates.contracts.evidence import Provenance
+
+_MASSACHUSETTS = re.compile(r"\bmassachusetts\b|\bMA\b", re.IGNORECASE)
 
 
 class Institution(VersionedModel):
@@ -148,3 +151,19 @@ class InstitutionIdentityReview(VersionedModel):
     @property
     def approves(self) -> bool:
         return self.identity_confirmed and self.massachusetts_scope_confirmed
+
+    @property
+    def evidence_states_identity(self) -> bool:
+        """The cited text itself names this charter number and this legal name."""
+        number = re.compile(rf"(?<!\d){self.institution_charter}(?!\d)")
+        name = " ".join(self.legal_name.casefold().split())
+        return any(
+            number.search(item.source_text)
+            and name in " ".join(item.source_text.casefold().split())
+            for item in self.evidence
+        )
+
+    @property
+    def evidence_states_massachusetts(self) -> bool:
+        """The cited text itself places the institution in Massachusetts."""
+        return any(_MASSACHUSETTS.search(item.source_text) for item in self.evidence)

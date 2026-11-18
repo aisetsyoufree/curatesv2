@@ -43,11 +43,14 @@ _TABLES = (
     CREATE TABLE institution_identity_evidence (
         review_id TEXT NOT NULL,
         provenance_id TEXT NOT NULL,
+        institution_charter INTEGER NOT NULL,
         ordinal INTEGER NOT NULL,
         PRIMARY KEY (review_id, provenance_id),
         CONSTRAINT ck_institution_identity_evidence_ordinal CHECK (ordinal >= 0),
-        FOREIGN KEY(review_id) REFERENCES institution_identity_reviews (review_id),
-        FOREIGN KEY(provenance_id) REFERENCES provenance (provenance_id)
+        CONSTRAINT fk_institution_identity_evidence_provenance_institution
+            FOREIGN KEY(institution_charter, provenance_id)
+            REFERENCES provenance (institution_charter, provenance_id),
+        FOREIGN KEY(review_id) REFERENCES institution_identity_reviews (review_id)
     )
     """,
 )

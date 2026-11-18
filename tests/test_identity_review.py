@@ -16,13 +16,16 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from cu_rates.contracts import InstitutionIdentityReview, evaluate_publication
+from cu_rates.contracts.audit import WithdrawalEntry
+from cu_rates.contracts.enums import WithdrawalScope
 from cu_rates.contracts.evidence import HtmlLocator
 from cu_rates.contracts.publication import ReasonCode as R
 from cu_rates.db import open_operational_database
 from cu_rates.db.records import load_identity_reviews, persist_identity_review
 from cu_rates.db.schema import institution_identity_evidence, institution_identity_reviews
 from cu_rates.pipeline.slice import SliceRun, run_fixture
-from cu_rates.pipeline.trusted import TrustedView, load_publication_context
+from cu_rates.pipeline.trusted import TrustedView, insert_withdrawal, load_publication_context
+from cu_rates.snapshot import Denylist
 
 OFFER = "purchase-30-year"
 
@@ -137,7 +140,10 @@ def test_a_stale_review_blocks_publication(run: SliceRun) -> None:
 
 def test_the_database_refuses_reviews_of_nothing_or_backed_by_nothing(run: SliceRun) -> None:
     base = _current(run)
-    with pytest.raises(IntegrityError), open_operational_database(run.database).begin() as conn:
+    with (
+        pytest.raises((IntegrityError, ValueError)),
+        open_operational_database(run.database).begin() as conn,
+    ):
         persist_identity_review(
             conn, base.model_copy(update={"review_id": "r-ghost", "institution_charter": 999})
         )
@@ -176,3 +182,95 @@ def test_identity_reviews_are_append_only(run: SliceRun) -> None:
     with open_operational_database(run.database).connect() as conn:
         assert len(conn.execute(select(institution_identity_reviews)).all()) == 1
         assert len(conn.execute(select(institution_identity_evidence)).all()) == 1
+
+
+def test_a_rejection_decided_at_the_same_moment_is_never_hidden_by_an_approval(
+    run: SliceRun,
+) -> None:
+    """Review HIGH: ties on decided_at must fail closed whatever the review ids sort as."""
+    base = _current(run)
+    for review_id in ("a-first", "zzz-last"):
+        # Same instant: the id order must not decide whether the rejection is seen.
+        review = base.model_copy(
+            update={"review_id": f"tie-{review_id}", "identity_confirmed": False}
+        )
+        with open_operational_database(run.database).begin() as conn:
+            persist_identity_review(conn, review)
+        view = _view(run)
+        assert view.context.identity_review is not None
+        assert not view.context.identity_review.approves
+        decision = evaluate_publication(view.offer, view.context)
+        assert R.IDENTITY_NOT_CONFIRMED in decision.reasons
+        assert not decision.publishable_now
+
+
+def test_evidence_that_does_not_name_the_institution_does_not_prove_it(run: SliceRun) -> None:
+    """Review HIGH: a verified-but-unrelated stored page (a rate page) is not identity proof."""
+    base = _current(run)
+    offer_evidence = next(iter(run.offers[OFFER].iter_provenance()))
+    _newer(run, "identity-review-rate-page", evidence=(offer_evidence,))
+    view = _view(run, after=timedelta(minutes=5))
+    review = view.context.identity_review
+    assert review is not None and review.review_id == "identity-review-rate-page"
+    assert not review.evidence_states_identity
+    decision = evaluate_publication(view.offer, view.context)
+    assert R.IDENTITY_NOT_CONFIRMED in decision.reasons
+    assert not decision.publishable_now
+    assert base.evidence_states_identity and base.evidence_states_massachusetts
+
+
+def test_a_review_cannot_cite_another_institutions_evidence(run: SliceRun) -> None:
+    """Review HIGH: provenance recorded for charter A cannot back a review of charter B."""
+    base = _current(run)
+    with open_operational_database(run.database).begin() as conn:
+        persist_identity_review(conn, base.model_copy(update={"review_id": "same-owner"}))
+    # Same stored provenance cited for a different institution is refused by the writer...
+    with (
+        pytest.raises(ValueError, match="only cite evidence recorded for its institution"),
+        open_operational_database(run.database).begin() as conn,
+    ):
+        persist_identity_review(
+            conn,
+            base.model_copy(update={"review_id": "stolen", "institution_charter": 777}),
+        )
+    # ...and by the database itself, so a raw writer cannot bypass the check.
+    with closing(sqlite3.connect(run.database)) as raw:
+        raw.execute("PRAGMA foreign_keys=ON")
+        provenance_id = raw.execute(
+            "SELECT provenance_id FROM institution_identity_evidence"
+        ).fetchone()[0]
+        with pytest.raises(sqlite3.IntegrityError), raw:
+            raw.execute(
+                "INSERT INTO institution_identity_evidence VALUES ('same-owner', ?, 777, 5)",
+                (provenance_id,),
+            )
+
+
+def test_a_review_older_than_a_roster_clearing_cannot_vouch_for_a_reflagged_charter(
+    run: SliceRun, tmp_path: Path
+) -> None:
+    """Review MEDIUM: when the roster importer clears verification, old reviews are void."""
+    base = _current(run)
+    denylist = Denylist(tmp_path / "independent" / "withdrawals.json")
+    denylist.initialize()
+    entry = WithdrawalEntry(
+        schema_version=base.schema_version,
+        withdrawal_id="roster-test.suppress.clearing",
+        scope=WithdrawalScope.INSTITUTION,
+        target_id=str(base.institution_charter),
+        actor="roster-importer",
+        withdrawn_at=base.decided_at + timedelta(minutes=2),
+        reason="reported merged in a roster import",
+    )
+    with open_operational_database(run.database).begin() as conn:
+        insert_withdrawal(conn, entry, denylist=denylist)
+    view = _view(run, after=timedelta(minutes=5))
+    assert view.context.identity_review is None  # the old approval no longer counts
+    assert R.IDENTITY_REVIEW_MISSING in evaluate_publication(view.offer, view.context).reasons
+    # A human re-review AFTER the clearing restores it.
+    _newer(
+        run, "identity-review-after-clearing", decided_at=entry.withdrawn_at + timedelta(minutes=1)
+    )
+    view = _view(run, after=timedelta(minutes=6))
+    assert view.context.identity_review is not None
+    assert view.context.identity_review.review_id == "identity-review-after-clearing"

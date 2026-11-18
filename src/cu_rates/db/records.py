@@ -242,6 +242,16 @@ def persist_identity_review(
     ]
     if len(set(identifiers)) != len(identifiers):
         raise ValueError("an identity review cannot cite the same evidence twice")
+    owners = {
+        row.provenance_id: row.institution_charter
+        for row in conn.execute(
+            select(provenance_table.c.provenance_id, provenance_table.c.institution_charter).where(
+                provenance_table.c.provenance_id.in_(identifiers)
+            )
+        )
+    }
+    if any(owners.get(identifier) != checked.institution_charter for identifier in identifiers):
+        raise ValueError("an identity review can only cite evidence recorded for its institution")
     conn.execute(
         institution_identity_reviews.insert(),
         {
@@ -259,7 +269,12 @@ def persist_identity_review(
     conn.execute(
         institution_identity_evidence.insert(),
         [
-            {"review_id": checked.review_id, "provenance_id": identifier, "ordinal": ordinal}
+            {
+                "review_id": checked.review_id,
+                "provenance_id": identifier,
+                "institution_charter": checked.institution_charter,
+                "ordinal": ordinal,
+            }
             for ordinal, identifier in enumerate(identifiers)
         ],
     )
@@ -285,6 +300,8 @@ def load_identity_reviews(
             .where(institution_identity_evidence.c.review_id == row.review_id)
             .order_by(institution_identity_evidence.c.ordinal)
         ).all()
+        if any(item.institution_charter != row.institution_charter for item in evidence_rows):
+            continue  # evidence recorded for another institution: the review is not trusted
         loaded = _load_provenance(conn, {item.provenance_id for item in evidence_rows})
         reviews.append(
             InstitutionIdentityReview.model_validate(
