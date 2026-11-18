@@ -31,7 +31,12 @@ from cu_rates.contracts.audit import WithdrawalEntry
 from cu_rates.contracts.base import CONTRACT_VERSION
 from cu_rates.contracts.enums import InstitutionStatus, WithdrawalScope
 from cu_rates.contracts.registry import Institution
-from cu_rates.db.schema import institutions, roster_import_entries, roster_imports
+from cu_rates.db.schema import (
+    institutions,
+    roster_import_entries,
+    roster_imports,
+    withdrawal_lifts,
+)
 from cu_rates.pipeline.trusted import insert_withdrawal
 from cu_rates.roster.mapping import (
     DEFAULT_NCUA_MAPPING,
@@ -66,6 +71,8 @@ _INELIGIBLE_STATUSES = frozenset(
         InstitutionStatus.CONVERTED,
     }
 )
+
+_ROSTER_PREFIX = "roster-"
 
 
 @dataclass(frozen=True)
@@ -311,6 +318,20 @@ class RosterImporter:
                 select(institutions.c.charter_number).where(institutions.c.charter_verified == 1)
             ).all()
         }
+        # A charter whose roster suppression a human has not lifted is still awaiting
+        # reconciliation: a LATER import must not apply an unreviewed identity either.
+        awaiting_reconciliation = (
+            set()
+            if self._denylist is None
+            else {
+                int(e.target_id)
+                for e in self._denylist.entries()
+                if e.scope is WithdrawalScope.INSTITUTION
+                and e.withdrawal_id.startswith(_ROSTER_PREFIX)
+                and e.lifted_at is None
+                and e.target_id.isdigit()
+            }
+        )
 
         inserted: list[int] = []
         updated: list[int] = []
@@ -419,7 +440,14 @@ class RosterImporter:
 
             # Use the verification state from BEFORE this import's suppression cleared it:
             # a verified record's changed identity is queued for review, never applied.
-            if current is not None and inst.charter_number in verified and changed:
+            if (
+                current is not None
+                and (
+                    inst.charter_number in verified
+                    or inst.charter_number in awaiting_reconciliation
+                )
+                and changed
+            ):
                 review.append(inst.charter_number)
                 continue
             if current is None:
@@ -497,7 +525,7 @@ class RosterImporter:
     ) -> WithdrawalEntry | None:
         if self._denylist is None:
             raise ValueError("a denylist is required to import a merger or closure")
-        withdrawal_id = f"roster-{artifact_id}.suppress.{charter}"
+        withdrawal_id = f"{_ROSTER_PREFIX}{artifact_id}.suppress.{charter}"
         entries = self._denylist.entries()
         # A retry must reuse every immutable field, especially the original time.
         # Every roster artifact owns its own deterministic entry: a human lift of one
@@ -955,3 +983,37 @@ def _parse_date(value: str) -> str | None:
     if parsed.strftime("%Y-%m-%d") != value:
         return None
     return value
+
+
+def lift_roster_suppressions(
+    conn: Connection, denylist: Denylist, charter: int, *, at: datetime, actor: str
+) -> tuple[str, ...]:
+    """Human reconciliation: lift EVERY in-force roster suppression for one charter.
+
+    Each roster artifact owns its own entry, so restoring an institution means lifting
+    all of them, in the independent ledger and in the operational record. This restores
+    nothing else: ``charter_verified`` and the institution's status stay as they are
+    until identity is separately re-verified by a human.
+    """
+    lifted: list[str] = []
+    for entry in denylist.entries():
+        if (
+            entry.scope is WithdrawalScope.INSTITUTION
+            and entry.target_id == str(charter)
+            and entry.withdrawal_id.startswith(_ROSTER_PREFIX)
+            and entry.lifted_at is None
+        ):
+            denylist.lift(entry.withdrawal_id, at=at, actor=actor)
+            already = conn.execute(
+                select(withdrawal_lifts.c.withdrawal_id).where(
+                    withdrawal_lifts.c.withdrawal_id == entry.withdrawal_id
+                )
+            ).first()
+            if already is None:
+                conn.execute(
+                    insert(withdrawal_lifts).values(
+                        withdrawal_id=entry.withdrawal_id, lifted_at=at, lifted_by=actor
+                    )
+                )
+            lifted.append(entry.withdrawal_id)
+    return tuple(lifted)

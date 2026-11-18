@@ -26,6 +26,7 @@ from cu_rates.db.schema import (
 )
 from cu_rates.pipeline.slice import CHARTER
 from cu_rates.roster import RosterImportReport, import_roster
+from cu_rates.roster.importer import lift_roster_suppressions
 from cu_rates.snapshot import Denylist, SnapshotReader
 
 from .test_public_snapshot import (
@@ -1042,3 +1043,73 @@ def test_verified_institutions_changed_identity_is_held_not_applied(
     assert CHARTER not in report.updated_charters
     assert report.review_charters == (CHARTER,)
     assert reader.read(at=_MOMENT).offers == ()
+
+
+def _roster_with_two_successors(successor: str, as_of: str) -> bytes:
+    return (
+        _HEADER
+        + f"{CHARTER},Example North Charter,MA,Merged,Boston,2026-11-15,{successor},{as_of}\n"
+        + f"60002,Successor CU,MA,Active,Cambridge,,,{as_of}\n"
+        + f"60003,Other Successor CU,MA,Active,Worcester,,,{as_of}\n"
+    ).encode()
+
+
+def test_later_imports_never_apply_an_unreviewed_identity_while_suppression_stands(
+    stored: StoredFixture, public_snapshot: tuple[SnapshotReader, Denylist]
+) -> None:
+    """Review P2: holding a verified charter must last until a human lifts, not one import."""
+    reader, denylist = public_snapshot
+    stored.conn.execute(
+        update(institutions)
+        .where(institutions.c.charter_number == CHARTER)
+        .values(charter_verified=1)
+    )
+    first = _snapshot_import(stored, denylist, _roster_with_two_successors("60002", "2026-11-16"))
+    second = _snapshot_import(
+        stored,
+        denylist,
+        _roster_with_two_successors("60003", "2026-11-17"),
+        moment=_MOMENT + timedelta(seconds=1),
+    )
+    row = stored.conn.execute(
+        select(
+            institutions.c.status,
+            institutions.c.successor_charter_number,
+            institutions.c.charter_verified,
+        ).where(institutions.c.charter_number == CHARTER)
+    ).one()
+    assert tuple(row) == ("active", None, 0)  # neither successor was ever applied
+    assert CHARTER in first.review_charters and CHARTER in second.review_charters
+    assert CHARTER not in second.updated_charters
+    assert reader.read(at=_MOMENT + timedelta(seconds=1)).offers == ()
+
+
+def test_one_call_lifts_every_roster_suppression_and_restores_nothing_else(
+    stored: StoredFixture, public_snapshot: tuple[SnapshotReader, Denylist]
+) -> None:
+    reader, denylist = public_snapshot
+    _snapshot_import(stored, denylist, _snapshot_roster("Merged", successor="60002"))
+    _snapshot_import(
+        stored,
+        denylist,
+        _snapshot_roster("Merged", successor="60002", as_of="2026-11-17"),
+        moment=_MOMENT + timedelta(seconds=1),
+    )
+    in_force = [e.withdrawal_id for e in denylist.entries() if e.lifted_at is None]
+    assert len(in_force) == 2
+    later = _MOMENT + timedelta(minutes=1)
+    lifted = lift_roster_suppressions(
+        stored.conn, denylist, CHARTER, at=later, actor="human-reviewer"
+    )
+    assert sorted(lifted) == sorted(in_force)
+    assert all(e.lifted_at == later for e in denylist.entries())
+    assert len(stored.conn.execute(select(withdrawal_lifts)).all()) == 2
+    assert {o.institution_charter for o in reader.read(at=later).offers} == {CHARTER}
+    # Idempotent, and it never marks the charter verified: identity is re-verified separately.
+    assert lift_roster_suppressions(stored.conn, denylist, CHARTER, at=later, actor="x") == ()
+    assert (
+        stored.conn.execute(
+            select(institutions.c.charter_verified).where(institutions.c.charter_number == CHARTER)
+        ).scalar_one()
+        == 0
+    )
