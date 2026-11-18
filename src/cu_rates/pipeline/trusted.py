@@ -1427,6 +1427,8 @@ def _prior(conn: Connection, offer_id: str, evaluated_at: UtcDatetime) -> PriorP
     )
     latest = _subject_review(conn, "offer", offer_id, evaluated_at)
     if latest is not None and not latest.approved:
+        # A rejection is enforced by load_publication_context (the offer is rewritten to
+        # QUARANTINED, OFFER_QUARANTINED) and by the snapshot builder, not by this prior.
         review = None
     return PriorPublication(
         snapshot=baseline,

@@ -325,6 +325,7 @@ def test_304_does_not_cure_a_failed_validation() -> None:
 def test_304_does_not_approve_an_unreviewed_prior() -> None:
     decision = decide(prior=prior(purchase_offer(), reviewed=False))
     blocked(decision, PublicationOutcome.QUARANTINE)  # D-21: an unreviewed prior is fine
+    assert R.REOBSERVATION_CLAIM_CHANGED in decision.reasons  # but a 304 cannot extend its claims
 
 
 def test_every_new_quarantine_reason_is_categorized() -> None:

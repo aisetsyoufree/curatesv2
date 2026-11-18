@@ -1369,7 +1369,9 @@ def _change_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[Reas
     prior = ctx.prior
     if prior is None:
         # D-21: a first publication needs no human review; it publishes when the rest of the
-        # gate passes (two corroborating captures, validated, confidence not low).
+        # gate passes (two corroborating captures, validated). Extraction-confidence tiers
+        # (low is quarantined) arrive with the production adapters (T040); until then no real
+        # source exists, so only the synthetic fixture slice can reach this branch.
         return reasons
     # D-21: an automatic prior publication is a trusted baseline. It must exist as of now, still
     # be in force (not withdrawn), and, if a human did review it, that review must not post-date
