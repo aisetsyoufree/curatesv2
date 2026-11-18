@@ -189,3 +189,54 @@ def test_baseline_paths_resolve_two_fixture_artifacts_and_runs() -> None:
         assert path.observed_at == artifact.fetched_at
         assert path.provenance.artifact_id == artifact.artifact_id
     assert evaluate_publication(f.purchase_offer(), ctx).ranking_eligible
+
+
+def test_three_valid_captures_select_the_same_pair_in_any_input_order() -> None:
+    """AUD7-12(e): the corroborating pair and review digest cannot depend on load order."""
+    import itertools
+
+    from cu_rates.contracts.publication import (
+        _path_reasons,
+        corroborated_paths,
+        publication_evidence_sha256,
+    )
+
+    offer = f.purchase_offer(apr=None, points=None)
+    base = f.context(offer)
+    id3, run3, seen3 = "dd" * 32, "fetch-003", f.T0 - timedelta(hours=2)
+    artifact3 = f.raw_artifact(artifact_id=id3, fetch_run_id=run3, fetched_at=seen3)
+    fetch3 = f.fetch_run(
+        id3,
+        run_id=run3,
+        profile_id=base.fetch_runs[0].profile_id,
+        profile_sha256=base.fetch_runs[0].profile_sha256,
+        started_at=seen3 - timedelta(minutes=1),
+        finished_at=seen3 + timedelta(minutes=1),
+    )
+    third = f.corroborating_path(artifact_id=id3, capture_id=run3, observed_at=seen3)
+    paths = (f.evidence_path(), f.corroborating_path(), third)
+    statements = tuple(
+        dict.fromkeys((*base.verified_scenario_statements, *f.fixture_statements(offer, id3, run3)))
+    )
+    fingerprint = f.source_fingerprint(
+        artifact_id=id3, content_sha256=id3, fetch_run_id=run3, observed_at=seen3
+    )
+    ctx = base.model_copy(
+        update={
+            "known_artifacts": (*base.known_artifacts, artifact3),
+            "fetch_runs": (*base.fetch_runs, fetch3),
+            "source_fingerprints": (*base.source_fingerprints, fingerprint),
+            "verified_scenario_statements": statements,
+        }
+    )
+    # All three captures are individually valid; otherwise this proves nothing.
+    for path in paths:
+        assert not _path_reasons(path, offer, ctx.model_copy(update={"evidence_paths": paths}))
+    selections = set()
+    digests = set()
+    for ordering in itertools.permutations(paths):
+        selected = corroborated_paths(offer, ctx.model_copy(update={"evidence_paths": ordering}))
+        assert len(selected) == 2
+        selections.add(tuple(p.capture_id for p in selected))
+        digests.add(publication_evidence_sha256(offer, selected))
+    assert len(selections) == 1 and len(digests) == 1

@@ -2,7 +2,7 @@
 
 import re
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from typing import Annotated, Any
 
 from pydantic import (
@@ -135,5 +135,10 @@ class VersionedModel(ContractModel):
 
 def canonical_decimal(value: Decimal) -> str:
     """Stable text for a Decimal: numerically equal values yield identical text."""
-    text = format(value.normalize(), "f")
+    # normalize() rounds to the *ambient* context precision, so an application that
+    # lowers it would collapse 6.125 and 6.124. Use a precision that always holds
+    # every digit of this value, independent of ambient state.
+    with localcontext() as context:
+        context.prec = max(len(value.as_tuple().digits) + 2, 28)
+        text = format(value.normalize(), "f")
     return "0" if text in {"-0", ""} else text
