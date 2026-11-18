@@ -59,7 +59,8 @@ from cu_rates.contracts.sources import (
 from cu_rates.contracts.taxonomy import TAXONOMY_VERSION, ProductFinding
 from cu_rates.db import open_operational_database, upgrade_database
 from cu_rates.db.schema import slice_normalization_failures
-from cu_rates.fetch_worker import FetchApproval, FetchWorker, TermsReview
+from cu_rates.fetch_policy import FetchRegistry, TermsLedger, TermsReview
+from cu_rates.fetch_worker import FetchWorker
 from cu_rates.normalize import OfferContext, ScenarioCheck, normalize_offer
 from cu_rates.normalize._values import Range, comparison_statement
 from cu_rates.pipeline.extract import (
@@ -95,6 +96,7 @@ from cu_rates.pipeline.trusted import (
     verify_located_claim,
 )
 from cu_rates.pipeline.validate import validate_offer, validation_policy
+from cu_rates.snapshot import Denylist
 
 REVIEWER = "example-reviewer"
 CHARTER = 9000001
@@ -580,10 +582,20 @@ def run_fixture(
     clock = _Clock(_OPENED)
     with engine.begin() as conn:
         source, profile, approval = _register(conn, identity)
+    denylist = Denylist(root / "independent" / "withdrawals.json")
+    denylist.initialize()
+    terms = TermsLedger(root / "private" / "terms.json")
+    terms.initialize()
+    terms.record(_terms(approval), denylist=denylist)
+    registry = FetchRegistry(database, terms, denylist)
     worker = _worker(
-        root, store, clock, (FIXTURES / identity.filename).read_bytes() if body is None else body
+        root,
+        store,
+        clock,
+        (FIXTURES / identity.filename).read_bytes() if body is None else body,
+        registry,
     )
-    result = worker.fetch(source, profile, _fetch_approval(approval, profile), _terms(approval))
+    result = worker.fetch(source, profile)
     if result.run is None or result.artifact is None:
         raise RuntimeError(f"fixture fetch failed: {result.reason}")
     with engine.begin() as conn:
@@ -620,9 +632,7 @@ def run_fixture(
             )
         if reviewed_snapshot is not None:
             clock.advance(120)
-            observed = worker.fetch(
-                source, profile, _fetch_approval(approval, profile), _terms(approval)
-            ).reobserved
+            observed = worker.fetch(source, profile).reobserved
             if observed is None:
                 raise RuntimeError("expected a stored strong-ETag 304")
             observation = observed.record()
@@ -680,7 +690,9 @@ def _decide(
     return evaluate_publication(view.offer, view.context)
 
 
-def _worker(root: Path, store: ArtifactStore, clock: _Clock, body: bytes) -> FetchWorker:
+def _worker(
+    root: Path, store: ArtifactStore, clock: _Clock, body: bytes, registry: FetchRegistry
+) -> FetchWorker:
     def send(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/robots.txt":
             return httpx.Response(
@@ -704,30 +716,11 @@ def _worker(root: Path, store: ArtifactStore, clock: _Clock, body: bytes) -> Fet
         store,
         transport,
         git_sha=GIT_SHA,
+        registry=registry,
         clock=clock.now,
         monotonic=clock.now,
         sleep=clock.sleep,
         resolve=lambda _host: ("8.8.8.8",),
-    )
-
-
-def _fetch_approval(approval: SourceApproval, profile: FetchProfile) -> FetchApproval:
-    return FetchApproval(
-        schema_version=approval.schema_version,
-        approval_id=approval.approval_id,
-        source_id=approval.source_id,
-        source_url=approval.source_url,
-        decision=approval.decision,
-        actor=approval.actor,
-        decided_at=approval.decided_at,
-        policy_id=approval.policy_id,
-        policy_version=approval.policy_version,
-        rationale=approval.rationale,
-        approved_profile_sha256=approval.approved_profile_sha256,
-        approved_layout_sha256=approval.approved_layout_sha256,
-        adapter=approval.adapter,
-        profile=profile,
-        evidence_kind=EvidenceKind.HTML,
     )
 
 
