@@ -2698,3 +2698,87 @@ def test_canonical_scenario_assumptions_asserted_independently() -> None:
     assert heloc_map["Rate Structure"] == "Post-introductory variable APR"
     assert heloc_map["Occupancy"] == "Owner-occupied single-family primary residence"
     assert heloc_map["Discounts"] == "None (No relationship or automatic payment discount)"
+
+
+def test_displayed_rates_and_points_are_never_silently_rounded() -> None:
+    """AUD7-13(b): a published five-decimal value is shown exactly, not as a 3-place rounding."""
+    from cu_rates.snapshot.builder import _public_projection
+    from cu_rates.web.comparison import classify_and_format_offer, exact_decimal
+
+    assert exact_decimal(Decimal("6")) == "6.000"
+    assert exact_decimal(Decimal("6.1")) == "6.100"
+    assert exact_decimal(Decimal("6.125")) == "6.125"
+    assert exact_decimal(Decimal("6.12345")) == "6.12345"
+    assert exact_decimal(Decimal("6.12349")) != exact_decimal(Decimal("6.12351"))
+
+    now = make.EVALUATED_AT
+    cand = _make_candidate(
+        "offer-precision",
+        "Precision CU",
+        note_rate_str="6.12345",
+        apr_str="6.54321",
+        points_str="0.12345",
+        now=now,
+    )
+    formatted = classify_and_format_offer(_public_projection(cand, Placement.RANKED, False), now)
+    assert formatted is not None
+    assert formatted.note_rate_display == "6.12345%"
+    assert formatted.apr_display == "6.54321%"
+    assert formatted.points_display == "0.12345"
+    assert "6.123" not in formatted.note_rate_display.replace("6.12345", "")
+
+
+def test_heloc_intro_rate_label_is_exact_and_exact_decimal_edge_cases() -> None:
+    """Review: the HELOC intro label path must not round, and edge shapes stay safe."""
+    from cu_rates.contracts.offers import IntroRate
+    from cu_rates.snapshot.builder import _public_projection
+    from cu_rates.web.comparison import classify_and_format_offer, exact_decimal
+
+    assert exact_decimal(Decimal("-0")) == "0.000"
+    assert exact_decimal(Decimal("0.00000")) == "0.00000"
+    assert exact_decimal(Decimal("6E+1")) == "60.000"
+    with pytest.raises(ValueError, match="non-finite"):
+        exact_decimal(Decimal("NaN"))
+
+    now = make.EVALUATED_AT
+    effective = make.T0 - timedelta(days=1)
+    details = HelocDetails(
+        intro=IntroRate(rate=make.rate("2.12345"), duration_months=6),
+        index_name="Prime",
+        index_rate=make.rate("7.500"),
+        margin=make.margin("0.500"),
+        floor=make.rate("4.000"),
+        stated_post_intro_apr=make.rate("8.000"),
+        lien_position=LienPosition.SECOND,
+        draw_period_months=120,
+        repayment_period_months=240,
+    )
+    offer = draft(
+        offer_id="heloc-intro-precision",
+        status=OfferStatus.APPROVED,
+        effective_at=effective,
+        observed_at=make.T0,
+        valid_until=make.T0 + timedelta(days=3),
+        scenario_id=CanonicalScenarioId.HELOC,
+        note_rate=None,
+        apr=make.rate("2.12345"),
+        points=make.points("0"),
+        supporting_evidence=(make.provenance("CAPTURE heloc-intro-precision"),),
+        scenario_matches=make.matches_all(CanonicalScenarioId.HELOC),
+        details=details,
+    )
+    candidate = SnapshotCandidate(
+        offer=offer,
+        context=make.context(
+            offer,
+            evaluated_at=now,
+            institution=make.institution(legal_name="Intro Precision Credit Union"),
+        ),
+        candidates=(claim("effective_at", effective.isoformat()),),
+    )
+    formatted = classify_and_format_offer(
+        _public_projection(candidate, Placement.RANKED, False), now
+    )
+    assert formatted is not None
+    assert formatted.intro_rate_display == "Intro: 2.12345% (6 mos)"
+    assert "2.123%" not in formatted.note_rate_display
