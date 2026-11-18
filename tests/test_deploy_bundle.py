@@ -121,6 +121,9 @@ def test_systemd_hardening_and_resource_limits() -> None:
         "/var/lib/cu-rates/artifacts",
         "/var/lib/cu-rates/snapshots",
     }, f"worker ReadWritePaths must be exactly data, artifacts, and snapshots, got {worker_rw}"
+    worker_ro = set(" ".join(worker_sec.get("ReadOnlyPaths", [])).split())
+    assert "/var/lib/cu-rates/independent" in worker_ro
+    assert "/var/lib/cu-rates/independent" not in worker_rw
 
 
 def test_loopback_only_binding() -> None:
@@ -169,12 +172,15 @@ def test_worker_unit_disabled_by_default() -> None:
     timer_install = worker_timer.get("Install", {})
     assert "WantedBy" not in timer_install or not timer_install["WantedBy"]
 
-    # Verify install.sh does not enable the worker and disables it explicitly
+    # Verify install.sh does not enable the worker and disables, stops, and masks it
     install_sh = (DEPLOY_DIR / "install.sh").read_text(encoding="utf-8")
     assert "systemctl enable cu-rates-web.service" in install_sh
     assert "systemctl enable cu-rates-worker" not in install_sh
     assert "systemctl disable cu-rates-worker.service" in install_sh
     assert "systemctl disable cu-rates-worker.timer" in install_sh
+    assert "systemctl stop cu-rates-worker.service" in install_sh
+    assert "systemctl stop cu-rates-worker.timer" in install_sh
+    assert "ln -sf /dev/null" in install_sh
 
 
 def test_web_unit_does_not_reference_worker_database() -> None:
@@ -193,8 +199,9 @@ def test_web_unit_does_not_reference_worker_database() -> None:
     assert "operational.db" not in raw_content
     assert "worker.db" not in raw_content
 
-    # Web unit must only reference snapshots and app code
+    # Web unit must only reference snapshots, independent ledger, and app code
     assert "/var/lib/cu-rates/snapshots" in ro_paths
+    assert "/var/lib/cu-rates/independent" in ro_paths
     assert "/var/lib/cu-rates/app" in ro_paths
 
 
@@ -444,6 +451,9 @@ def test_documented_runbook_order_against_install_checks(tmp_path: Path) -> None
 
     (fake_bin / "chmod").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     (fake_bin / "chmod").chmod(0o755)
+
+    (fake_bin / "ln").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (fake_bin / "ln").chmod(0o755)
 
     mkdir_script = """#!/bin/sh
 case "$*" in
@@ -926,7 +936,7 @@ def test_readme_documents_denylist_initialize_step() -> None:
     readme = (DEPLOY_DIR / "README.md").read_text(encoding="utf-8")
     assert "Denylist.initialize()" in readme
     assert "denylist.initialize()" in readme
-    assert "/var/lib/cu-rates/snapshots/denylist.json" in readme
+    assert "/var/lib/cu-rates/independent/denylist.json" in readme
     assert "Denylist(Path(" in readme
 
 
@@ -1157,7 +1167,165 @@ def test_runbook_withdrawal_example_actually_runs(tmp_path: Path) -> None:
     import textwrap
 
     code = textwrap.dedent(snippet).replace(
-        "/var/lib/cu-rates/snapshots/denylist.json", str(ledger)
+        "/var/lib/cu-rates/independent/denylist.json", str(ledger)
     )
     exec(compile(code, "runbook-withdrawal-example", "exec"), {})
     assert "off-example-123" in ledger.read_text()
+
+
+def test_worker_stopped_disabled_and_masked_per_d15_d17() -> None:
+    """Verify worker units are stopped, disabled, masked (ln -sf /dev/null), and commit recorded."""
+    install_sh = (DEPLOY_DIR / "install.sh").read_text(encoding="utf-8")
+
+    # Worker units must be stopped
+    assert "systemctl stop cu-rates-worker.service" in install_sh
+    assert "systemctl stop cu-rates-worker.timer" in install_sh
+
+    # Worker units must be disabled
+    assert "systemctl disable cu-rates-worker.service" in install_sh
+    assert "systemctl disable cu-rates-worker.timer" in install_sh
+
+    # Worker units must be masked via symlink to /dev/null
+    assert "ln -sf /dev/null" in install_sh
+    assert 'ln -sf /dev/null "${SYSTEMD_DIR}/cu-rates-worker.service"' in install_sh
+    assert 'ln -sf /dev/null "${SYSTEMD_DIR}/cu-rates-worker.timer"' in install_sh
+
+    # Installed git commit must be recorded in root-owned state file (mode 0644)
+    assert "installed-commit" in install_sh
+    assert "0644" in install_sh
+    assert "rev-parse HEAD" in install_sh
+
+
+def test_install_script_dry_run_prints_worker_mask_and_commit(tmp_path: Path) -> None:
+    """Verify install.sh --dry-run prints stopping, disabling, masking, and commit recording."""
+    install_sh = DEPLOY_DIR / "install.sh"
+    test_root = tmp_path / "cu-rates-dry-worker"
+    res = subprocess.run(
+        ["bash", str(install_sh), "--dry-run"],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "CU_RATES_ROOT": str(test_root)},
+    )
+    assert res.returncode == 0
+    out = res.stdout
+    assert "stop cu-rates-worker.service" in out
+    assert "stop cu-rates-worker.timer" in out
+    assert "cu-rates-worker.service is disabled" in out
+    assert "cu-rates-worker.timer is disabled" in out
+    assert "mask cu-rates-worker.service" in out
+    assert "mask cu-rates-worker.timer" in out
+    assert "installed-commit" in out
+    assert "0644" in out
+
+
+def test_independent_ledger_isolation_and_paths() -> None:
+    """Verify independent ledger is moved to operator-owned dir read-only to worker and web."""
+    worker_unit = parse_systemd_unit(SYSTEMD_DIR / "cu-rates-worker.service")
+    worker_sec = worker_unit.get("Service", {})
+    worker_ro = set(" ".join(worker_sec.get("ReadOnlyPaths", [])).split())
+    worker_rw = set(" ".join(worker_sec.get("ReadWritePaths", [])).split())
+
+    # Worker has independent directory in ReadOnlyPaths, never in ReadWritePaths
+    assert "/var/lib/cu-rates/independent" in worker_ro
+    assert "/var/lib/cu-rates/independent" not in worker_rw
+
+    # Web has independent directory in ReadOnlyPaths, never in ReadWritePaths
+    web_unit = parse_systemd_unit(SYSTEMD_DIR / "cu-rates-web.service")
+    web_sec = web_unit.get("Service", {})
+    web_ro = set(" ".join(web_sec.get("ReadOnlyPaths", [])).split())
+    web_rw = set(" ".join(web_sec.get("ReadWritePaths", [])).split())
+    assert "/var/lib/cu-rates/independent" in web_ro
+    assert "/var/lib/cu-rates/independent" not in web_rw
+
+    # env.example references /var/lib/cu-rates/independent/denylist.json
+    env_content = (DEPLOY_DIR / "env.example").read_text(encoding="utf-8")
+    assert "DENYLIST_PATH=/var/lib/cu-rates/independent/denylist.json" in env_content
+    assert "/var/lib/cu-rates/snapshots/denylist.json" not in env_content
+
+    # install.sh provisions operator-owned independent directory with mode 0755
+    install_sh = (DEPLOY_DIR / "install.sh").read_text(encoding="utf-8")
+    assert "independent" in install_sh
+    assert "0755" in install_sh
+    assert "verify_operator_directory" in install_sh
+
+    # README documents independent directory
+    readme = (DEPLOY_DIR / "README.md").read_text(encoding="utf-8")
+    assert "/var/lib/cu-rates/independent" in readme
+    assert "/var/lib/cu-rates/independent/denylist.json" in readme
+
+
+def test_artifact_storage_mode_0700_and_ownership_verification() -> None:
+    """Verify artifact storage is created mode 0700 (no group access) with ownership check."""
+    install_sh = (DEPLOY_DIR / "install.sh").read_text(encoding="utf-8")
+
+    # Artifact storage must be chmod 0700
+    assert 'chmod 0700 "${NVME_ROOT}/artifacts"' in install_sh
+    # Must NOT set 0750 on artifacts
+    assert 'chmod 0750 "${NVME_ROOT}/data" "${NVME_ROOT}/artifacts"' not in install_sh
+
+    # install.sh must verify ownership of artifacts directory
+    assert "verify_artifact_ownership" in install_sh
+
+    # README documents artifacts mode 0700
+    readme = (DEPLOY_DIR / "README.md").read_text(encoding="utf-8")
+    assert (
+        "artifacts/            # Content-addressed raw evidence store (worker only, mode 0700)"
+        in readme
+    )
+
+
+def test_install_script_rejects_unsafe_roots_and_symlinks(tmp_path: Path) -> None:
+    """Verify install.sh rejects unsafe roots, symlinks, non-directories, and traversal."""
+    install_sh = DEPLOY_DIR / "install.sh"
+
+    # Reject system roots
+    for unsafe_root in ["/", "/etc", "/usr", "/bin"]:
+        res = subprocess.run(
+            ["bash", str(install_sh)],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "CU_RATES_ROOT": unsafe_root},
+        )
+        assert res.returncode != 0, f"install.sh should reject unsafe root '{unsafe_root}'"
+        assert "unsafe root" in res.stderr.lower()
+
+    # Reject symlinks
+    real_target = tmp_path / "real-dir"
+    real_target.mkdir()
+    symlink_target = tmp_path / "symlink-dir"
+    symlink_target.symlink_to(real_target)
+
+    res_sym = subprocess.run(
+        ["bash", str(install_sh)],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "CU_RATES_ROOT": str(symlink_target)},
+    )
+    assert res_sym.returncode != 0, "install.sh should reject symlink root"
+    assert "symlink" in res_sym.stderr.lower()
+
+    # Reject regular file (not a real directory)
+    regular_file = tmp_path / "some-file"
+    regular_file.write_text("not a directory", encoding="utf-8")
+
+    res_file = subprocess.run(
+        ["bash", str(install_sh)],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "CU_RATES_ROOT": str(regular_file)},
+    )
+    assert res_file.returncode != 0, "install.sh should reject regular file as root"
+    assert (
+        "not a real directory" in res_file.stderr.lower()
+        or "not a directory" in res_file.stderr.lower()
+    )
+
+    # Reject path traversal
+    res_trav = subprocess.run(
+        ["bash", str(install_sh)],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "CU_RATES_ROOT": f"{tmp_path}/foo/../bar"},
+    )
+    assert res_trav.returncode != 0, "install.sh should reject path traversal"
+    assert "path traversal" in res_trav.stderr.lower()
