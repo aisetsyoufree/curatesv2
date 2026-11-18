@@ -1,8 +1,9 @@
 """Shared base model, scalar types, and contract versioning."""
 
 import re
+from contextlib import AbstractContextManager
 from datetime import UTC, datetime
-from decimal import Decimal, localcontext
+from decimal import Context, Decimal, localcontext
 from typing import Annotated, Any
 
 from pydantic import (
@@ -142,3 +143,17 @@ def canonical_decimal(value: Decimal) -> str:
         context.prec = max(len(value.as_tuple().digits) + 2, 28)
         text = format(value.normalize(), "f")
     return "0" if text in {"-0", ""} else text
+
+
+ARITHMETIC_PRECISION = 28
+
+
+def contract_arithmetic() -> AbstractContextManager[Context]:
+    """A fixed decimal context for every contract computation that can round.
+
+    Python's ambient context is process-wide state: an embedder (or a library) that lowers it
+    would change the result of ``max(index + margin, floor)`` or of an LTV division, and so the
+    publication verdict. Contract arithmetic therefore always runs under this one context
+    (28 digits, the library defaults for rounding and traps), whatever the ambient one is.
+    """
+    return localcontext(Context(prec=ARITHMETIC_PRECISION))

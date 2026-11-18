@@ -19,6 +19,7 @@ from cu_rates.contracts.base import (
     Points,
     Text,
     VersionedModel,
+    contract_arithmetic,
 )
 from cu_rates.contracts.enums import (
     CanonicalScenarioId,
@@ -114,15 +115,19 @@ class ComparisonScenario(VersionedModel):
                 raise ValueError("mortgage scenarios use ltv only, with no separate first lien")
             if self.ltv is None:
                 raise ValueError("mortgage scenarios require ltv")
-            stated, expected = self.ltv, self.loan_amount * 100 / self.property_value
+            with contract_arithmetic():
+                stated, expected = self.ltv, self.loan_amount * 100 / self.property_value
         else:
             if self.purpose is not None:
                 raise ValueError("purpose applies to mortgage scenarios only")
             if self.first_lien_balance is None or self.cltv is None or self.ltv is not None:
                 raise ValueError("equity scenarios require first_lien_balance and cltv, not ltv")
             stated = self.cltv
-            expected = (self.first_lien_balance + self.loan_amount) * 100 / self.property_value
-        if abs(stated - expected) >= Decimal("0.01"):
+            with contract_arithmetic():
+                expected = (self.first_lien_balance + self.loan_amount) * 100 / self.property_value
+        with contract_arithmetic():
+            off_by = abs(stated - expected)
+        if off_by >= Decimal("0.01"):
             raise ValueError(f"stated leverage {stated} disagrees with computed {expected:.4f}")
         return self
 
