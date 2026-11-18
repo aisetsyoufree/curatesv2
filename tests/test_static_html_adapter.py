@@ -457,7 +457,7 @@ def reviewed_adapter(
     view = load_publication_context(conn, f"{name}.purchase", NOW, store=store)
     assert view.offer.status is OfferStatus.APPROVED
     decision = evaluate_publication(view.offer, view.context)
-    assert decision.outcome is PublicationOutcome.REQUIRES_REVIEW, decision.reasons
+    assert decision.outcome is PublicationOutcome.AUTO_PUBLISH, decision.reasons  # D-21
     pair = corroborated_paths(view.offer, view.context)
     assert len(pair) == 6
     assert {p.capture_id for p in pair} == {"first", "second"}
