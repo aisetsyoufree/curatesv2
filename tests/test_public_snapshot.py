@@ -180,7 +180,7 @@ def test_snapshot_records_provenance_generation_and_immutable_format(
     assert view.info == info
     assert info.manifest_sha256 == manifest.manifest_sha256
     (visible,) = view.offers
-    assert visible.review_status == "automatic" and visible.placement is Placement.RANKED
+    assert visible.review_status == "reviewed" and visible.placement is Placement.RANKED
     assert visible.source_url == item.context.source.url
     assert visible.observed_at == item.offer.observed_at
     assert {part.artifact_id for part in visible.evidence} == {
@@ -237,9 +237,11 @@ def test_review_must_bind_exact_stored_offer_evidence(
     item = stored.row("purchase-15-year")
     stored.approve(item.offer.offer_id, evidence_hash="d0" * 32)
     item = stored.row("purchase-15-year")
-    publisher, _, _ = setup_storage(tmp_path)
-    with pytest.raises(SnapshotError, match="publication gate refused"):
-        publisher.build(release("not-reviewed", item), conn=stored.conn, store=stored.run.store)
+    publisher, reader, _ = setup_storage(tmp_path)
+    # D-21: a review that does not bind the exact stored evidence is never attached or trusted;
+    # the offer (two corroborating captures) publishes automatically and is not labelled reviewed.
+    info = publisher.build(release("not-reviewed", item), conn=stored.conn, store=stored.run.store)
+    assert {o.review_status for o in reader.read(at=info.published_at).offers} == {"automatic"}
 
 
 def test_reader_never_sees_a_partial_version_during_build_and_activation(
@@ -298,7 +300,7 @@ def test_reader_never_sees_a_partial_version_during_build_and_activation(
     engine.dispose()
 
 
-@pytest.mark.parametrize("mode", ["pending review", "rejected review", "quarantined"])
+@pytest.mark.parametrize("mode", ["rejected review", "quarantined"])  # D-21: no pending-review lane
 def test_ineligible_stored_rows_never_activate_or_partially_publish(
     tmp_path: Path, stored: StoredFixture, mode: str
 ) -> None:

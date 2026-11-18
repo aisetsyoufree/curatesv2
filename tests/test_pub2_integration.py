@@ -3,7 +3,6 @@
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import pytest
 from sqlalchemy import select
 
 from cu_rates.contracts.publication import ReasonCode as R
@@ -16,7 +15,6 @@ from cu_rates.db import open_operational_database
 from cu_rates.db.schema import slice_snapshot_baselines
 from cu_rates.pipeline.slice import run_fixture
 from cu_rates.pipeline.trusted import load_publication_context, publish
-from cu_rates.snapshot import SnapshotError
 from cu_rates.snapshot.builder import SnapshotCandidate, SnapshotPublisher, _public_projection
 
 from .pub2_fixtures import reviewed_fixture
@@ -114,7 +112,7 @@ def test_two_stored_captures_export_and_audit_both_chains(tmp_path: Path) -> Non
         assert view.current_review.reviewed_evidence_sha256 == audit["publication_evidence_sha256"]
 
 
-def test_review_of_one_capture_cannot_approve_the_pair(
+def test_a_stale_single_capture_review_is_not_attached_to_an_automatic_publication(
     tmp_path: Path, stored: StoredFixture
 ) -> None:
     from cu_rates.contracts.fingerprints import offer_evidence_sha256
@@ -123,8 +121,15 @@ def test_review_of_one_capture_cannot_approve_the_pair(
     stored.approve(item.offer.offer_id, evidence_hash=offer_evidence_sha256(item.offer))
     item = stored.row("purchase-15-year")
     publisher = SnapshotPublisher(tmp_path / "legacy-review", allow_fixture=True)
-    with pytest.raises(SnapshotError, match="publication gate refused"):
-        publisher.build(release("legacy-review", item), conn=stored.conn, store=stored.run.store)
+    # D-21: the stale single-capture review is simply not attached; the offer, which has two
+    # corroborating captures, publishes automatically and is never labelled human-reviewed.
+    info = publisher.build(release("legacy-review", item), conn=stored.conn, store=stored.run.store)
+    from cu_rates.snapshot import Denylist, SnapshotReader
+
+    denylist = Denylist(tmp_path / "ind" / "d.json")
+    denylist.initialize()
+    view = SnapshotReader(publisher.root, denylist.path).read(at=info.published_at)
+    assert {o.review_status for o in view.offers} == {"automatic"}
 
 
 def test_repeated_bytes_in_two_runs_do_not_make_independent_evidence(tmp_path: Path) -> None:

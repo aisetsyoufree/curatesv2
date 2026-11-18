@@ -29,13 +29,9 @@ from cu_rates.contracts.fingerprints import (
 )
 from cu_rates.contracts.offers import NormalizedOffer, OfferCondition
 from cu_rates.contracts.publication import (
-    REVIEW_REASONS,
     EvidencePath,
-    Placement,
     PriorPublication,
     PublicationContext,
-    PublicationOutcome,
-    ReasonCode,
     ValidationPolicy,
     ValidationResult,
     VerifiedScenarioCondition,
@@ -597,30 +593,24 @@ def publish(
     decision = evaluate_publication(offer, ctx)
     prior = ctx.prior
     fp = offer_fingerprints(offer)
-    if reviewed:
-        # A first-publication lane is deliberately narrow: a human signature is not
-        # an override for missing dates, policy, corrections, withdrawn sources, or drift.
-        if not (
-            decision.outcome is PublicationOutcome.REQUIRES_REVIEW
-            and set(decision.reasons) & REVIEW_REASONS == {ReasonCode.FIRST_PUBLICATION}
-            and not decision.degraded
-            and decision.placement is not Placement.NONE
-            and review is not None
-            and review.approved
-            and offer.observed_at <= review.decided_at <= evaluated_at
-            and review.reviewed_fingerprints == fp
-            and review.reviewed_evidence_sha256
-            == publication_evidence_sha256(offer, corroborated_paths(offer, ctx))
-        ):
-            return None
-    elif not decision.publishable_now:
+    if not decision.publishable_now:
         return None
-    elif review is not None and (
-        review.reviewed_fingerprints != fp
-        or review.reviewed_evidence_sha256
-        != publication_evidence_sha256(offer, corroborated_paths(offer, ctx))
+    pair_digest = publication_evidence_sha256(offer, corroborated_paths(offer, ctx))
+    review_binds = (
+        review is not None
+        and review.approved
+        and review.decided_at <= evaluated_at
+        and review.reviewed_fingerprints == fp
+        and review.reviewed_evidence_sha256 == pair_digest
+    )
+    if reviewed and not (
+        review_binds and review is not None and offer.observed_at <= review.decided_at
     ):
-        # A legitimate small rate change can auto-publish, but is not a new human review.
+        # The caller asked for a human-reviewed publication; never silently downgrade it.
+        return None
+    if not review_binds:
+        # D-21: publication is automatic. A legitimate rate change is not a new human review,
+        # so a review that no longer binds the exact content is simply not attached.
         review = None
 
     entry = SnapshotEntry(offer_id=offer_id, structural_sha256=fp.structural, value_sha256=fp.value)
@@ -1437,6 +1427,8 @@ def _prior(conn: Connection, offer_id: str, evaluated_at: UtcDatetime) -> PriorP
     )
     latest = _subject_review(conn, "offer", offer_id, evaluated_at)
     if latest is not None and not latest.approved:
+        # A rejection is enforced by load_publication_context (the offer is rewritten to
+        # QUARANTINED, OFFER_QUARANTINED) and by the snapshot builder, not by this prior.
         review = None
     return PriorPublication(
         snapshot=baseline,
