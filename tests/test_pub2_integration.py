@@ -29,7 +29,9 @@ def test_one_real_capture_alone_never_publishes(tmp_path: Path) -> None:
     offer = run.offers["purchase-30-year"]
     now = offer.observed_at + timedelta(minutes=4)
     with open_operational_database(run.database).begin() as conn:
-        view = load_publication_context(conn, offer.offer_id, now, store=run.store)
+        view = load_publication_context(
+            conn, offer.offer_id, now, store=run.store, allow_fixture=True
+        )
         assert len(view.context.known_artifacts) == 1
         for field in ("note_rate", "apr", "points"):
             paths = [p for p in view.context.evidence_paths if p.path == field]
@@ -54,6 +56,7 @@ def test_one_real_capture_alone_never_publishes(tmp_path: Path) -> None:
                 evaluated_at=now,
                 snapshot_id="must-not-exist",
                 reviewed=True,
+                allow_fixture=True,
             )
             is None
         )
@@ -65,7 +68,11 @@ def test_two_stored_captures_export_and_audit_both_chains(tmp_path: Path) -> Non
     with open_operational_database(run.database).connect() as conn:
         assert run.reviewed_snapshot is not None
         view = load_publication_context(
-            conn, offer.offer_id, run.reviewed_snapshot.published_at, store=run.store
+            conn,
+            offer.offer_id,
+            run.reviewed_snapshot.published_at,
+            store=run.store,
+            allow_fixture=True,
         )
         captures = {a.artifact_id: a for a in view.context.known_artifacts}
         assert len(captures) == 2
@@ -140,7 +147,11 @@ def test_repeated_bytes_in_two_runs_do_not_make_independent_evidence(tmp_path: P
     offer = run.offers["purchase-30-year"]
     with open_operational_database(run.database).connect() as conn:
         view = load_publication_context(
-            conn, offer.offer_id, artifact.fetched_at + timedelta(minutes=1), store=run.store
+            conn,
+            offer.offer_id,
+            artifact.fetched_at + timedelta(minutes=1),
+            store=run.store,
+            allow_fixture=True,
         )
     decision = evaluate_publication(view.offer, view.context)
     assert R.DUPLICATE_EVIDENCE_CAPTURE in decision.reasons
@@ -155,7 +166,11 @@ def test_unverified_current_capture_cannot_borrow_verified_history(tmp_path: Pat
     offer = run.offers["purchase-30-year"]
     with open_operational_database(run.database).begin() as conn:
         view = load_publication_context(
-            conn, offer.offer_id, offer.observed_at + timedelta(minutes=4), store=run.store
+            conn,
+            offer.offer_id,
+            offer.observed_at + timedelta(minutes=4),
+            store=run.store,
+            allow_fixture=True,
         )
         primary = view.context.known_artifacts[0]
         original_run = next(r for r in view.context.fetch_runs if r.run_id == primary.fetch_run_id)
@@ -183,7 +198,11 @@ def test_unverified_current_capture_cannot_borrow_verified_history(tmp_path: Pat
         insert_artifact(conn, artifact)
         insert_capture(conn, forged, fetch.run_id)
         result = load_publication_context(
-            conn, offer.offer_id, offer.observed_at + timedelta(minutes=4), store=run.store
+            conn,
+            offer.offer_id,
+            offer.observed_at + timedelta(minutes=4),
+            store=run.store,
+            allow_fixture=True,
         )
     assert result.offer.status is OfferStatus.QUARANTINED
     assert not evaluate_publication(result.offer, result.context).publishable_now

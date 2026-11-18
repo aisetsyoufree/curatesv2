@@ -10,6 +10,8 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.engine import Connection
 
+from cu_rates.adapters.registry import verify_offer_against_stored_bytes
+from cu_rates.adapters.static_html import fragment_is_located
 from cu_rates.artifact_store import ArtifactStore, ArtifactStoreError
 from cu_rates.contracts.audit import (
     Correction,
@@ -565,13 +567,12 @@ def insert_capture(conn: Connection, offer: NormalizedOffer, run_id: str) -> Non
 def verify_located_claim(body: bytes, provenance: Provenance) -> str:
     locator = provenance.locator
     if not isinstance(locator, HtmlLocator):
-        raise ValueError("slice claims use HTML locators")
+        raise ValueError("stored claims require HTML locators")
     node = resolve_text(body, locator.selector, locator.selector_type)
-    if sha256(
-        node.encode()
-    ).hexdigest() != locator.normalized_text_sha256 or not excerpt_is_located(
-        node, provenance.source_text
-    ):
+    located = excerpt_is_located(node, provenance.source_text)
+    if provenance.extraction.parser.name == "static-html":
+        located = fragment_is_located(node, provenance.source_text)
+    if sha256(node.encode()).hexdigest() != locator.normalized_text_sha256 or not located:
         raise ValueError("stored locator or excerpt differs from source")
     return provenance.source_text
 
@@ -584,9 +585,12 @@ def publish(
     evaluated_at: UtcDatetime,
     snapshot_id: str,
     reviewed: bool = False,
+    allow_fixture: bool = False,
 ) -> PublishedSnapshot | None:
     """Atomically persist only a gate-approved automatic or explicitly reviewed publication."""
-    view = load_publication_context(conn, offer_id, evaluated_at, store=store)
+    view = load_publication_context(
+        conn, offer_id, evaluated_at, store=store, allow_fixture=allow_fixture
+    )
     offer = view.offer
     ctx = view.context.model_copy(update={"snapshot_id": snapshot_id})
     review = view.current_review
@@ -618,7 +622,13 @@ def publish(
         schema_version=CONTRACT_VERSION,
         snapshot_id=snapshot_id,
         published_at=evaluated_at,
-        published_by=review.actor if reviewed and review is not None else "t014-fixture-publisher",
+        published_by=(
+            review.actor
+            if reviewed and review is not None
+            else "t014-fixture-publisher"
+            if allow_fixture
+            else "cu-rates-publisher"
+        ),
         entries=(entry,),
         manifest_sha256=snapshot_manifest_sha256((entry,)),
         supersedes=prior.published.snapshot_id if prior else None,
@@ -726,8 +736,34 @@ def _identity_review(
     return review
 
 
+def load_source_approval(
+    conn: Connection,
+    source_id: str,
+    evaluated_at: UtcDatetime,
+) -> SourceApproval | None:
+    """Newest decision in force; a later rejection cannot fall back to an approval."""
+    row = conn.execute(
+        select(source_approvals)
+        .where(
+            source_approvals.c.source_id == source_id,
+            source_approvals.c.decided_at <= evaluated_at,
+        )
+        .order_by(
+            source_approvals.c.decided_at.desc(),
+            source_approvals.c.decision.desc(),
+            source_approvals.c.approval_id.desc(),
+        )
+    ).first()
+    return None if row is None else _approval(row)
+
+
 def load_publication_context(
-    conn: Connection, offer_id: str, evaluated_at: UtcDatetime, *, store: ArtifactStore
+    conn: Connection,
+    offer_id: str,
+    evaluated_at: UtcDatetime,
+    *,
+    store: ArtifactStore,
+    allow_fixture: bool = False,
 ) -> TrustedView:
     """Rebuild a publication candidate from verified private bytes and append-only history."""
     registered = load_normalized_offer(conn, offer_id)
@@ -768,19 +804,7 @@ def load_publication_context(
             )
         ).one()
     )
-    approval_row = conn.execute(
-        select(source_approvals)
-        .where(
-            source_approvals.c.source_id == source.source_id,
-            source_approvals.c.decided_at <= evaluated_at,
-        )
-        .order_by(
-            source_approvals.c.decided_at.desc(),
-            source_approvals.c.decision.desc(),
-            source_approvals.c.approval_id.desc(),
-        )
-    ).first()
-    approval = None if approval_row is None else _approval(approval_row)
+    approval = load_source_approval(conn, source.source_id, evaluated_at)
     run_rows = conn.execute(
         select(fetch_runs).where(
             fetch_runs.c.source_id == source.source_id, fetch_runs.c.finished_at <= evaluated_at
@@ -832,10 +856,13 @@ def load_publication_context(
             if store.get_observation(artifact.fetch_run_id, artifact.source_url) != artifact:
                 raise ValueError("stored observation differs from the database")
             if cited != {artifact.artifact_id}:
-                raise ValueError("slice claims must cite the single source artifact")
-            from cu_rates.pipeline.slice import verify_offer_bytes
-
-            comparable = verify_offer_bytes(source, offer, raw, artifact)
+                raise ValueError("offer claims must cite the single source artifact")
+            verification = verify_offer_against_stored_bytes(
+                source, approval, offer, raw, artifact, allow_fixture=allow_fixture
+            )
+            comparable = verification.comparable
+            if verification.confidence == "low":
+                raise ValueError("low-confidence extraction is quarantined")
             body, verified = raw, (artifact,)
         except (ArtifactStoreError, ValueError, OSError):
             pass
@@ -1000,9 +1027,10 @@ def load_publication_context(
             raw = store.read(art)
             if store.get_observation(art.fetch_run_id, art.source_url) != art:
                 continue
-            from cu_rates.pipeline.slice import verify_offer_bytes
-
-            if not verify_offer_bytes(source, observed_offer, raw, art):
+            verification = verify_offer_against_stored_bytes(
+                source, approval, observed_offer, raw, art, allow_fixture=allow_fixture
+            )
+            if not verification.comparable or verification.confidence == "low":
                 continue
         except (ArtifactStoreError, ValueError, OSError):
             continue

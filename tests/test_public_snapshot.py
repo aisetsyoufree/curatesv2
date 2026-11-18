@@ -66,7 +66,9 @@ class StoredFixture:
 
     def row(self, name: str = "purchase-30-year", *, now: datetime = _BIRTH) -> SnapshotCandidate:
         offer_id = self.run.offers[name].offer_id
-        view = load_publication_context(self.conn, offer_id, now, store=self.run.store)
+        view = load_publication_context(
+            self.conn, offer_id, now, store=self.run.store, allow_fixture=True
+        )
         primary = next(
             (a for a in view.context.known_artifacts if a.fetched_at == view.offer.observed_at),
             None,
@@ -86,7 +88,9 @@ class StoredFixture:
         )
 
     def approve(self, offer_id: str, *, evidence_hash: str | None = None) -> None:
-        view = load_publication_context(self.conn, offer_id, _BIRTH, store=self.run.store)
+        view = load_publication_context(
+            self.conn, offer_id, _BIRTH, store=self.run.store, allow_fixture=True
+        )
         paths = corroborated_paths(view.offer, view.context)
         assert paths
         insert_review(

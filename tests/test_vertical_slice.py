@@ -90,7 +90,7 @@ def _view(
     offer = run.offers[row]
     with open_operational_database(run.database).connect() as conn:
         return load_publication_context(
-            conn, offer.offer_id, offer.observed_at + after, store=run.store
+            conn, offer.offer_id, offer.observed_at + after, store=run.store, allow_fixture=True
         )
 
 
@@ -321,6 +321,7 @@ def test_blob_metadata_alone_cannot_feed_a_snapshot(tmp_path: Path, tamper: str)
                 store=run.store,
                 evaluated_at=after.context.evaluated_at,
                 snapshot_id="unsafe",
+                allow_fixture=True,
             )
             is None
         )
@@ -434,7 +435,9 @@ def test_new_source_decision_beats_matching_historical_304(tmp_path: Path, chang
     decision = evaluate_publication(after.offer, after.context)
     assert after.offer.observed_at == run.offers[_THIRTY].observed_at
     assert decision.outcome is PublicationOutcome.QUARANTINE
-    assert R.PROFILE_UNAPPROVED in decision.reasons
+    assert (
+        R.SOURCE_NOT_APPROVED if change == "rejection" else R.PROFILE_UNAPPROVED
+    ) in decision.reasons
 
 
 def test_offer_rejection_supersedes_historical_review(tmp_path: Path) -> None:
@@ -552,6 +555,7 @@ def test_changed_rate_goes_through_gate_against_actual_historical_baseline(tmp_p
                 store=run.store,
                 evaluated_at=view.context.evaluated_at,
                 snapshot_id="changed",
+                allow_fixture=True,
             )
             is None
         )

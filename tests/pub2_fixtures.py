@@ -29,7 +29,9 @@ def reviewed_fixture(root: Path) -> SliceRun:
     engine = open_operational_database(run.database)
     now = chosen.observed_at + timedelta(minutes=1, seconds=1)
     with engine.begin() as conn:
-        first = load_publication_context(conn, chosen.offer_id, now, store=run.store)
+        first = load_publication_context(
+            conn, chosen.offer_id, now, store=run.store, allow_fixture=True
+        )
         original = first.context.known_artifacts[0]
         original_run = next(
             r for r in first.context.fetch_runs if r.run_id == original.fetch_run_id
@@ -54,7 +56,9 @@ def reviewed_fixture(root: Path) -> SliceRun:
             }
         )
         record_fixture_capture(conn, "athol-style-dated", run.store, fetch, artifact)
-        view = load_publication_context(conn, chosen.offer_id, now, store=run.store)
+        view = load_publication_context(
+            conn, chosen.offer_id, now, store=run.store, allow_fixture=True
+        )
         pair = corroborated_paths(view.offer, view.context)
         assert len(pair) == 6
         review = ReviewDecision(
@@ -73,7 +77,11 @@ def reviewed_fixture(root: Path) -> SliceRun:
         insert_review(conn, review, CHARTER)
         run.first = {
             key: evaluate_publication(
-                (v := load_publication_context(conn, offer.offer_id, now, store=run.store)).offer,
+                (
+                    v := load_publication_context(
+                        conn, offer.offer_id, now, store=run.store, allow_fixture=True
+                    )
+                ).offer,
                 v.context,
             )
             for key, offer in run.offers.items()
@@ -85,6 +93,7 @@ def reviewed_fixture(root: Path) -> SliceRun:
             evaluated_at=now,
             snapshot_id="fixture-reviewed",
             reviewed=True,
+            allow_fixture=True,
         )
         assert run.reviewed_snapshot is not None
         moment = original.fetched_at + timedelta(minutes=2)
@@ -107,9 +116,13 @@ def reviewed_fixture(root: Path) -> SliceRun:
             response_etag=original_run.conditional_validator.value,
         )
         insert_reobservation(conn, observation)
-        refreshed = load_publication_context(conn, chosen.offer_id, moment, store=run.store)
+        refreshed = load_publication_context(
+            conn, chosen.offer_id, moment, store=run.store, allow_fixture=True
+        )
         insert_validations(conn, validate_offer(refreshed.offer, moment))
-        refreshed = load_publication_context(conn, chosen.offer_id, moment, store=run.store)
+        refreshed = load_publication_context(
+            conn, chosen.offer_id, moment, store=run.store, allow_fixture=True
+        )
         run.refresh = evaluate_publication(refreshed.offer, refreshed.context)
         run.refreshed_snapshot = publish(
             conn,
@@ -117,6 +130,7 @@ def reviewed_fixture(root: Path) -> SliceRun:
             store=run.store,
             evaluated_at=moment,
             snapshot_id="fixture-refreshed",
+            allow_fixture=True,
         )
     engine.dispose()
     return run

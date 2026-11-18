@@ -134,14 +134,16 @@ def resolve_text(body: bytes, selector: str, selector_type: str = "css") -> str:
                 (n for n in root.walk() if n.tag == "a" and n.attrs.get("href") == href), selector
             ).attrs["href"]
     elif selector_type == "css":
-        match = re.fullmatch(rf"#({_ID})(?: > td:nth-child\(([1-9][0-9]*)\))?", selector)
+        match = re.fullmatch(
+            rf"#({_ID})(?: > ([a-z][a-z0-9]*):nth-child\(([1-9][0-9]*)\))?", selector
+        )
         if match:
             node = _by_id(root, match[1])
             if match[2] is None:
                 return node.text()
-            index = int(match[2]) - 1
+            index = int(match[3]) - 1
             children = node.children
-            if index < len(children) and children[index].tag == "td":
+            if index < len(children) and children[index].tag == match[2]:
                 return children[index].text()
         match = re.fullmatch(r"h2:nth-of-type\(([1-9][0-9]*)\) \+ p", selector)
         if match:
