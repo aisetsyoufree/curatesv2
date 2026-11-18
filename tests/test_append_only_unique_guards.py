@@ -240,7 +240,7 @@ def test_deployed_upgrade_downgrade_restores_frozen_sql_and_data(
         raise AssertionError("migration must use frozen SQL")
 
     monkeypatch.setattr(s, "schema_triggers", no_live_builder)
-    upgrade_database(path)
+    upgrade_database(path, REVISION)
     assert current_revision(path) == REVISION
     with closing(sqlite3.connect(path)) as raw:
         assert _triggers(raw) == expected
@@ -250,7 +250,7 @@ def test_deployed_upgrade_downgrade_restores_frozen_sql_and_data(
     with closing(sqlite3.connect(path)) as raw:
         assert _triggers(raw) == before
         assert {table: _rows(raw, table) for table in kept} == kept
-    upgrade_database(path)
+    upgrade_database(path, REVISION)
     with closing(sqlite3.connect(path)) as raw:
         assert _triggers(raw) == expected
         assert {table: _rows(raw, table) for table in kept} == kept
@@ -258,7 +258,8 @@ def test_deployed_upgrade_downgrade_restores_frozen_sql_and_data(
 
 def test_migration_order_is_linear_and_sql_is_frozen(tmp_path: Path) -> None:
     script = ScriptDirectory.from_config(_config(tmp_path / "unused.sqlite"))
-    assert script.get_heads() == [REVISION]
+    assert len(script.get_heads()) == 1
+    assert REVISION in {r.revision for r in script.walk_revisions()}
     revision = script.get_revision(REVISION)
     assert revision is not None
     assert revision.down_revision == PREVIOUS

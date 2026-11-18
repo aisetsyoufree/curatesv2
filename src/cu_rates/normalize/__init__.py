@@ -97,7 +97,8 @@ _INLINE_RATES = frozenset(
 _TOP_LEVEL_RATES = frozenset({"note_rate", "apr", "points"})
 _EXTRA_STATEMENTS = frozenset({"property_value", "first_lien_balance", "autopay_discount"})
 _EQUITY_QUALIFIERS = frozenset({"lien_position", "max_cltv", "min_amount", "max_amount"})
-_SUPPLEMENTAL = _EXTRA_STATEMENTS | _EQUITY_QUALIFIERS
+# Equity qualifiers have no contract dimension; every canonical assumption does.
+_SUPPLEMENTAL = _EQUITY_QUALIFIERS
 _DIMENSIONS = frozenset(item.value for item in ScenarioDimension) | _EXTRA_STATEMENTS
 _DIRECT: dict[str, str] = {
     _D.TERM_MONTHS: "details.term_months",
@@ -579,8 +580,8 @@ def normalize_offer(
                 "scenario_id", "comparison target has a different family or purpose"
             )
     checks = _scenario_checks(context, traces)
-    # The contract has no dimensions for these additional canonical assumptions.
-    # An explicit deal-breaker is still expressible as an evidence-backed condition.
+    # An explicit deal-breaker is also shown to the borrower as an evidence-backed
+    # condition, in addition to its scenario match.
     conditions += tuple(
         OfferCondition(
             condition_id=f"t044.scenario.{check.dimension}",
@@ -590,7 +591,7 @@ def normalize_offer(
             scenario_state=check.state,
         )
         for check in checks
-        if check.dimension in _SUPPLEMENTAL
+        if check.dimension in (_SUPPLEMENTAL | _EXTRA_STATEMENTS)
         and check.state is MatchState.CONFLICTS
         and check.provenance is not None
     )

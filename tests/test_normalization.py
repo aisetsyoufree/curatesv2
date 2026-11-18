@@ -500,6 +500,8 @@ def test_no_offer_when_no_usable_rate_and_explicit_no_rate_cannot_be_overridden(
         ("details.min_amount", "$60,000", "min_amount", MatchState.CONFLICTS),
         ("details.max_amount", "$49,999", "max_amount", MatchState.CONFLICTS),
         ("scenario.property_value", "$600,000", "property_value", MatchState.CONFLICTS),
+        ("scenario.first_lien_balance", "$300,000", "first_lien_balance", MatchState.CONFLICTS),
+        ("scenario.first_lien_balance", "$350,000", "first_lien_balance", MatchState.MATCHES),
     ],
 )
 def test_additional_equity_assumptions_are_not_silently_dropped(
@@ -525,6 +527,10 @@ def test_additional_equity_assumptions_are_not_silently_dropped(
     check = next(check for check in result.scenario_checks if check.dimension == dimension)
     assert result.scenario_state is state and check.state is state
     assert check.provenance is not None and check.provenance.source_text == value
+    if dimension in {"property_value", "first_lien_balance"}:
+        # Canonical dimensions are first-class matches on the offer, not only checks.
+        matches = {m.dimension.value: m.state for m in offer.scenario_matches}
+        assert matches[dimension] is state
     if state is MatchState.CONFLICTS:
         condition = next(
             c for c in offer.conditions if c.condition_id == f"t044.scenario.{dimension}"

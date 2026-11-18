@@ -609,6 +609,8 @@ def test_unsupported_supplemental_assumptions_never_rank_even_if_core_matches(
         s.fetch_run_id == "synthetic-repeat-200" for s in view.context.verified_scenario_statements
     )
     decision = evaluate_publication(view.offer, view.context)
-    assert R.SCENARIO_UNSTATED in decision.reasons
+    # The autopay assumption is a first-class canonical dimension: a source that
+    # requires autopay is a scenario conflict, not merely an unstated assumption.
+    assert R.SCENARIO_CONFLICT in decision.reasons
     assert R.STRUCTURAL_CHANGE in decision.reasons
     assert not decision.publishable_now

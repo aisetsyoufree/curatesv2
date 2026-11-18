@@ -353,16 +353,24 @@ def matches_all(scenario_id: CanonicalScenarioId) -> tuple[DimensionMatch, ...]:
         ScenarioDimension.POINTS: f"{scenario.points} points",
         ScenarioDimension.CASH_OUT: "No cash out",
         ScenarioDimension.RELATIONSHIP_DISCOUNT: "No relationship discount",
+        ScenarioDimension.PROPERTY_VALUE: "$" + str(scenario.property_value),
+        ScenarioDimension.AUTOPAY: "No autopay discount",
+        ScenarioDimension.FIRST_LIEN_BALANCE: (
+            "$" + str(scenario.first_lien_balance)
+            if scenario.first_lien_balance is not None
+            else None
+        ),
     }
     return tuple(
         DimensionMatch(
             dimension=dimension,
             state=MatchState.MATCHES,
-            source_text=texts[dimension],
+            source_text=text,
             stated=matching_statement(scenario, dimension),
-            provenance=provenance(texts[dimension]),
+            provenance=provenance(text),
         )
         for dimension in sorted(REQUIRED_DIMENSIONS[scenario_id])
+        if (text := texts.get(dimension)) is not None
     )
 
 
