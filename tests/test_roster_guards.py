@@ -23,6 +23,7 @@ from cu_rates.db import (
     current_revision,
     downgrade_database,
     open_operational_database,
+    script_head,
     upgrade_database,
 )
 from cu_rates.db.migrate import VERSIONS_DIR
@@ -332,7 +333,7 @@ def test_empty_downgrade_restores_previous_roster_triggers(tmp_path: Path) -> No
     finally:
         raw.close()
     upgrade_database(path)
-    assert current_revision(path) == "aud4b_roster_guards"
+    assert current_revision(path) == script_head()
     raw = sqlite3.connect(path)
     try:
         stored = raw.execute(

@@ -1,6 +1,6 @@
 """Publication uses stored capture history, never an inferred second observation."""
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -90,7 +90,8 @@ def test_two_stored_captures_export_and_audit_both_chains(tmp_path: Path) -> Non
             assert isinstance(artifact_id, str)
             artifact = captures[artifact_id]
             assert claim["capture_id"] == artifact.fetch_run_id
-            assert claim["observed_at"] == artifact.fetched_at.isoformat()
+            assert isinstance(claim["observed_at"], str)
+            assert datetime.fromisoformat(claim["observed_at"]) == artifact.fetched_at
             assert claim["content_sha256"] == artifact_id
             assert claim["locator"]
             assert "source_text" not in claim

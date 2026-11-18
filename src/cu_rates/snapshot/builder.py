@@ -55,13 +55,16 @@ from ._files import (
     writer_lock,
 )
 from ._models import (
+    PublicAdmission,
     PublicAssumption,
     PublicCondition,
     PublicEvidence,
+    PublicEvidencePath,
     PublicOffer,
     PublicTier,
     SnapshotInfo,
     Version,
+    public_evidence_sha256,
 )
 
 _ID = TypeAdapter(Identifier)
@@ -143,20 +146,34 @@ def _public_projection(row: SnapshotCandidate, placement: Placement, reviewed: b
         PublicEvidence(path=p.path, artifact_id=p.artifact_id, locator=p.provenance.locator)
         for p in paths
     )
-    # Additive metadata in the existing public details map preserves format-1 readers.
-    # Excerpts and private extraction text remain excluded from public exports.
-    details["publication_evidence"] = [
-        {
-            "path": p.path,
-            "artifact_id": p.artifact_id,
-            "content_sha256": p.content_sha256,
-            "capture_id": p.capture_id,
-            "observed_at": p.observed_at.isoformat(),
-            "source_id": p.source_id,
-            "locator": p.provenance.locator.model_dump(mode="json"),
-        }
+    # Persist a verifiable public admission receipt. Private excerpts and full
+    # review evidence remain in worker storage, never in the public database.
+    public_paths = tuple(
+        PublicEvidencePath(
+            path=p.path,
+            value=p.value,
+            artifact_id=p.artifact_id,
+            content_sha256=p.content_sha256,
+            capture_id=p.capture_id,
+            observed_at=p.observed_at,
+            source_id=p.source_id,
+            product_id=p.product_id,
+            scenario_id=p.scenario_id,
+            source_class=p.source_class,
+            locator=p.provenance.locator,
+        )
         for p in paths
-    ]
+        if p.scenario_id is not None
+    )
+    details.update(
+        PublicAdmission(
+            publication_version=ctx.publication_version,
+            publication_evidence=public_paths,
+            publication_evidence_sha256=public_evidence_sha256(
+                offer.offer_id, facts.fingerprints, public_paths
+            ),
+        ).model_dump(mode="json")
+    )
     return PublicOffer(
         offer_id=offer.offer_id,
         product_id=offer.product_id,
@@ -329,7 +346,10 @@ class SnapshotPublisher:
             ):
                 raise SnapshotError("admitted offers do not match the declared manifest")
             info = SnapshotInfo.model_validate(
-                manifest.model_dump(exclude={"entries", "review_ids"})
+                {
+                    **manifest.model_dump(exclude={"entries", "review_ids"}),
+                    "publication_version": "2.0",
+                }
             )
             versions = self._prepare()
             with writer_lock(self.root / ".publisher.lock"):

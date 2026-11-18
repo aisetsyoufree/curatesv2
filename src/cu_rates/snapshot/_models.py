@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime
 from typing import Literal, Self
 
@@ -16,6 +18,7 @@ from cu_rates.contracts.base import (
     Points,
     SchemaVersion,
     Sha256Hex,
+    SignedPercent,
     Text,
     UtcDatetime,
 )
@@ -30,7 +33,11 @@ from cu_rates.contracts.enums import (
 from cu_rates.contracts.evidence import EvidenceLocator
 from cu_rates.contracts.fingerprints import OfferFingerprints, RateValue, value_fingerprint
 from cu_rates.contracts.offers import TierBound
-from cu_rates.contracts.publication import Placement
+from cu_rates.contracts.publication import (
+    AUTHORITATIVE_SOURCE_CLASSES,
+    DUAL_EVIDENCE_TIME_WINDOW,
+    Placement,
+)
 from cu_rates.contracts.scenarios import StatedBound
 
 
@@ -55,6 +62,44 @@ class PublicCondition(ContractModel):
 class PublicTier(ContractModel):
     tier_id: Identifier
     bounds: tuple[TierBound, ...]
+
+
+class PublicEvidencePath(PublicEvidence):
+    """Public portion of a path already verified by the worker admission gate."""
+
+    value: SignedPercent
+    content_sha256: Sha256Hex
+    capture_id: Identifier
+    observed_at: UtcDatetime
+    source_id: Identifier
+    product_id: Identifier
+    scenario_id: CanonicalScenarioId
+    source_class: Text
+
+
+class PublicAdmission(ContractModel):
+    publication_version: Literal["2.0"]
+    publication_evidence: tuple[PublicEvidencePath, ...]
+    publication_evidence_sha256: Sha256Hex
+
+
+def public_evidence_sha256(
+    offer_id: str, fingerprints: OfferFingerprints, paths: tuple[PublicEvidencePath, ...]
+) -> str:
+    """Bind the public admission receipt, separately from the private review digest.
+
+    The private publication_evidence_sha256 includes excerpts/extraction records
+    that must never be exported. This domain binds their admitted public projection.
+    """
+    payload = {
+        "publication_version": "2.0",
+        "offer_id": offer_id,
+        "fingerprints": fingerprints.model_dump(mode="json"),
+        "paths": sorted(p.model_dump_json() for p in paths),
+    }
+    return hashlib.sha256(
+        ("public-publication-evidence-v2:" + json.dumps(payload, sort_keys=True)).encode()
+    ).hexdigest()
 
 
 class PublicOffer(ContractModel):
@@ -96,8 +141,74 @@ class PublicOffer(ContractModel):
             raise ValueError("invalid public offer or value fingerprint")
         return self
 
+    def require_protocol2(self) -> PublicAdmission:
+        """Enforce admission at the storage trust boundary, including retained versions.
+
+        A projection alone is not publication approval. Both public reads and
+        rollback must call this before exposing or activating any stored row.
+        """
+        admission = PublicAdmission.model_validate(
+            {name: self.details.get(name) for name in PublicAdmission.model_fields}
+        )
+        paths = admission.publication_evidence
+        if admission.publication_evidence_sha256 != public_evidence_sha256(
+            self.offer_id, self.fingerprints, paths
+        ):
+            raise ValueError("public publication evidence digest mismatch")
+        rates = {rate.path: rate.value for rate in self.rates}
+        # The HELOC post-intro value is a deterministic alias/derivation of sourced
+        # values, not a separately captured claim. Require corroboration of all
+        # its inputs and recompute it rather than inventing evidence for the output.
+        if self.family is ProductFamily.HELOC and "details.post_intro_rate" in rates:
+            post_intro = rates.pop("details.post_intro_rate")
+            expected = rates.get("details.stated_post_intro_apr")
+            if expected is None:
+                index = rates.get("details.index_rate")
+                margin = rates.get("details.margin")
+                floor = rates.get("details.floor")
+                if (
+                    index is None
+                    or margin is None
+                    or floor is None
+                    or not self.details.get("index_name")
+                ):
+                    raise ValueError("HELOC derivation requires all sourced inputs")
+                expected = max(index + margin, floor)
+                ceiling = rates.get("details.ceiling")
+                if ceiling is not None:
+                    expected = min(expected, ceiling)
+            if post_intro != expected:
+                raise ValueError("HELOC post-intro value does not match its sourced inputs")
+        values = {**rates, **({"points": self.points} if self.points is not None else {})}
+        if {p.path for p in paths} != values.keys():
+            raise ValueError("publication evidence must cover every financial value")
+        for p in paths:
+            if (
+                p.value != values[p.path]
+                or p.source_id != self.source_id
+                or p.product_id != self.product_id
+                or p.scenario_id != self.scenario_id
+                or p.source_class not in AUTHORITATIVE_SOURCE_CLASSES
+                or p.content_sha256 != p.artifact_id
+                or not self.observed_at - DUAL_EVIDENCE_TIME_WINDOW
+                <= p.observed_at
+                <= self.observed_at
+                or PublicEvidence(path=p.path, artifact_id=p.artifact_id, locator=p.locator)
+                not in self.evidence
+            ):
+                raise ValueError("publication evidence is not bound to the public value")
+        for path in values:
+            pair = [p for p in paths if p.path == path]
+            if len(pair) != 2 or any(
+                getattr(pair[0], key) == getattr(pair[1], key)
+                for key in ("artifact_id", "content_sha256", "capture_id", "observed_at")
+            ):
+                raise ValueError("public value requires two independent evidence paths")
+        return admission
+
 
 class SnapshotInfo(ContractModel):
+    publication_version: Literal["2.0"]
     schema_version: SchemaVersion
     snapshot_id: Identifier
     published_at: UtcDatetime
