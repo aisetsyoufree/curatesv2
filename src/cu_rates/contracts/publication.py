@@ -1009,9 +1009,9 @@ def _pair_reasons(p1: EvidencePath, p2: EvidencePath) -> set[ReasonCode]:
     reasons: set[ReasonCode] = set()
     # Separate guards deliberately: each identity is independently necessary.
     # D-20: identical bytes are fine in principle (a static page); what must differ is the fetch,
-    # NOTE: the trusted loader and artifact lookups still key on artifact_id, so identical bytes
-    # from two runs fail closed end to end until that lookup is capture-aware (issue filed).
     # and the two fetches must be far enough apart to be independent observations.
+    # NOTE: the trusted loader and artifact lookups still key on artifact_id, so identical bytes
+    # from two runs fail closed end to end until that lookup is capture-aware (issue #143).
     if p1.capture_id == p2.capture_id:
         reasons.add(R.DUPLICATE_EVIDENCE_CAPTURE)
     if abs(p1.observed_at - p2.observed_at) < DUAL_EVIDENCE_MIN_SPACING:

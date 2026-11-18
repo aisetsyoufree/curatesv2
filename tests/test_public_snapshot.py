@@ -673,7 +673,7 @@ def test_read_degrades_ranking_before_hard_expiry(
         "missing-reference",
         "duplicate-capture",
         "duplicate-time",
-        "duplicate-artifact",
+        "too-close",
         "wrong-value",
         "wrong-product",
         "wrong-scenario",
@@ -781,9 +781,10 @@ def test_protocol2_reader_and_rollback_refuse_ineligible_sealed_rows(
                     second["capture_id"] = first["capture_id"]
                 elif defect == "duplicate-time":
                     second["observed_at"] = first["observed_at"]
-                elif defect == "duplicate-artifact":
-                    second["artifact_id"] = first["artifact_id"]
-                    second["content_sha256"] = first["content_sha256"]
+                elif defect == "too-close":
+                    # D-20: separate fetches must be at least three hours apart.
+                    first_at = datetime.fromisoformat(first["observed_at"])
+                    second["observed_at"] = (first_at - timedelta(hours=2, minutes=59)).isoformat()
                 elif defect == "wrong-value":
                     second["value"] = "9.125"
                 elif defect == "wrong-product":
