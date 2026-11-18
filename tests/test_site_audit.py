@@ -367,8 +367,14 @@ def test_sqlite_writable_connection_negative_controls() -> None:
     findings = database_findings(pragma_ro_src, ["cu_rates.web"])
     assert any("sqlite writable connection 'sqlite3.connect'" in f for f in findings)
 
-    # 8. URI query parsing: a fragment or a filename containing mode=ro is not read-only
-    for bad in ("file:pub.sqlite#mode=ro", "file:x?notmode=ro", "file:mode=ro.sqlite"):
+    # 8. URI query parsing: lookalike scheme, fragment, or filename with mode=ro is not read-only
+    for bad in (
+        "file:pub.sqlite#mode=ro",
+        "file:x?notmode=ro",
+        "file:mode=ro.sqlite",
+        "xfile:pub.sqlite?mode=ro",
+        "/tmp/file:pub.sqlite?mode=ro",
+    ):
         bad_src = {
             "cu_rates.web": "import cu_rates.snapshot.reader",
             "cu_rates.snapshot.reader": (
@@ -494,3 +500,33 @@ def test_sqlite_sql_and_pragma_negative_controls() -> None:
     }
     findings = database_findings(introspection_src, ["cu_rates.web"])
     assert findings == []
+
+    # 9. Literal CREATE INDEX / CREATE VIEW / REINDEX / ANALYZE are detected and rejected
+    for stmt in (
+        "CREATE INDEX idx ON test(id)",
+        "CREATE VIEW v AS SELECT 1",
+        "REINDEX",
+        "ANALYZE",
+    ):
+        write_sql_src = {
+            "cu_rates.web": "import cu_rates.snapshot.reader",
+            "cu_rates.snapshot.reader": (
+                "import sqlite3\n"
+                "conn = sqlite3.connect('file:pub.sqlite?mode=ro', uri=True)\n"
+                f"conn.execute({stmt!r})"
+            ),
+        }
+        findings = database_findings(write_sql_src, ["cu_rates.web"])
+        assert any("sqlite write statement" in f for f in findings), stmt
+
+    # 10. Literal non-allowlisted SQL is detected and rejected
+    unauthorized_sql_src = {
+        "cu_rates.web": "import cu_rates.snapshot.reader",
+        "cu_rates.snapshot.reader": (
+            "import sqlite3\n"
+            "conn = sqlite3.connect('file:pub.sqlite?mode=ro', uri=True)\n"
+            "conn.execute('SELECT * FROM secret_table')"
+        ),
+    }
+    findings = database_findings(unauthorized_sql_src, ["cu_rates.web"])
+    assert any("sqlite forbidden literal SQL" in f for f in findings)

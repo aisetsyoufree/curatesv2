@@ -185,6 +185,14 @@ class FormattedOffer:
     intro_rate_display: str = ""
 
 
+def exact_decimal(value: Decimal, minimum_places: int = 3) -> str:
+    """Show a published value exactly: at least three places, never silently rounded."""
+    if not value.is_finite():
+        raise ValueError("a non-finite value cannot be displayed")
+    places = max(minimum_places, -int(value.as_tuple().exponent))
+    return f"{abs(value) if value.is_zero() else value:.{places}f}"  # never "-0.000"
+
+
 def format_age(delta: timedelta) -> str:
     if delta.total_seconds() < 0:
         return "current"
@@ -406,9 +414,9 @@ def classify_and_format_offer(offer: PublicOffer, now: datetime) -> FormattedOff
                 if isinstance(dur_val, int):
                     intro_duration = dur_val
             if intro_duration is not None:
-                intro_label = f"Intro: {intro_rate:.3f}% ({intro_duration} mos)"
+                intro_label = f"Intro: {exact_decimal(intro_rate)}% ({intro_duration} mos)"
             else:
-                intro_label = f"Intro: {intro_rate:.3f}% (duration not published)"
+                intro_label = f"Intro: {exact_decimal(intro_rate)}% (duration not published)"
 
     # Decision D-05: Rate without APR is excluded from comparison tables entirely
     if apr is None:
@@ -451,15 +459,19 @@ def classify_and_format_offer(offer: PublicOffer, now: datetime) -> FormattedOff
 
     if note_rate is not None:
         base_rate_str = (
-            f"As low as {note_rate:.3f}%" if offer.headline_is_as_low_as else f"{note_rate:.3f}%"
+            f"As low as {exact_decimal(note_rate)}%"
+            if offer.headline_is_as_low_as
+            else f"{exact_decimal(note_rate)}%"
         )
         note_rate_display = f"{base_rate_str} ({intro_label})" if intro_label else base_rate_str
     elif intro_label:
         note_rate_display = f"Post-intro not published ({intro_label})"
     else:
         note_rate_display = "Not published"
-    apr_display = f"{apr:.3f}%" if apr is not None else "Not published"
-    points_display = f"{offer.points:.3f}" if offer.points is not None else "Not published"
+    apr_display = f"{exact_decimal(apr)}%" if apr is not None else "Not published"
+    points_display = (
+        f"{exact_decimal(offer.points)}" if offer.points is not None else "Not published"
+    )
     term_display = format_term(offer)
     loan_type_display = format_loan_type(offer)
     conditions_display = format_conditions(offer)
