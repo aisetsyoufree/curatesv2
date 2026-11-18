@@ -25,7 +25,7 @@ from tests.site_audit import (
     parse_csp,
     same_origin,
 )
-from tests.test_web import _build_test_snapshot, _json_ld, _make_candidate, parse_page
+from tests.test_web import _json_ld, _make_candidate, _mock_public_reader, parse_page
 
 ROOT = Path(__file__).resolve().parents[1]
 GA_ID = "G-ABC1234567"
@@ -292,7 +292,7 @@ def test_consent_state_is_never_shared_cached() -> None:
 
 
 @pytest.fixture
-def comparison_config(tmp_path: Path) -> dict[str, Any]:
+def comparison_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     candidates = [
         _make_candidate("a", "Alpha CU", apr_str="7.000"),
         _make_candidate("z", "Zeta CU", note_rate_str="3.875", apr_str="4.000"),
@@ -301,7 +301,7 @@ def comparison_config(tmp_path: Path) -> dict[str, Any]:
         ),
         _make_candidate("incomplete", "Incomplete CU", points_str="1"),
     ]
-    publisher, denylist = _build_test_snapshot(tmp_path, candidates)
+    publisher, denylist = _mock_public_reader(tmp_path, monkeypatch, candidates)
     return {
         "TESTING": True,
         "SNAPSHOT_ROOT": str(publisher.root),
