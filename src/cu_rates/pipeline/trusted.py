@@ -108,6 +108,7 @@ from cu_rates.db.schema import (
     withdrawal_lifts,
 )
 from cu_rates.pipeline.extract import excerpt_is_located, layout_sha256, resolve_text
+from cu_rates.snapshot import Denylist
 
 _FRESHNESS = timedelta(hours=71)
 
@@ -456,7 +457,27 @@ def insert_finding(conn: Connection, finding: ProductFinding) -> None:
         )
 
 
-def insert_withdrawal(conn: Connection, entry: WithdrawalEntry) -> None:
+def insert_withdrawal(conn: Connection, entry: WithdrawalEntry, *, denylist: Denylist) -> None:
+    """Suppress public reads before the operational transaction records a withdrawal.
+
+    A failed transaction can retry the same immutable entry. Lifting suppression is
+    a separate operator action; this path never restores a source implicitly.
+    """
+    entry = WithdrawalEntry.model_validate(entry.model_dump())
+    denylist.withdraw(entry)
+    prior = (
+        conn.execute(
+            select(withdrawal_entries).where(
+                withdrawal_entries.c.withdrawal_id == entry.withdrawal_id
+            )
+        )
+        .mappings()
+        .first()
+    )
+    if prior is not None:
+        if dict(prior) != entry.model_dump(exclude={"lifted_at", "lifted_by"}):
+            raise ValueError("withdrawal ID already exists with different content")
+        return
     conn.execute(
         withdrawal_entries.insert(),
         {
@@ -469,15 +490,6 @@ def insert_withdrawal(conn: Connection, entry: WithdrawalEntry) -> None:
             "reason": entry.reason,
         },
     )
-    if entry.lifted_at is not None:
-        conn.execute(
-            withdrawal_lifts.insert(),
-            {
-                "withdrawal_id": entry.withdrawal_id,
-                "lifted_at": entry.lifted_at,
-                "lifted_by": entry.lifted_by,
-            },
-        )
 
 
 def _insert_snapshot(conn: Connection, snapshot: PublishedSnapshot) -> None:

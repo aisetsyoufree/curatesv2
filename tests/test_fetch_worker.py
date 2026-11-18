@@ -3,6 +3,7 @@
 import fcntl
 import gzip
 import ipaddress
+import sqlite3
 import zlib
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
@@ -15,15 +16,26 @@ import pytest
 
 from cu_rates import fetch_worker
 from cu_rates.artifact_store import ArtifactStore
+from cu_rates.contracts.audit import WithdrawalEntry
 from cu_rates.contracts.base import CONTRACT_VERSION
-from cu_rates.contracts.enums import EvidenceKind, FetchMethod, ReviewVerdict, RunStatus
+from cu_rates.contracts.enums import (
+    EvidenceKind,
+    FetchMethod,
+    ReviewVerdict,
+    RunStatus,
+    WithdrawalScope,
+)
 from cu_rates.contracts.sources import (
     ConditionalValidator,
     FetchProfile,
     RateSource,
+    SourceApproval,
     profile_sha256,
 )
+from cu_rates.db import metadata, open_operational_database
+from cu_rates.db.schema import withdrawal_entries
 from cu_rates.fetch_dialer import TOTAL_TIMEOUT_EXTENSION, LoopbackOverride, PinnedTransport
+from cu_rates.fetch_policy import FetchRegistry, TermsLedger
 from cu_rates.fetch_worker import (
     ROBOTS_TTL,
     USER_AGENT,
@@ -32,6 +44,12 @@ from cu_rates.fetch_worker import (
     FetchWorker,
     TermsReview,
 )
+from cu_rates.pipeline.trusted import (
+    insert_approval,
+    insert_profile,
+    insert_source,
+)
+from cu_rates.snapshot import Denylist
 
 URL = "https://credit-union.test/rates"
 BODY = b"<html>Synthetic fixture</html>"
@@ -88,6 +106,7 @@ class Pilot:
             policy_id="d-12",
             policy_version="1",
             rationale="Offline test only",
+            approved_profile_sha256=profile_sha256(self.profile),
             profile=self.profile,
             evidence_kind=EvidenceKind.HTML,
         )
@@ -99,6 +118,33 @@ class Pilot:
                 "terms_sha256": "a" * 64,
             }
         )
+        self.database = root / "registry.sqlite"
+        self.denylist = Denylist(root / "independent" / "withdrawals.json")
+        self.denylist.initialize()
+        self.terms_ledger = TermsLedger(root / "private" / "terms.json")
+        self.terms_ledger.initialize()
+        self.registry = FetchRegistry(self.database, self.terms_ledger, self.denylist)
+        self.persist_policy()
+
+    def persist_policy(self) -> None:
+        """Seed a fresh synthetic registry; never run this in worker/fetch calls."""
+        self.database.unlink(missing_ok=True)
+        engine = open_operational_database(self.database)
+        metadata.create_all(engine)
+        with engine.begin() as conn:
+            insert_source(conn, self.source)
+            insert_profile(conn, self.profile)
+            insert_approval(
+                conn,
+                SourceApproval.model_validate(
+                    self.approval.model_dump(exclude={"profile", "evidence_kind"})
+                ),
+                9000001,
+            )
+        engine.dispose()
+        self.terms_ledger.path.unlink()
+        self.terms_ledger.initialize()
+        self.terms_ledger.record(self.terms, denylist=self.denylist)
 
     def worker(
         self,
@@ -118,6 +164,7 @@ class Pilot:
             self.store,
             transport_factory,
             git_sha="0" * 40,
+            registry=self.registry,
             clock=self.clock.now,
             monotonic=self.clock.now,
             sleep=self.clock.sleep,
@@ -125,7 +172,7 @@ class Pilot:
         )
 
     def fetch(self, handler: Callable[[httpx.Request], httpx.Response]) -> FetchResult:
-        return self.worker(handler).fetch(self.source, self.profile, self.approval, self.terms)
+        return self.worker(handler).fetch(self.source, self.profile)
 
 
 @pytest.fixture
@@ -174,13 +221,20 @@ def test_no_http_without_approval(pilot: Pilot, kind: str) -> None:
         pilot.approval = pilot.approval.model_copy(
             update={"decided_at": pilot.approval.decided_at + timedelta(days=1)},
         )
-    result = pilot.worker(ok).fetch(
-        pilot.source,
-        pilot.profile,
-        pilot.approval,
-        pilot.terms,
-        withdrawn=kind == "withdrawn",
-    )
+    pilot.persist_policy()
+    if kind == "withdrawn":
+        pilot.denylist.withdraw(
+            WithdrawalEntry(
+                schema_version=CONTRACT_VERSION,
+                withdrawal_id="test-withdrawn",
+                scope=WithdrawalScope.SOURCE,
+                target_id=pilot.source.source_id,
+                actor="Synthetic reviewer",
+                withdrawn_at=pilot.approval.decided_at,
+                reason="Synthetic withdrawal",
+            )
+        )
+    result = pilot.worker(ok).fetch(pilot.source, pilot.profile)
     assert result.artifact is None and result.run is None
     assert not pilot.calls
 
@@ -211,7 +265,7 @@ def test_disallow_and_allow_overlap_fails_closed(pilot: Pilot) -> None:
     assert result.reason == "robots-disallowed" and result.artifact is None
     assert len(pilot.calls) == 1
     pilot.clock.sleep(60)
-    assert pilot.fetch(ok).reason == "source-paused"
+    assert pilot.fetch(ok).reason == "source-withdrawn"
     assert len(pilot.calls) == 1
 
 
@@ -233,7 +287,7 @@ def test_challenge_prefix_immediately_pauses_target(pilot: Pilot, target: str) -
     assert len(pilot.calls) == (1 if target.startswith("robots") else 2)
     assert list(pilot.store.observations()) == []
     pilot.clock.sleep(60)
-    assert pilot.fetch(ok).reason == "source-paused"
+    assert pilot.fetch(ok).reason == "source-withdrawn"
 
 
 def test_challenge_header_stops_without_decoding_body(pilot: Pilot) -> None:
@@ -246,14 +300,15 @@ def test_challenge_header_stops_without_decoding_body(pilot: Pilot) -> None:
 
     assert pilot.fetch(handler).reason == "access-challenge"
     pilot.clock.sleep(60)
-    assert pilot.fetch(ok).reason == "source-paused"
+    assert pilot.fetch(ok).reason == "source-withdrawn"
 
 
 def test_changed_profile_or_reused_terms_decision_does_not_fetch(pilot: Pilot) -> None:
     profile = pilot.profile.model_copy(update={"min_interval_seconds": 5})
-    assert pilot.worker(ok).fetch(pilot.source, profile, pilot.approval, pilot.terms).run is None
-    terms = pilot.terms.model_copy(update={"approval_id": pilot.approval.approval_id})
-    assert pilot.worker(ok).fetch(pilot.source, pilot.profile, pilot.approval, terms).run is None
+    assert pilot.worker(ok).fetch(pilot.source, profile).run is None
+    pilot.terms = pilot.terms.model_copy(update={"approval_id": pilot.approval.approval_id})
+    pilot.persist_policy()
+    assert pilot.worker(ok).fetch(pilot.source, pilot.profile).run is None
     assert not pilot.calls
 
 
@@ -265,7 +320,7 @@ def test_three_terminal_403_runs_pause_without_retry(pilot: Pilot) -> None:
         assert pilot.fetch(handler).reason == "http-403"
         pilot.clock.sleep(60)
     assert len(pilot.calls) == 4
-    assert pilot.fetch(ok).reason == "source-paused"
+    assert pilot.fetch(ok).reason == "source-withdrawn"
 
 
 def test_forward_wall_clock_jump_does_not_shorten_spacing(pilot: Pilot) -> None:
@@ -289,14 +344,13 @@ def test_forward_wall_clock_jump_does_not_shorten_spacing(pilot: Pilot) -> None:
         pilot.store,
         lambda _: httpx.MockTransport(handler),
         git_sha="0" * 40,
+        registry=pilot.registry,
         clock=pilot.clock.now,
         monotonic=tick.now,
         sleep=wait,
         resolve=public_resolver,
     )
-    assert (
-        worker.fetch(pilot.source, pilot.profile, pilot.approval, pilot.terms).reason == "fetched"
-    )
+    assert worker.fetch(pilot.source, pilot.profile).reason == "fetched"
     assert calls[1] - calls[0] >= 15
 
 
@@ -335,7 +389,7 @@ def test_challenge_pauses_across_worker_instances(pilot: Pilot) -> None:
 
     assert pilot.fetch(handler).reason == "access-challenge"
     pilot.clock.sleep(60)
-    assert pilot.fetch(ok).reason == "source-paused"
+    assert pilot.fetch(ok).reason == "source-withdrawn"
     assert len(pilot.calls) == 2
 
 
@@ -455,7 +509,7 @@ def test_worker_lock_blocks_a_second_collector(pilot: Pilot) -> None:
     worker = pilot.worker(ok)
     with (pilot.path / "state" / "worker.lock").open("wb") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
-        result = worker.fetch(pilot.source, pilot.profile, pilot.approval, pilot.terms)
+        result = worker.fetch(pilot.source, pilot.profile)
     assert result.reason == "worker-busy"
     assert not pilot.calls
 
@@ -515,9 +569,7 @@ def test_http_date_backoff_is_honored(pilot: Pilot) -> None:
 def test_non_routable_resolution_is_refused_before_connect(
     pilot: Pilot, answers: tuple[str, ...]
 ) -> None:
-    result = pilot.worker(ok, resolve=lambda host: answers).fetch(
-        pilot.source, pilot.profile, pilot.approval, pilot.terms
-    )
+    result = pilot.worker(ok, resolve=lambda host: answers).fetch(pilot.source, pilot.profile)
     assert result.reason == "non-routable-address"
     assert pilot.calls == []
 
@@ -530,9 +582,7 @@ def test_resolution_failure_is_refused(pilot: Pilot, failure: OSError | tuple[()
             raise failure
         return failure
 
-    result = pilot.worker(ok, resolve=resolve).fetch(
-        pilot.source, pilot.profile, pilot.approval, pilot.terms
-    )
+    result = pilot.worker(ok, resolve=resolve).fetch(pilot.source, pilot.profile)
     assert result.reason == "address-resolution-failed"
     assert pilot.calls == []
 
@@ -548,9 +598,7 @@ def test_redirect_does_not_resolve_destination_and_is_rejected(pilot: Pilot) -> 
             return robots()
         return httpx.Response(302, headers={"Location": "https://elsewhere.test/latest"})
 
-    result = pilot.worker(handler, resolve=resolve).fetch(
-        pilot.source, pilot.profile, pilot.approval, pilot.terms
-    )
+    result = pilot.worker(handler, resolve=resolve).fetch(pilot.source, pilot.profile)
     assert result.reason == "http-302"
     assert [req.url.host for _, req in pilot.calls] == ["credit-union.test", "credit-union.test"]
 
@@ -569,13 +617,11 @@ def test_redirect_with_challenge_header_is_access_challenge(pilot: Pilot) -> Non
             headers={"Location": "https://elsewhere.test/login", "CF-Mitigated": "challenge"},
         )
 
-    result = pilot.worker(handler, resolve=resolve).fetch(
-        pilot.source, pilot.profile, pilot.approval, pilot.terms
-    )
+    result = pilot.worker(handler, resolve=resolve).fetch(pilot.source, pilot.profile)
     assert result.reason == "access-challenge"
     assert result.run is not None and result.run.status is RunStatus.BLOCKED
     pilot.clock.sleep(60)
-    assert pilot.fetch(ok).reason == "source-paused"
+    assert pilot.fetch(ok).reason == "source-withdrawn"
 
 
 def test_transport_receives_validated_addresses(pilot: Pilot) -> None:
@@ -594,6 +640,7 @@ def pinned_worker(
         pilot.store,
         pinned,
         git_sha="0" * 40,
+        registry=pilot.registry,
         clock=pilot.clock.now,
         monotonic=pilot.clock.now,
         sleep=pilot.clock.sleep,
@@ -612,7 +659,7 @@ def test_worker_dispatches_the_gateway_dialer_pinned_to_validated_addresses(
 
     monkeypatch.setattr(PinnedTransport, "handle_request", stub)  # never touches a network
     worker = pinned_worker(pilot, PinnedTransport)
-    result = worker.fetch(pilot.source, pilot.profile, pilot.approval, pilot.terms)
+    result = worker.fetch(pilot.source, pilot.profile)
     assert result.reason == "fetched"
     assert served == ["/robots.txt", "/rates"]
 
@@ -627,9 +674,7 @@ def test_worker_passes_the_profile_deadline_to_the_dialer(
         return ok(request)
 
     monkeypatch.setattr(PinnedTransport, "handle_request", stub)
-    pinned_worker(pilot, PinnedTransport).fetch(
-        pilot.source, pilot.profile, pilot.approval, pilot.terms
-    )
+    pinned_worker(pilot, PinnedTransport).fetch(pilot.source, pilot.profile)
     assert seen == [pilot.profile.timeout_seconds] * 2
 
 
@@ -683,12 +728,13 @@ def test_resolver_rebinding_never_reaches_the_dialer(
         pilot.store,
         factory,
         git_sha="0" * 40,
+        registry=pilot.registry,
         clock=pilot.clock.now,
         monotonic=pilot.clock.now,
         sleep=pilot.clock.sleep,
         resolve=resolve,
     )
-    result = worker.fetch(pilot.source, pilot.profile, pilot.approval, pilot.terms)
+    result = worker.fetch(pilot.source, pilot.profile)
     assert result.reason == "non-routable-address"
     assert dialed == [(ipaddress.IPv4Address("8.8.8.8"),)]  # the rebound answer never got a dialer
 
@@ -703,7 +749,7 @@ def test_worker_refuses_a_dialer_not_pinned_to_the_validated_set(
     worker = pinned_worker(
         pilot, lambda addresses: PinnedTransport([ipaddress.ip_address("8.8.4.4")])
     )
-    result = worker.fetch(pilot.source, pilot.profile, pilot.approval, pilot.terms)
+    result = worker.fetch(pilot.source, pilot.profile)
     assert result.reason == "pin-mismatch"
 
 
@@ -717,7 +763,7 @@ def test_worker_refuses_a_dialer_with_the_test_override(
     worker = pinned_worker(
         pilot, lambda addresses: PinnedTransport(addresses, test_override=LoopbackOverride(8443))
     )
-    result = worker.fetch(pilot.source, pilot.profile, pilot.approval, pilot.terms)
+    result = worker.fetch(pilot.source, pilot.profile)
     assert result.reason == "live-transport-disabled"
 
 
@@ -730,11 +776,12 @@ def test_default_worker_has_no_resolver_so_nothing_can_dial(pilot: Pilot) -> Non
         pilot.store,
         factory,
         git_sha="0" * 40,
+        registry=pilot.registry,
         clock=pilot.clock.now,
         monotonic=pilot.clock.now,
         sleep=pilot.clock.sleep,
     )
-    result = worker.fetch(pilot.source, pilot.profile, pilot.approval, pilot.terms)
+    result = worker.fetch(pilot.source, pilot.profile)
     assert result.reason == "address-resolution-failed"
 
 
@@ -762,12 +809,13 @@ def test_network_transport_is_refused_before_dispatch(
         pilot.store,
         factory,
         git_sha="0" * 40,
+        registry=pilot.registry,
         clock=pilot.clock.now,
         monotonic=pilot.clock.now,
         sleep=pilot.clock.sleep,
         resolve=public_resolver,
     )
-    result = worker.fetch(pilot.source, pilot.profile, pilot.approval, pilot.terms)
+    result = worker.fetch(pilot.source, pilot.profile)
     assert result.reason == "live-transport-disabled"
     assert factories_called == (2 if after_robots else 1)
 
@@ -816,9 +864,7 @@ def test_network_transport_is_refused_before_dispatch(
     ],
 )
 def test_special_use_denylist_rejects_non_routable_addresses(pilot: Pilot, denied_ip: str) -> None:
-    result = pilot.worker(ok, resolve=lambda host: (denied_ip,)).fetch(
-        pilot.source, pilot.profile, pilot.approval, pilot.terms
-    )
+    result = pilot.worker(ok, resolve=lambda host: (denied_ip,)).fetch(pilot.source, pilot.profile)
     assert result.reason == "non-routable-address"
     assert pilot.calls == []
 
@@ -832,9 +878,7 @@ def test_special_use_denylist_rejects_non_routable_addresses(pilot: Pilot, denie
     ],
 )
 def test_globally_routable_public_addresses_are_permitted(pilot: Pilot, allowed_ip: str) -> None:
-    result = pilot.worker(ok, resolve=lambda host: (allowed_ip,)).fetch(
-        pilot.source, pilot.profile, pilot.approval, pilot.terms
-    )
+    result = pilot.worker(ok, resolve=lambda host: (allowed_ip,)).fetch(pilot.source, pilot.profile)
     assert result.reason == "fetched"
     assert len(pilot.calls) == 2
 
@@ -860,7 +904,7 @@ def test_denial_counts_once_per_scheduled_run(pilot: Pilot, code: int, from_robo
             "/robots.txt",
             *["/rates"] * (3 * attempts),
         ]
-    assert pilot.fetch(ok).reason == "source-paused"
+    assert pilot.fetch(ok).reason == "source-withdrawn"
 
 
 def test_robots_403_honors_retry_after(pilot: Pilot) -> None:
@@ -1001,14 +1045,9 @@ def test_compressed_403_still_counts_toward_the_block_rule(
         return httpx.Response(403, headers=encoding)
 
     for _ in range(3):
-        assert (
-            pilot.worker(handler)
-            .fetch(pilot.source, pilot.profile, pilot.approval, pilot.terms)
-            .reason
-            == "http-403"
-        )
+        assert pilot.worker(handler).fetch(pilot.source, pilot.profile).reason == "http-403"
         pilot.clock.sleep(60)
-    assert pilot.fetch(ok).reason == "source-paused"
+    assert pilot.fetch(ok).reason == "source-withdrawn"
 
 
 @pytest.mark.parametrize("encoding", [{}, {"Content-Encoding": "gzip"}])
@@ -1018,10 +1057,239 @@ def test_compressed_429_honors_retry_after(pilot: Pilot, encoding: dict[str, str
             return robots()
         return httpx.Response(429, headers={"Retry-After": "1200", **encoding})
 
-    assert (
-        pilot.worker(handler).fetch(pilot.source, pilot.profile, pilot.approval, pilot.terms).reason
-        == "http-429-deferred"
-    )
+    assert pilot.worker(handler).fetch(pilot.source, pilot.profile).reason == "http-429-deferred"
     pilot.clock.sleep(600)
     assert pilot.fetch(ok).reason == "not-due"
     assert len(pilot.calls) == 2
+
+
+def _withdrawal(pilot: Pilot, withdrawal_id: str = "operator-stop") -> WithdrawalEntry:
+    return WithdrawalEntry(
+        schema_version=CONTRACT_VERSION,
+        withdrawal_id=withdrawal_id,
+        scope=WithdrawalScope.SOURCE,
+        target_id=pilot.source.source_id,
+        actor="Synthetic operator",
+        withdrawn_at=datetime.fromtimestamp(pilot.clock.now(), UTC),
+        reason="Synthetic stop request",
+    )
+
+
+def _revoke(pilot: Pilot) -> None:
+    pilot.clock.sleep(1)
+    rejected = SourceApproval.model_validate(
+        {
+            **pilot.approval.model_dump(exclude={"profile", "evidence_kind"}),
+            "approval_id": "registry-revocation",
+            "decision": "rejected",
+            "decided_at": datetime.fromtimestamp(pilot.clock.now(), UTC),
+        }
+    )
+    with open_operational_database(pilot.database).begin() as conn:
+        insert_approval(conn, rejected, 9000001)
+
+
+def test_caller_supplied_approval_and_withdrawn_flags_cannot_authorize(pilot: Pilot) -> None:
+    worker = pilot.worker(ok)
+    _revoke(pilot)
+    # Exercise the old attack surface, including an otherwise valid stale approval.
+    with pytest.raises(TypeError):
+        worker.fetch(  # type: ignore[call-arg]
+            pilot.source, pilot.profile, pilot.approval, pilot.terms, withdrawn=False
+        )
+    assert worker.fetch(pilot.source, pilot.profile).reason == "source-not-approved"
+    assert not pilot.calls and not pilot.dialed
+
+
+def test_registry_revocation_is_read_again_by_an_existing_worker(pilot: Pilot) -> None:
+    worker = pilot.worker(ok)
+    assert worker.fetch(pilot.source, pilot.profile).reason == "fetched"
+    pilot.clock.sleep(60)
+    _revoke(pilot)
+    before = len(pilot.calls)
+    assert worker.fetch(pilot.source, pilot.profile).reason == "source-not-approved"
+    assert len(pilot.calls) == before
+
+
+def test_approval_expiry_is_enforced_even_with_current_terms(pilot: Pilot) -> None:
+    worker = pilot.worker(ok)
+    pilot.clock.sleep(90 * ROBOTS_TTL)
+    pilot.terms_ledger.record(
+        pilot.terms.model_copy(
+            update={
+                "approval_id": "fresh-terms",
+                "decided_at": datetime.fromtimestamp(pilot.clock.now(), UTC),
+            }
+        ),
+        denylist=pilot.denylist,
+    )
+    assert worker.fetch(pilot.source, pilot.profile).reason == "source-not-approved"
+    assert not pilot.calls
+
+
+@pytest.mark.parametrize("store", ["database", "terms", "denylist"])
+@pytest.mark.parametrize("failure", ["missing", "invalid", "unreadable"])
+def test_missing_or_unreadable_authoritative_state_fails_closed(
+    pilot: Pilot, store: str, failure: str
+) -> None:
+    worker = pilot.worker(ok)
+    path = {
+        "database": pilot.database,
+        "terms": pilot.terms_ledger.path,
+        "denylist": pilot.denylist.path,
+    }[store]
+    path.unlink()
+    if failure == "invalid":
+        path.write_bytes(b"invalid persisted state")
+    elif failure == "unreadable":
+        path.mkdir()  # reliably unreadable as a record, including when tests run as root
+    result = worker.fetch(pilot.source, pilot.profile)
+    assert result.reason == "policy-state-unavailable"
+    assert result.run is None and result.artifact is None
+    assert not pilot.calls and not pilot.dialed
+    if failure == "missing":
+        assert not path.exists()  # reads must never recreate missing authority
+
+
+@pytest.mark.parametrize("missing", ["source", "profile", "approval", "terms"])
+def test_missing_persisted_record_fails_closed(pilot: Pilot, missing: str) -> None:
+    worker = pilot.worker(ok)
+    if missing == "terms":
+        pilot.terms_ledger.path.unlink()
+        pilot.terms_ledger.initialize()
+    else:
+        pilot.database.unlink()
+        engine = open_operational_database(pilot.database)
+        metadata.create_all(engine)
+        with engine.begin() as conn:
+            if missing != "source":
+                insert_source(conn, pilot.source)
+            if missing not in {"source", "profile"}:
+                insert_profile(conn, pilot.profile)
+        engine.dispose()
+    assert worker.fetch(pilot.source, pilot.profile).run is None
+    assert not pilot.calls and not pilot.dialed
+
+
+@pytest.mark.parametrize("independent", [True, False])
+def test_withdrawal_is_read_from_each_authority_independently(
+    pilot: Pilot, independent: bool
+) -> None:
+    worker = pilot.worker(ok)
+    assert worker.fetch(pilot.source, pilot.profile).reason == "fetched"
+    pilot.clock.sleep(60)
+    entry = _withdrawal(pilot)
+    if independent:
+        pilot.denylist.withdraw(entry)
+    else:
+        # Legacy/database-only withdrawals must stop acquisition too.
+        with open_operational_database(pilot.database).begin() as conn:
+            conn.execute(
+                withdrawal_entries.insert(), entry.model_dump(exclude={"lifted_at", "lifted_by"})
+            )
+        assert not pilot.denylist.active_targets(entry.withdrawn_at)
+    before = len(pilot.calls)
+    assert worker.fetch(pilot.source, pilot.profile).reason == "source-withdrawn"
+    assert len(pilot.calls) == before
+
+
+def test_revocation_during_spacing_wait_stops_before_dispatch(
+    pilot: Pilot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worker = pilot.worker(ok)
+
+    def sleep(seconds: float) -> None:
+        pilot.clock.sleep(seconds)
+        _revoke(pilot)
+
+    monkeypatch.setattr(worker, "_sleep", sleep)
+    assert worker.fetch(pilot.source, pilot.profile).reason == "source-not-approved"
+    assert [request.url.path for _, request in pilot.calls] == ["/robots.txt"]
+
+
+def test_challenge_denylist_survives_crash_before_database_block(
+    pilot: Pilot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worker = pilot.worker(lambda _: httpx.Response(403, headers={"CF-Mitigated": "challenge"}))
+    original = worker._set
+
+    def crash(db: sqlite3.Connection, key: str, value: str) -> None:
+        if key.startswith("paused:"):
+            assert ("source", pilot.source.source_id) in pilot.denylist.active_targets(
+                datetime.fromtimestamp(pilot.clock.now(), UTC)
+            )
+            raise RuntimeError("crash between independent suppression and block record")
+        original(db, key, value)
+
+    monkeypatch.setattr(worker, "_set", crash)
+    with pytest.raises(RuntimeError, match="crash between"):
+        worker.fetch(pilot.source, pilot.profile)
+    with worker._state() as db:
+        assert not db.execute("SELECT * FROM events").fetchall()
+        assert worker._get(db, "paused:fixture") is None
+    before = pilot.denylist.path.read_bytes()
+    assert pilot.fetch(ok).reason == "source-withdrawn"
+    assert pilot.denylist.path.read_bytes() == before
+    assert len(pilot.calls) == 1
+
+
+@pytest.mark.parametrize("reason", ["challenge", "robots", "403", "429", "failures"])
+def test_every_block_rule_updates_independent_denylist(pilot: Pilot, reason: str) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        if reason == "challenge":
+            return httpx.Response(403, headers={"CF-Mitigated": "challenge"})
+        if reason == "robots":
+            return robots(b"User-agent: *\nDisallow: /rates\n")
+        if req.url.path == "/robots.txt":
+            return robots()
+        return httpx.Response(503 if reason == "failures" else int(reason))
+
+    runs = 5 if reason == "failures" else 3 if reason in {"403", "429"} else 1
+    for index in range(runs):
+        result = pilot.fetch(handler)
+        assert result.run is not None
+        targets = pilot.denylist.active_targets(datetime.fromtimestamp(pilot.clock.now(), UTC))
+        assert (("source", pilot.source.source_id) in targets) == (index == runs - 1)
+        pilot.clock.sleep(180)
+    assert result.run is not None and result.run.status is RunStatus.BLOCKED
+    assert pilot.fetch(ok).reason == "source-withdrawn"
+
+
+def test_failed_denylist_write_prevents_database_block(
+    pilot: Pilot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worker = pilot.worker(lambda _: httpx.Response(403, headers={"CF-Mitigated": "challenge"}))
+
+    def fail(entry: WithdrawalEntry) -> None:
+        raise OSError("synthetic ledger storage failure")
+
+    monkeypatch.setattr(pilot.denylist, "withdraw", fail)
+    assert worker.fetch(pilot.source, pilot.profile).reason == "policy-or-state-unavailable"
+    with worker._state() as db:
+        assert worker._get(db, "paused:fixture") is None
+        assert not db.execute("SELECT * FROM events").fetchall()
+
+
+def test_terms_prohibition_suppresses_before_record_and_retries_idempotently(
+    pilot: Pilot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    review = pilot.terms.model_copy(
+        update={"approval_id": "terms-prohibition", "decision": ReviewVerdict.REJECTED}
+    )
+    original = pilot.terms_ledger.read
+
+    def crash() -> tuple[TermsReview, ...]:
+        assert ("source", pilot.source.source_id) in pilot.denylist.active_targets(
+            review.decided_at
+        )
+        raise RuntimeError("crash before terms record")
+
+    monkeypatch.setattr(pilot.terms_ledger, "read", crash)
+    with pytest.raises(RuntimeError, match="crash before"):
+        pilot.terms_ledger.record(review, denylist=pilot.denylist)
+    monkeypatch.setattr(pilot.terms_ledger, "read", original)
+    pilot.terms_ledger.record(review, denylist=pilot.denylist)
+    before = pilot.denylist.path.read_bytes(), pilot.terms_ledger.path.read_bytes()
+    pilot.terms_ledger.record(review, denylist=pilot.denylist)
+    assert (pilot.denylist.path.read_bytes(), pilot.terms_ledger.path.read_bytes()) == before
+    assert pilot.fetch(ok).reason == "source-withdrawn"

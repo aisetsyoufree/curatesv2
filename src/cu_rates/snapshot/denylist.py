@@ -70,6 +70,15 @@ class Denylist:
             raise ValueError("record a withdrawal before lifting it")
         with writer_lock(self._lock):
             ledger = self._read()
+            prior = next(
+                (row for row in ledger.entries if row.withdrawal_id == entry.withdrawal_id), None
+            )
+            if prior is not None:
+                if prior != entry:
+                    raise ValueError(
+                        "withdrawal ID already exists with different content or a lift"
+                    )
+                return  # Retrying after a database failure never duplicates suppression.
             self._save(_Ledger(version=1, entries=(*ledger.entries, entry)))
 
     def lift(self, withdrawal_id: str, *, at: datetime, actor: str) -> None:
