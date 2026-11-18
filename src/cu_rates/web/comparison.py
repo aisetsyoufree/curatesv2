@@ -577,6 +577,7 @@ def read_snapshot_offers(
     """
     root_cfg: Any = current_app.config.get("SNAPSHOT_ROOT")
     denylist_cfg: Any = current_app.config.get("DENYLIST_PATH")
+    automatic_cfg: Any = current_app.config.get("AUTOMATIC_DENYLIST_PATH")
 
     if at is None:
         at_cfg = current_app.config.get("SNAPSHOT_CLOCK")
@@ -590,11 +591,14 @@ def read_snapshot_offers(
         else Path("data/independent/withdrawals.json")
     )
 
+    automatic_path = Path(automatic_cfg) if automatic_cfg is not None else None
     if not root.is_dir() or not denylist_path.is_file():
         return None, ()
 
     try:
-        reader = SnapshotReader(root=root, denylist_path=denylist_path)
+        reader = SnapshotReader(
+            root=root, denylist_path=denylist_path, automatic_path=automatic_path
+        )
         view = reader.read(at=at)
         return view.info, view.offers
     except (SnapshotError, OSError, ValueError):

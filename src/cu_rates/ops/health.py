@@ -37,6 +37,7 @@ def _check_snapshot_readable(
     snapshot_root: Path,
     denylist_path: Path,
     now: datetime,
+    automatic_path: Path | None = None,
 ) -> tuple[Check, SnapshotView | None]:
     if not snapshot_root.is_absolute():
         return (
@@ -57,7 +58,7 @@ def _check_snapshot_readable(
             None,
         )
     try:
-        reader = SnapshotReader(snapshot_root, denylist_path)
+        reader = SnapshotReader(snapshot_root, denylist_path, automatic_path=automatic_path)
         view = reader.read(at=now)
         return (
             Check(
@@ -152,11 +153,12 @@ def _check_snapshot_fresh(
 def _check_denylist_readable(
     denylist_path: Path,
     now: datetime,
+    name: str = "denylist_readable",
 ) -> Check:
     try:
         if not denylist_path.is_absolute():
             return Check(
-                name="denylist_readable",
+                name=name,
                 status="fail",
                 detail="denylist_path must be an absolute path",
             )
@@ -164,13 +166,13 @@ def _check_denylist_readable(
         entries = denylist.entries()
         in_force = [e for e in entries if e.in_force_at(now)]
         return Check(
-            name="denylist_readable",
+            name=name,
             status="ok",
             detail=f"{len(in_force)} in-force suppression(s)",
         )
     except Exception as exc:
         return Check(
-            name="denylist_readable",
+            name=name,
             status="fail",
             detail=str(exc),
         )
@@ -308,6 +310,7 @@ def check_health(
     denylist_path: Path,
     backup_dir: Path | None = None,
     database: Path | None = None,
+    automatic_denylist_path: Path | None = None,
     now: datetime,
 ) -> HealthReport:
     """Run a read-only health check across public snapshot, denylist, backup, and database."""
@@ -315,7 +318,9 @@ def check_health(
     try:
         now_utc = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
 
-        readable_check, view = _check_snapshot_readable(snapshot_root, denylist_path, now_utc)
+        readable_check, view = _check_snapshot_readable(
+            snapshot_root, denylist_path, now_utc, automatic_denylist_path
+        )
         checks.append(readable_check)
 
         fresh_check = _check_snapshot_fresh(snapshot_root, view, now_utc)
@@ -323,6 +328,12 @@ def check_health(
 
         denylist_check = _check_denylist_readable(denylist_path, now_utc)
         checks.append(denylist_check)
+        if automatic_denylist_path is not None:
+            checks.append(
+                _check_denylist_readable(
+                    automatic_denylist_path, now_utc, "automatic_denylist_readable"
+                )
+            )
 
         if backup_dir is not None:
             backup_check = _check_backup_recent(backup_dir, now_utc)
@@ -357,6 +368,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Path to denylist/withdrawal ledger JSON",
     )
     parser.add_argument(
+        "--automatic-denylist",
+        type=Path,
+        default=None,
+        help="Worker-owned automatic suppression ledger (enforced together with --denylist)",
+    )
+    parser.add_argument(
         "--backup-dir",
         type=Path,
         default=None,
@@ -381,6 +398,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     report = check_health(
         snapshot_root=args.snapshot_root,
         denylist_path=args.denylist,
+        automatic_denylist_path=args.automatic_denylist,
         backup_dir=args.backup_dir,
         database=args.database,
         now=now,

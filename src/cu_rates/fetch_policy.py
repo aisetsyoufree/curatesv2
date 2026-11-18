@@ -111,10 +111,24 @@ class FetchRegistry:
     simultaneous decisions fail closed. Approvals require quarterly reauthorization.
     """
 
-    def __init__(self, database: Path, terms: TermsLedger, denylist: Denylist) -> None:
+    def __init__(
+        self,
+        database: Path,
+        terms: TermsLedger,
+        denylist: Denylist,
+        *,
+        automatic: Denylist | None = None,
+    ) -> None:
         self.database = database.absolute()
         self.terms = terms
-        self.denylist = denylist
+        self.denylist = denylist  # operator-owned: read here, never written by the worker
+        self.automatic = automatic  # worker-owned: where the worker records its own blocks
+
+    @property
+    def suppression(self) -> Denylist:
+        """Where the worker writes an automatic block: its own ledger when one is configured
+        (production), else the single ledger (tests and the offline slice)."""
+        return self.automatic if self.automatic is not None else self.denylist
 
     def authorize(self, source: RateSource, profile: FetchProfile, at: datetime) -> TermsReview:
         try:
@@ -205,6 +219,8 @@ class FetchRegistry:
         finally:
             engine.dispose()
         if self.denylist.active_targets(at) & targets:
+            raise PolicyError("source-withdrawn")
+        if self.automatic is not None and self.automatic.active_targets(at) & targets:
             raise PolicyError("source-withdrawn")
         terms = sorted(
             (

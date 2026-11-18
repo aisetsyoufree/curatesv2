@@ -291,6 +291,16 @@ Procedure:
    `SnapshotPublisher.rollback()` verifies the retained snapshot database and version descriptor in `/var/lib/cu-rates/snapshots/versions/<snapshot_id>` before atomically activating it by writing `/var/lib/cu-rates/snapshots/current.json`.
 2. The web application dynamically re-reads the snapshot version from `current.json` on request without requiring a service restart.
 
+### Automatic suppression ledger (issue #118)
+
+The independent denylist above is **operator-owned**: the collection worker can only read it. When a source blocks or challenges the (currently masked) worker, the worker records the suppression in a **separate ledger it owns**, `/var/lib/cu-rates/automatic/denylist.json` (`AUTOMATIC_DENYLIST_PATH`). The public site enforces **both** ledgers, and once `AUTOMATIC_DENYLIST_PATH` is set a missing or invalid automatic ledger blocks public reads (fail closed), so create it once, as the service user, before setting the variable:
+
+```bash
+sudo -u cu-rates /var/lib/cu-rates/venv/bin/python -c "from pathlib import Path; from cu_rates.snapshot import Denylist; Denylist(Path('/var/lib/cu-rates/automatic/denylist.json')).initialize()"
+```
+
+Only an operator lifts an automatic suppression (the same `Denylist.lift`, run on that file). The health check reads both ledgers.
+
 ### Emergency Withdrawal Denylist
 The web application enforces the configured `DENYLIST_PATH` through `SnapshotReader` on each read. An uninitialized, missing, or invalid `denylist.json` fails closed and suppresses offers.
 

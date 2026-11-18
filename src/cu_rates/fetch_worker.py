@@ -609,7 +609,7 @@ class FetchWorker:
         if reason in {"access-challenge", "robots-disallowed"} or barred >= 3 or failures >= 5:
             # Independent suppression is durable BEFORE any database block record.
             # A crash/rollback below leaves public reads and the next worker stopped.
-            self._registry.denylist.withdraw(
+            self._registry.suppression.withdraw(
                 WithdrawalEntry(
                     schema_version=CONTRACT_VERSION,
                     withdrawal_id=f"fetch-block-{run_id}",

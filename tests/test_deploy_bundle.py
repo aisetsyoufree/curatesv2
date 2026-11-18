@@ -124,7 +124,8 @@ def test_systemd_hardening_and_resource_limits() -> None:
         "/var/lib/cu-rates/data",
         "/var/lib/cu-rates/artifacts",
         "/var/lib/cu-rates/snapshots",
-    }, f"worker ReadWritePaths must be exactly data, artifacts, and snapshots, got {worker_rw}"
+        "/var/lib/cu-rates/automatic",  # its OWN suppression ledger (issue #118)
+    }, f"worker ReadWritePaths changed unexpectedly: {worker_rw}"
     worker_ro = set(" ".join(worker_sec.get("ReadOnlyPaths", [])).split())
     assert "/var/lib/cu-rates/independent" in worker_ro
     assert "/var/lib/cu-rates/independent" not in worker_rw
@@ -1576,3 +1577,28 @@ def test_correction_inbox_is_wired_closed_by_default_and_least_privilege() -> No
     )  # the purge timer is installed for the operator to enable, never enabled by the installer
     readme = (DEPLOY_DIR / "README.md").read_text(encoding="utf-8")
     assert "Correction Inbox" in readme and "bulk-reject" in readme and "INTAKE_DB" in readme
+
+
+def test_automatic_suppression_ledger_is_worker_writable_and_never_the_operator_ledger() -> None:
+    """#118: the worker records its own blocks in a separate ledger; the operator one stays RO."""
+    worker = parse_systemd_unit(SYSTEMD_DIR / "cu-rates-worker.service").get("Service", {})
+    web = parse_systemd_unit(SYSTEMD_DIR / "cu-rates-web.service").get("Service", {})
+    health = parse_systemd_unit(SYSTEMD_DIR / "cu-rates-health.service").get("Service", {})
+    paths = {
+        name: (
+            set(" ".join(unit.get("ReadWritePaths", [])).split()),
+            set(" ".join(unit.get("ReadOnlyPaths", [])).split()),
+        )
+        for name, unit in (("worker", worker), ("web", web), ("health", health))
+    }
+    automatic, operator = "/var/lib/cu-rates/automatic", "/var/lib/cu-rates/independent"
+    assert automatic in paths["worker"][0] and operator not in paths["worker"][0]
+    assert operator in paths["worker"][1]  # the operator ledger stays read-only to the worker
+    assert automatic in paths["web"][1] and automatic not in paths["web"][0]
+    assert automatic in paths["health"][1] and automatic not in paths["health"][0]
+    assert (
+        "--automatic-denylist /var/lib/cu-rates/automatic/denylist.json" in health["ExecStart"][0]
+    )
+    env = (DEPLOY_DIR / "env.example").read_text(encoding="utf-8")
+    assert "AUTOMATIC_DENYLIST_PATH=/var/lib/cu-rates/automatic/denylist.json" in env
+    assert '"${NVME_ROOT}/automatic"' in (DEPLOY_DIR / "install.sh").read_text(encoding="utf-8")
