@@ -424,14 +424,25 @@ CU-Rates provides automated backup and health monitoring via systemd timers. The
    - **Hardening & Isolation:** Strictly read-only everywhere (`ReadOnlyPaths`, no `ReadWritePaths`), unprivileged execution as `cu-rates`, no network access (`PrivateNetwork=true`, `RestrictAddressFamilies=AF_UNIX`), `Type=oneshot`, `Restart=no`.
    - **Alert Hook:** Non-zero exit (exit code 1) on any check failure marks `cu-rates-health.service` as failed in systemd.
 
+3. **Daily Data Quality Check (`cu-rates-quality.timer` -> `cu-rates-quality.service`):**
+   - **Schedule:** Daily at 06:11 local time with up to 15 minutes randomized delay (`RandomizedDelaySec=900`), catch-up enabled (`Persistent=true`).
+   - **Actions:** Runs `python -m cu_rates.ops.quality --database /var/lib/cu-rates/data/operational.sqlite` to report on data quality across the operational database:
+     - Quarantined offers: warns if older than 24 hours, fails if older than 7 days
+     - Stale sources: warns if an approved source has had no successful run in >72 hours, fails if >7 days or never run
+     - Blocked sources: warns if 1–3 sources blocked in the last 7 days, fails if >3
+     - Open withdrawals: reports open withdrawals in force
+     - Unresolved corrections: warns on corrections without subsequent review decisions
+   - **Hardening & Isolation:** Unprivileged execution as `cu-rates`, `ProtectSystem=strict`, no network access (`PrivateNetwork=true`, `RestrictAddressFamilies=AF_UNIX`), `UMask=0077`, `Type=oneshot`, and writes ONLY to the data directory (`ReadWritePaths=/var/lib/cu-rates/data`) for SQLite WAL side files (`-shm`/`-wal`) during read-only opens.
+   - **Alert Hook:** Non-zero exit (exit status 1) on any failing check marks `cu-rates-quality.service` as failed in systemd; warnings print to JSON but exit 0. Alert delivery is not implemented yet (failures record to the system journal).
+
 > **Status Notice:**
 > - **Off-device encrypted copies and alert delivery are NOT implemented yet.** Backups currently stage locally on NVMe under `/var/lib/cu-rates/backups` and require an operator-managed key before remote export is implemented. Automated alert delivery (e.g. webhook, email, or paging notification on unit failure) has not yet been wired; failures record to the system journal.
 
 ### Enabling Scheduled Timers
 
-To enable and immediately start both timers:
+To enable and immediately start the timers:
 ```bash
-sudo systemctl enable --now cu-rates-backup.timer cu-rates-health.timer
+sudo systemctl enable --now cu-rates-backup.timer cu-rates-health.timer cu-rates-quality.timer
 ```
 
 ### Checking Timer Status and Logs
@@ -439,7 +450,7 @@ sudo systemctl enable --now cu-rates-backup.timer cu-rates-health.timer
 Inspect active timer schedules:
 ```bash
 systemctl list-timers
-systemctl status cu-rates-backup.timer cu-rates-health.timer
+systemctl status cu-rates-backup.timer cu-rates-health.timer cu-rates-quality.timer
 ```
 
 Check execution output and error logs:
@@ -449,6 +460,9 @@ journalctl -u cu-rates-health
 
 # Backup service logs
 journalctl -u cu-rates-backup
+
+# Quality check logs
+journalctl -u cu-rates-quality
 ```
 
 ---
@@ -478,8 +492,8 @@ To cleanly decommission the deployment without affecting other host services:
 
 1. **Stop and Disable Services:**
    ```bash
-   sudo systemctl stop cu-rates-web.service cu-rates-worker.timer cu-rates-worker.service cu-rates-backup.timer cu-rates-backup.service cu-rates-health.timer cu-rates-health.service
-   sudo systemctl disable cu-rates-web.service cu-rates-worker.timer cu-rates-backup.timer cu-rates-health.timer
+   sudo systemctl stop cu-rates-web.service cu-rates-worker.timer cu-rates-worker.service cu-rates-backup.timer cu-rates-backup.service cu-rates-health.timer cu-rates-health.service cu-rates-quality.timer cu-rates-quality.service
+   sudo systemctl disable cu-rates-web.service cu-rates-worker.timer cu-rates-backup.timer cu-rates-health.timer cu-rates-quality.timer
    ```
 
 2. **Remove Systemd Units:**

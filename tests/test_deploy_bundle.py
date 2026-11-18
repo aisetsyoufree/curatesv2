@@ -44,6 +44,8 @@ def test_systemd_units_exist() -> None:
     assert (SYSTEMD_DIR / "cu-rates-backup.timer").is_file()
     assert (SYSTEMD_DIR / "cu-rates-health.service").is_file()
     assert (SYSTEMD_DIR / "cu-rates-health.timer").is_file()
+    assert (SYSTEMD_DIR / "cu-rates-quality.service").is_file()
+    assert (SYSTEMD_DIR / "cu-rates-quality.timer").is_file()
 
 
 def test_systemd_hardening_and_resource_limits() -> None:
@@ -263,6 +265,7 @@ def test_execstart_binary_paths_match_readme_venv() -> None:
         SYSTEMD_DIR / "cu-rates-worker.service",
         SYSTEMD_DIR / "cu-rates-backup.service",
         SYSTEMD_DIR / "cu-rates-health.service",
+        SYSTEMD_DIR / "cu-rates-quality.service",
     ]
     for sf in service_files:
         unit = parse_systemd_unit(sf)
@@ -1122,6 +1125,7 @@ def test_units_omit_tmp_from_readwritepaths_with_privatetmp() -> None:
         SYSTEMD_DIR / "cu-rates-worker.service",
         SYSTEMD_DIR / "cu-rates-backup.service",
         SYSTEMD_DIR / "cu-rates-health.service",
+        SYSTEMD_DIR / "cu-rates-quality.service",
     ]
     for sf in service_files:
         parsed = parse_systemd_unit(sf)
@@ -1342,10 +1346,11 @@ def test_install_script_rejects_unsafe_roots_and_symlinks(tmp_path: Path) -> Non
 
 
 def test_ops_systemd_units_exist_and_hardened() -> None:
-    """Verify backup and health service units exist and enforce strict hardening."""
+    """Verify backup, health, and quality service units exist and enforce strict hardening."""
     ops_services = [
         SYSTEMD_DIR / "cu-rates-backup.service",
         SYSTEMD_DIR / "cu-rates-health.service",
+        SYSTEMD_DIR / "cu-rates-quality.service",
     ]
 
     for service_file in ops_services:
@@ -1476,21 +1481,24 @@ def test_ops_systemd_timers_calendar_and_persistence() -> None:
 
 
 def test_ops_systemd_install_script_wiring_and_masking() -> None:
-    """Verify install.sh installs the four units, does not enable them, and masks worker units."""
+    """Verify install.sh installs ops units, does not enable them, and masks worker units."""
     install_sh = (DEPLOY_DIR / "install.sh").read_text(encoding="utf-8")
 
-    # install.sh references all four units in UNITS array
+    # install.sh references all scheduled ops units in UNITS array
     for unit in [
         "cu-rates-backup.service",
         "cu-rates-backup.timer",
         "cu-rates-health.service",
         "cu-rates-health.timer",
+        "cu-rates-quality.service",
+        "cu-rates-quality.timer",
     ]:
         assert f'"{unit}"' in install_sh, f"install.sh must list {unit} in UNITS array"
 
-    # install.sh must NOT enable the backup or health units
+    # install.sh must NOT enable the backup, health, or quality units
     assert "systemctl enable cu-rates-backup" not in install_sh
     assert "systemctl enable cu-rates-health" not in install_sh
+    assert "systemctl enable cu-rates-quality" not in install_sh
 
     # Worker units MUST still be masked
     assert 'ln -sf /dev/null "${SYSTEMD_DIR}/cu-rates-worker.service"' in install_sh
@@ -1532,6 +1540,71 @@ def test_ops_negative_control_backup_timer_persistence_required() -> None:
     corrupted = timer_text.replace("Persistent=true", "")
     with pytest.raises(AssertionError):
         assert "Persistent=true" in corrupted
+
+
+def test_ops_systemd_quality_filesystem_paths_and_execstart() -> None:
+    """Verify quality unit filesystem paths and ExecStart command."""
+    quality_unit = parse_systemd_unit(SYSTEMD_DIR / "cu-rates-quality.service")
+    quality_sec = quality_unit.get("Service", {})
+    quality_rw = set(" ".join(quality_sec.get("ReadWritePaths", [])).split())
+    assert quality_rw == {"/var/lib/cu-rates/data"}, (
+        f"quality service may write only the WAL side files in the data directory, got {quality_rw}"
+    )
+
+    quality_ro = set(" ".join(quality_sec.get("ReadOnlyPaths", [])).split())
+    assert "/var/lib/cu-rates/app" in quality_ro
+    assert "/var/lib/cu-rates/data" not in quality_ro
+
+    quality_exec = quality_sec.get("ExecStart", [])
+    assert len(quality_exec) == 1
+    assert (
+        "cu_rates.ops.quality --database /var/lib/cu-rates/data/operational.sqlite"
+        in quality_exec[0]
+    )
+    assert quality_exec[0].startswith("/var/lib/cu-rates/venv/bin/python")
+    assert not quality_exec[0].startswith("-")
+    assert "|| true" not in quality_exec[0]
+
+
+def test_ops_systemd_quality_timer_calendar_and_persistence() -> None:
+    """Verify quality timer unit defines OnCalendar and Persistent=true."""
+    quality_timer = parse_systemd_unit(SYSTEMD_DIR / "cu-rates-quality.timer")
+    q_timer_sec = quality_timer.get("Timer", {})
+    assert q_timer_sec.get("OnCalendar") == ["*-*-* 06:11:00"]
+    assert q_timer_sec.get("Persistent") == ["true"]
+    assert q_timer_sec.get("Unit") == ["cu-rates-quality.service"]
+    assert q_timer_sec.get("RandomizedDelaySec") == ["900"]
+    assert quality_timer.get("Install", {}).get("WantedBy") == ["timers.target"]
+
+
+def test_ops_negative_control_quality_readwritepaths_rejected() -> None:
+    """Negative control: the quality unit may write ONLY the data directory (WAL side files)."""
+    parsed = parse_systemd_unit(SYSTEMD_DIR / "cu-rates-quality.service")
+    rw = set(" ".join(parsed.get("Service", {}).get("ReadWritePaths", [])).split())
+    assert rw == {"/var/lib/cu-rates/data"}
+    assert rw != rw | {"/var/lib/cu-rates/snapshots"}
+
+
+def test_ops_negative_control_quality_timer_persistence_required() -> None:
+    """Negative control: quality timer fails if Persistent=true is missing."""
+    timer_text = (SYSTEMD_DIR / "cu-rates-quality.timer").read_text(encoding="utf-8")
+    assert "Persistent=true" in timer_text
+
+    corrupted = timer_text.replace("Persistent=true", "")
+    with pytest.raises(AssertionError):
+        assert "Persistent=true" in corrupted
+
+
+def test_ops_readme_quality_scheduled_operations_section() -> None:
+    """Verify README documents quality timer in scheduled operations section."""
+    readme = (DEPLOY_DIR / "README.md").read_text(encoding="utf-8")
+    assert "cu-rates-quality.timer" in readme
+    assert "cu-rates-quality.service" in readme
+    assert "cu_rates.ops.quality --database /var/lib/cu-rates/data/operational.sqlite" in readme
+    assert "exit status 1" in readme
+    assert "journalctl -u cu-rates-quality" in readme
+    notice = "alert delivery is not implemented yet"
+    assert notice in readme.lower()
 
 
 def test_correction_inbox_is_wired_closed_by_default_and_least_privilege() -> None:
