@@ -232,9 +232,9 @@ def test_parse_and_normalization_failures_are_visible_with_evidence(tmp_path: Pa
     with open_operational_database(failed.database).connect() as conn:
         extraction = conn.execute(select(extraction_runs)).one()
         assert extraction.status == "failed" and "wrong source page" in extraction.error
-        assert (
-            conn.execute(select(artifact_blobs.c.artifact_id)).scalar_one()
-            == sha256(wrong_page).hexdigest()
+        # The identity-review evidence page is also stored; the wrong source page must be too.
+        assert sha256(wrong_page).hexdigest() in set(
+            conn.execute(select(artifact_blobs.c.artifact_id)).scalars()
         )
     assert not failed.offers
     invalid_apr = _dated_body().replace(b"6.441%", b"6.100%")

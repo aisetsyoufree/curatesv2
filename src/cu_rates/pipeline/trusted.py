@@ -47,6 +47,7 @@ from cu_rates.contracts.publication import (
 )
 from cu_rates.contracts.registry import (
     Institution,
+    InstitutionIdentityReview,
     InstitutionSourceRelationship,
     ProductIdentity,
 )
@@ -67,6 +68,7 @@ from cu_rates.contracts.taxonomy import ProductFinding
 from cu_rates.db.records import (
     _insert_provenance,
     _load_provenance,
+    load_identity_reviews,
     load_normalized_offer,
     load_review_decision,
     persist_normalized_offer,
@@ -693,6 +695,27 @@ def _approval(row: Any) -> SourceApproval:
     )
 
 
+def _identity_review(
+    conn: Connection, store: ArtifactStore, charter: int, evaluated_at: UtcDatetime
+) -> InstitutionIdentityReview | None:
+    """The newest decision in force, offered to the gate only if its evidence still verifies.
+
+    A newer decision always wins, so a later rejection is never hidden behind an older
+    approval. Every cited location is re-checked against stored bytes: evidence that is
+    missing or no longer matches yields no review at all (the gate then fails closed).
+    """
+    decided = [r for r in load_identity_reviews(conn, charter) if r.decided_at <= evaluated_at]
+    if not decided:
+        return None
+    review = decided[0]
+    try:
+        for evidence in review.evidence:
+            verify_located_claim(store.read_body(evidence.artifact_id), evidence)
+    except (ArtifactStoreError, ValueError, OSError):
+        return None
+    return review
+
+
 def load_publication_context(
     conn: Connection, offer_id: str, evaluated_at: UtcDatetime, *, store: ArtifactStore
 ) -> TrustedView:
@@ -1018,6 +1041,7 @@ def load_publication_context(
             institution=institution,
             product=product,
             relationship=relationship,
+            identity_review=_identity_review(conn, store, institution.charter_number, evaluated_at),
             source=source,
             source_approval=approval,
             validation_policy=policy,

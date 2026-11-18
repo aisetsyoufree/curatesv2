@@ -116,6 +116,7 @@ from cu_rates.contracts.publication import (
 )
 from cu_rates.contracts.registry import (
     Institution,
+    InstitutionIdentityReview,
     InstitutionSourceRelationship,
     MembershipRule,
     ProductIdentity,
@@ -193,6 +194,7 @@ __all__ = [
     "HtmlLocator",
     "ImageOcrLocator",
     "Institution",
+    "InstitutionIdentityReview",
     "InstitutionSourceRelationship",
     "InstitutionStatus",
     "IntroRate",

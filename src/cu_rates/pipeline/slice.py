@@ -36,7 +36,12 @@ from cu_rates.contracts.enums import (
     ScenarioDimension,
     SourceRelationshipKind,
 )
-from cu_rates.contracts.evidence import Provenance, RawArtifact
+from cu_rates.contracts.evidence import (
+    ExtractionProvenance,
+    HtmlLocator,
+    Provenance,
+    RawArtifact,
+)
 from cu_rates.contracts.fingerprints import (
     OfferFingerprints,
 )
@@ -46,7 +51,12 @@ from cu_rates.contracts.publication import (
     VerifiedScenarioStatement,
     evaluate_publication,
 )
-from cu_rates.contracts.registry import Institution, InstitutionSourceRelationship, ProductIdentity
+from cu_rates.contracts.registry import (
+    Institution,
+    InstitutionIdentityReview,
+    InstitutionSourceRelationship,
+    ProductIdentity,
+)
 from cu_rates.contracts.scenarios import CANONICAL_SCENARIOS, StatedBound, statement_matches_excerpt
 from cu_rates.contracts.sources import (
     ExtractedCandidate,
@@ -58,7 +68,8 @@ from cu_rates.contracts.sources import (
 )
 from cu_rates.contracts.taxonomy import TAXONOMY_VERSION, ProductFinding
 from cu_rates.db import open_operational_database, upgrade_database
-from cu_rates.db.schema import slice_normalization_failures
+from cu_rates.db.records import persist_identity_review
+from cu_rates.db.schema import artifact_blobs, slice_normalization_failures
 from cu_rates.fetch_policy import FetchRegistry, TermsLedger, TermsReview
 from cu_rates.fetch_worker import FetchWorker
 from cu_rates.normalize import OfferContext, ScenarioCheck, normalize_offer
@@ -71,6 +82,7 @@ from cu_rates.pipeline.extract import (
     NonOffer,
     extract_fixture,
     layout_sha256,
+    resolve_text,
 )
 from cu_rates.pipeline.trusted import (
     insert_approval,
@@ -372,6 +384,65 @@ def _product(identity: _Identity) -> ProductIdentity:
     )
 
 
+_IDENTITY_PAGE = (
+    '<html><body><p id="identity">{name} - NCUA charter {charter} - Massachusetts</p></body></html>'
+)
+
+
+def _record_identity_review(conn: Connection, store: ArtifactStore, identity: _Identity) -> None:
+    """Offline fixture identity proof: a stored synthetic page, a located claim, a review.
+
+    The review cites bytes that are really stored and re-verified by the trusted loader; it is
+    never a flag. Real reviews cite a captured official NCUA page in the same way.
+    """
+    body = _IDENTITY_PAGE.format(name=identity.name, charter=identity.charter).encode()
+    artifact = store.put(
+        body,
+        media_type="text/html; charset=utf-8",
+        source_url="https://ncua.example/synthetic/charter-page",
+        fetched_at=_OPENED - timedelta(days=1),
+        http_status=200,
+        fetch_run_id=f"{identity.key}.identity-evidence",
+    )
+    conn.execute(
+        artifact_blobs.insert(),
+        {"artifact_id": artifact.artifact_id, "byte_length": artifact.byte_length},
+    )
+    node = resolve_text(body, "#identity", "css")
+    persist_identity_review(
+        conn,
+        InstitutionIdentityReview(
+            schema_version=CONTRACT_VERSION,
+            review_id=f"{identity.key}.identity-review",
+            institution_charter=identity.charter,
+            legal_name=identity.name,
+            identity_confirmed=True,
+            massachusetts_scope_confirmed=True,
+            evidence=(
+                Provenance(
+                    artifact_id=artifact.artifact_id,
+                    locator=HtmlLocator(
+                        selector_type="css",
+                        selector="#identity",
+                        normalized_text_sha256=hashlib.sha256(node.encode()).hexdigest(),
+                    ),
+                    source_text=node,
+                    extraction=ExtractionProvenance(
+                        git_sha=GIT_SHA,
+                        parser=SLICE_PARSER,
+                        configuration_sha256=SLICE_CONFIGURATION,
+                        normalization_version="t014.slice",
+                        rule_id="aud94.identity-evidence",
+                    ),
+                ),
+            ),
+            reviewer=REVIEWER,
+            decided_at=_OPENED - timedelta(minutes=10),
+            rationale="Offline synthetic fixture: charter number, name and Massachusetts match.",
+        ),
+    )
+
+
 def _register(
     conn: Connection, identity: _Identity
 ) -> tuple[RateSource, FetchProfile, SourceApproval]:
@@ -582,6 +653,7 @@ def run_fixture(
     clock = _Clock(_OPENED)
     with engine.begin() as conn:
         source, profile, approval = _register(conn, identity)
+        _record_identity_review(conn, store, identity)
     denylist = Denylist(root / "independent" / "withdrawals.json")
     denylist.initialize()
     terms = TermsLedger(root / "private" / "terms.json")

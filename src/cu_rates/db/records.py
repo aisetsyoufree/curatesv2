@@ -16,6 +16,7 @@ from cu_rates.contracts import (
     FetchProfile,
     FetchRun,
     Institution,
+    InstitutionIdentityReview,
     InstitutionSourceRelationship,
     NormalizedOffer,
     ProductIdentity,
@@ -33,6 +34,8 @@ from cu_rates.db.schema import (
     artifact_observations,
     fetch_profiles,
     fetch_runs,
+    institution_identity_evidence,
+    institution_identity_reviews,
     institution_source_relationships,
     institutions,
     normalized_offers,
@@ -220,6 +223,86 @@ def load_review_decision(conn: Connection, review_id: str) -> ReviewDecision:
             "reviewed_evidence_sha256": row.reviewed_evidence_sha256,
         }
     )
+
+
+def persist_identity_review(
+    conn: Connection, review: InstitutionIdentityReview | Mapping[str, Any]
+) -> InstitutionIdentityReview:
+    """Validate, then insert an identity review and the provenance it cites.
+
+    The cited artifact must already be registered (``provenance.artifact_id`` is a foreign
+    key), and the institution must exist: a review of nothing, or backed by nothing stored,
+    is refused by the database rather than accepted on trust.
+    """
+    checked = InstitutionIdentityReview.model_validate(
+        review.model_dump() if isinstance(review, InstitutionIdentityReview) else review
+    )
+    identifiers = [
+        _insert_provenance(conn, record, checked.institution_charter) for record in checked.evidence
+    ]
+    if len(set(identifiers)) != len(identifiers):
+        raise ValueError("an identity review cannot cite the same evidence twice")
+    conn.execute(
+        institution_identity_reviews.insert(),
+        {
+            "review_id": checked.review_id,
+            "schema_version": checked.schema_version,
+            "institution_charter": checked.institution_charter,
+            "legal_name": checked.legal_name,
+            "identity_confirmed": int(checked.identity_confirmed),
+            "massachusetts_scope_confirmed": int(checked.massachusetts_scope_confirmed),
+            "reviewer": checked.reviewer,
+            "decided_at": checked.decided_at,
+            "rationale": checked.rationale,
+        },
+    )
+    conn.execute(
+        institution_identity_evidence.insert(),
+        [
+            {"review_id": checked.review_id, "provenance_id": identifier, "ordinal": ordinal}
+            for ordinal, identifier in enumerate(identifiers)
+        ],
+    )
+    return checked
+
+
+def load_identity_reviews(
+    conn: Connection, institution_charter: int
+) -> tuple[InstitutionIdentityReview, ...]:
+    """Every identity review of one institution, newest decision first."""
+    rows = conn.execute(
+        select(institution_identity_reviews)
+        .where(institution_identity_reviews.c.institution_charter == institution_charter)
+        .order_by(
+            institution_identity_reviews.c.decided_at.desc(),
+            institution_identity_reviews.c.review_id,
+        )
+    ).all()
+    reviews: list[InstitutionIdentityReview] = []
+    for row in rows:
+        evidence_rows = conn.execute(
+            select(institution_identity_evidence)
+            .where(institution_identity_evidence.c.review_id == row.review_id)
+            .order_by(institution_identity_evidence.c.ordinal)
+        ).all()
+        loaded = _load_provenance(conn, {item.provenance_id for item in evidence_rows})
+        reviews.append(
+            InstitutionIdentityReview.model_validate(
+                {
+                    "schema_version": row.schema_version,
+                    "review_id": row.review_id,
+                    "institution_charter": row.institution_charter,
+                    "legal_name": row.legal_name,
+                    "identity_confirmed": bool(row.identity_confirmed),
+                    "massachusetts_scope_confirmed": bool(row.massachusetts_scope_confirmed),
+                    "evidence": [loaded[i.provenance_id].model_dump() for i in evidence_rows],
+                    "reviewer": row.reviewer,
+                    "decided_at": row.decided_at,
+                    "rationale": row.rationale,
+                }
+            )
+        )
+    return tuple(reviews)
 
 
 def _require_consistent_chain(

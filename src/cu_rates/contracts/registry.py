@@ -26,6 +26,7 @@ from cu_rates.contracts.enums import (
     RateAvailability,
     SourceRelationshipKind,
 )
+from cu_rates.contracts.evidence import Provenance
 
 
 class Institution(VersionedModel):
@@ -122,3 +123,28 @@ class ProductIdentity(VersionedModel):
             and not self.borrower_programs
             and not self.partner_programs
         )
+
+
+class InstitutionIdentityReview(VersionedModel):
+    """A human's evidence-backed decision about who an institution is and where it operates.
+
+    ``Institution.charter_verified`` and a relationship's ``approved_by`` are bare flags.
+    This record is the proof behind them: it names the charter and legal name that were
+    confirmed against an official source, states whether the institution is in scope for
+    this Massachusetts directory, and cites located evidence that can be re-verified
+    against stored bytes. Publication requires a current, approving review.
+    """
+
+    review_id: Identifier
+    institution_charter: CharterNumber
+    legal_name: Text
+    identity_confirmed: bool
+    massachusetts_scope_confirmed: bool
+    evidence: Annotated[tuple[Provenance, ...], Field(min_length=1, max_length=20)]
+    reviewer: Text
+    decided_at: UtcDatetime
+    rationale: Text
+
+    @property
+    def approves(self) -> bool:
+        return self.identity_confirmed and self.massachusetts_scope_confirmed
