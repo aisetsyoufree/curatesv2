@@ -683,6 +683,10 @@ def test_read_degrades_ranking_before_hard_expiry(
         "future-capture",
         "outside-window",
         "stale-at-release",
+        "unassumed-property_value",
+        "unassumed-autopay_discount",
+        "conflicting-autopay_discount",
+        "untyped-property_value",
     ],
 )
 def test_protocol2_reader_and_rollback_refuse_ineligible_sealed_rows(
@@ -722,6 +726,20 @@ def test_protocol2_reader_and_rollback_refuse_ineligible_sealed_rows(
             else:
                 info["publication_version"] = "1.0"
             conn.execute("UPDATE snapshot_info SET payload=?", (json.dumps(info),))
+        elif defect.partition("-")[0] in {"unassumed", "conflicting", "untyped"}:
+            kind, _, dimension = defect.partition("-")
+            kept = []
+            for assumption in payload["assumptions"]:
+                if assumption["dimension"] == dimension:
+                    if kind == "unassumed":
+                        continue
+                    if kind == "conflicting":
+                        assumption["state"] = "conflicts"
+                    else:
+                        assumption["stated"] = None
+                kept.append(assumption)
+            assert len(kept) == len(payload["assumptions"]) - (kind == "unassumed")
+            payload["assumptions"] = kept
         elif defect == "missing-digest":
             details.pop("publication_evidence_sha256")
         elif defect == "bad-digest":

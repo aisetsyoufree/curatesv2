@@ -38,7 +38,7 @@ from cu_rates.contracts.publication import (
     DUAL_EVIDENCE_TIME_WINDOW,
     Placement,
 )
-from cu_rates.contracts.scenarios import StatedBound
+from cu_rates.contracts.scenarios import REQUIRED_DIMENSIONS, StatedBound
 
 
 class PublicEvidence(ContractModel):
@@ -179,6 +179,18 @@ class PublicOffer(ContractModel):
                     expected = min(expected, ceiling)
             if post_intro != expected:
                 raise ValueError("HELOC post-intro value does not match its sourced inputs")
+        if self.placement is Placement.RANKED:
+            # A ranked row must carry evidence for every canonical assumption. Absence,
+            # a conflict or an untyped statement can never be re-admitted from storage.
+            if self.scenario_id is None:
+                raise ValueError("ranked offer has no canonical scenario")
+            matched = {
+                a.dimension
+                for a in self.assumptions
+                if a.state is MatchState.MATCHES and a.stated is not None
+            }
+            if not REQUIRED_DIMENSIONS[self.scenario_id] <= matched:
+                raise ValueError("ranked offer lacks evidence for a canonical assumption")
         values = {**rates, **({"points": self.points} if self.points is not None else {})}
         if {p.path for p in paths} != values.keys():
             raise ValueError("publication evidence must cover every financial value")
