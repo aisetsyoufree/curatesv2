@@ -1,0 +1,51 @@
+[Unit]
+Description=CU-Rates.org Data Quality Check
+Documentation=file:///var/lib/cu-rates/app/deploy/README.md https://github.com/aisetsyoufree/curatesv2
+
+[Service]
+Type=oneshot
+User=cu-rates
+Group=cu-rates
+WorkingDirectory=/var/lib/cu-rates/app
+
+ExecStart=/var/lib/cu-rates/venv/bin/python -m cu_rates.ops.quality --database /var/lib/cu-rates/data/operational.sqlite
+Restart=no
+
+LogsDirectory=cu-rates
+UMask=0077
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+PrivateDevices=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateNetwork=true
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+# Filesystem Access: the quality check never writes anything it inspects. The one exception is
+# the data directory: the operational database is in WAL mode, so even a read-only open
+# (mode=ro) must be able to create the -shm file next to it, and fails with "attempt to write
+# a readonly database" otherwise (pinned by tests/test_ops_wal_readonly.py).
+ReadWritePaths=/var/lib/cu-rates/data
+ReadOnlyPaths=/var/lib/cu-rates/app
+
+# Resource Limits (Raspberry Pi 5 with 16 GB RAM)
+MemoryMax=512M
+TasksMax=64
+CPUQuota=100%
