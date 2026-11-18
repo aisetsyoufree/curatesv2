@@ -492,7 +492,7 @@ def forbidden_ranking_problems(text: str) -> list[str]:
 
 
 _SQLITE_WRITE_KEYWORDS = re.compile(
-    r"\b(insert\s+into|update\s+\w+|delete\s+from|drop\s+table|create\s+table|alter\s+table|replace\s+into|vacuum|attach\s+database)\b",
+    r"\b(insert\s+into|update\s+\w+|delete\s+from|drop\s+table|drop\s+view|drop\s+index|create\s+(?:(?:temp|temporary)\s+)?table|create\s+(?:(?:temp|temporary)\s+)?view|create\s+(?:(?:temp|temporary)\s+)?(?:unique\s+)?index|alter\s+table|replace\s+into|vacuum|attach\s+database|reindex|analyze)\b",
     re.IGNORECASE,
 )
 
@@ -771,6 +771,13 @@ def _scan_module(
                         problem = _check_sqlite_statement(first_arg.value)
                         if problem:
                             references.append(problem)
+                        elif not (
+                            _is_safe_select(first_arg.value)
+                            or _PRAGMA_PATTERN.search(first_arg.value)
+                        ):
+                            references.append(
+                                f"sqlite forbidden literal SQL '{first_arg.value.strip()[:30]}'"
+                            )
                     else:
                         resolved = _extract_string_expr(first_arg, var_values)
                         if not resolved and isinstance(first_arg, ast.Name):
@@ -820,7 +827,9 @@ def _scan_module(
                             ):
                                 has_as_uri = True
 
-                    is_file_uri = has_as_uri or any("file:" in s for s in conn_target_strings)
+                    is_file_uri = has_as_uri or any(
+                        urlsplit(s).scheme == "file" for s in conn_target_strings
+                    )
                     has_query_mode_ro = any(_uri_is_read_only(s) for s in conn_target_strings)
 
                     valid_uri_ro = has_uri_true and is_file_uri and has_query_mode_ro
