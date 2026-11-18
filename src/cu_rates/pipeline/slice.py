@@ -285,6 +285,14 @@ def verify_offer_bytes(
     source: RateSource, offer: NormalizedOffer, body: bytes, artifact: RawArtifact
 ) -> bool:
     """Require all locators and normalized values to agree with the actual captured row."""
+    _, comparable = verified_offer_candidates(source, offer, body, artifact)
+    return comparable
+
+
+def verified_offer_candidates(
+    source: RateSource, offer: NormalizedOffer, body: bytes, artifact: RawArtifact
+) -> tuple[tuple[ExtractedCandidate, ...], bool]:
+    """Re-extract the exact stored row; assertions supplied by callers are not evidence."""
     if offer.effective_at is not None and offer.effective_at > artifact.fetched_at:
         raise ValueError("effective date follows the source observation")
     candidates = [
@@ -311,7 +319,7 @@ def verify_offer_bytes(
             if offer.offer_id == f"{identity.key}.{row.row_id}":
                 expected = _normalize(row, identity, artifact.fetched_at)
                 if offer.model_dump(exclude=lifecycle) == expected.model_dump(exclude=lifecycle):
-                    return _supplemental_assumptions_match(row, identity)
+                    return row.candidates, _supplemental_assumptions_match(row, identity)
     raise ValueError("offer fields do not match the stored artifact row")
 
 

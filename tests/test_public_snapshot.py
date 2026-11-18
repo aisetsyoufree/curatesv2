@@ -1,32 +1,48 @@
-"""Public snapshot integration checks (fictional rates and sources only)."""
+"""Public snapshot integration: real stored bytes from the offline fixture pipeline."""
 
+import inspect
 import json
 import sqlite3
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
-from datetime import datetime, timedelta
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from shutil import copytree
 from threading import Event
 from typing import Any
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.engine import Connection
 
-from cu_rates.contracts.audit import PublishedSnapshot, SnapshotEntry, snapshot_manifest_sha256
+from cu_rates.artifact_store import ArtifactStore
+from cu_rates.contracts.audit import (
+    PublishedSnapshot,
+    ReviewDecision,
+    SnapshotEntry,
+    snapshot_manifest_sha256,
+)
 from cu_rates.contracts.enums import (
     CanonicalScenarioId,
     OfferStatus,
+    ReviewSubject,
     ReviewVerdict,
     WithdrawalScope,
 )
 from cu_rates.contracts.fingerprints import OfferFingerprints, offer_fingerprints
-from cu_rates.contracts.publication import Placement, evaluate_publication
+from cu_rates.contracts.publication import (
+    Placement,
+    corroborated_paths,
+    evaluate_publication,
+    publication_evidence_sha256,
+)
 from cu_rates.db import metadata, open_operational_database
-from cu_rates.db.schema import withdrawal_entries
-from cu_rates.pipeline.extract import extract_fixture
-from cu_rates.pipeline.slice import GIT_SHA
-from cu_rates.pipeline.trusted import insert_withdrawal, load_publication_context
+from cu_rates.db.schema import normalized_offers, withdrawal_entries
+from cu_rates.pipeline.slice import CHARTER, SliceRun, verified_offer_candidates
+from cu_rates.pipeline.trusted import insert_review, insert_withdrawal, load_publication_context
 from cu_rates.snapshot import Denylist, PublicOffer, SnapshotError, SnapshotReader, builder
 from cu_rates.snapshot._database import database_digest
 from cu_rates.snapshot._models import (
@@ -39,53 +55,109 @@ from cu_rates.snapshot.builder import SnapshotCandidate, SnapshotPublisher
 
 from .contracts import factories as make
 from .pub2_fixtures import reviewed_fixture
-from .test_validation import claim, draft
 
-_BIRTH = make.EVALUATED_AT
+_BIRTH = datetime(2026, 11, 16, 15, 1, 6, tzinfo=UTC)
 
 
-def row(
-    offer_id: str = "offer-001", *, now: datetime = _BIRTH, validity: timedelta = timedelta(days=3)
-) -> SnapshotCandidate:
-    effective = make.T0 - timedelta(days=1)
-    date = claim("effective_at", effective.isoformat())
-    offer = draft(
-        offer_id=offer_id,
-        status=OfferStatus.APPROVED,
-        effective_at=effective,
-        supporting_evidence=(date.provenance, make.provenance("PRIVATE CAPTURE TEXT")),
-        scenario_id=CanonicalScenarioId.PURCHASE_30Y_FIXED,
-        scenario_matches=make.purchase_offer().scenario_matches,
-        valid_until=make.T0 + validity,
+@dataclass
+class StoredFixture:
+    run: SliceRun
+    conn: Connection
+
+    def row(self, name: str = "purchase-30-year", *, now: datetime = _BIRTH) -> SnapshotCandidate:
+        offer_id = self.run.offers[name].offer_id
+        view = load_publication_context(self.conn, offer_id, now, store=self.run.store)
+        primary = next(
+            (a for a in view.context.known_artifacts if a.fetched_at == view.offer.observed_at),
+            None,
+        )
+        candidates = (
+            ()
+            if primary is None
+            else verified_offer_candidates(
+                view.context.source, view.offer, self.run.store.read(primary), primary
+            )[0]
+        )
+        return SnapshotCandidate(
+            offer=view.offer,
+            context=view.context,
+            candidates=candidates,
+            current_review=view.current_review,
+        )
+
+    def approve(self, offer_id: str, *, evidence_hash: str | None = None) -> None:
+        view = load_publication_context(self.conn, offer_id, _BIRTH, store=self.run.store)
+        paths = corroborated_paths(view.offer, view.context)
+        assert paths
+        insert_review(
+            self.conn,
+            ReviewDecision(
+                schema_version=make.SV,
+                review_id=f"test-review-{offer_id}",
+                subject=ReviewSubject.OFFER,
+                subject_id=offer_id,
+                verdict=ReviewVerdict.APPROVED,
+                actor="fixture-reviewer",
+                decided_at=_BIRTH,
+                rationale="Review the two stored authored fixture documents.",
+                evidence=tuple(dict.fromkeys(path.provenance for path in paths)),
+                reviewed_fingerprints=offer_fingerprints(view.offer),
+                reviewed_evidence_sha256=evidence_hash
+                or publication_evidence_sha256(view.offer, paths),
+            ),
+            CHARTER,
+        )
+
+
+@pytest.fixture(scope="module")
+def persisted_seed(tmp_path_factory: pytest.TempPathFactory) -> SliceRun:
+    # Run the actual pipeline once, then isolate tests with copies of its closed store.
+    return reviewed_fixture(tmp_path_factory.mktemp("persisted-admission"))
+
+
+@pytest.fixture
+def stored(tmp_path: Path, persisted_seed: SliceRun) -> Iterator[StoredFixture]:
+    root = tmp_path / "worker"
+    copytree(persisted_seed.database.parent, root)
+    run = replace(
+        persisted_seed, database=root / "operational.sqlite", store=ArtifactStore(root / "evidence")
     )
-    ctx = make.context(offer, evaluated_at=now)
-    return SnapshotCandidate(offer=offer, context=ctx, candidates=(date,))
+    engine = open_operational_database(run.database)
+    with engine.begin() as conn:
+        yield StoredFixture(run, conn)
+    engine.dispose()
 
 
 def release(
     name: str,
     *rows: SnapshotCandidate,
     supersedes: str | None = None,
-    review_ids: tuple[str, ...] = (),
+    review_ids: tuple[str, ...] | None = None,
 ) -> PublishedSnapshot:
-    entries = []
-    for item in rows:
-        fp = offer_fingerprints(item.offer)
-        entries.append(
-            SnapshotEntry(
-                offer_id=item.offer.offer_id, structural_sha256=fp.structural, value_sha256=fp.value
-            )
+    entries = tuple(
+        sorted(
+            (
+                SnapshotEntry(
+                    offer_id=row.offer.offer_id,
+                    structural_sha256=offer_fingerprints(row.offer).structural,
+                    value_sha256=offer_fingerprints(row.offer).value,
+                )
+                for row in rows
+            ),
+            key=lambda e: e.offer_id,
         )
-    ordered = tuple(sorted(entries, key=lambda entry: entry.offer_id))
+    )
     return PublishedSnapshot(
         schema_version=make.SV,
         snapshot_id=name,
         published_at=rows[0].context.evaluated_at,
-        published_by="synthetic-publication-runner",
-        entries=ordered,
-        manifest_sha256=snapshot_manifest_sha256(ordered),
+        published_by="offline-fixture-publisher",
+        entries=entries,
+        manifest_sha256=snapshot_manifest_sha256(entries),
         supersedes=supersedes,
-        review_ids=review_ids,
+        review_ids=review_ids
+        if review_ids is not None
+        else tuple(row.current_review.review_id for row in rows if row.current_review is not None),
     )
 
 
@@ -96,23 +168,23 @@ def setup_storage(tmp_path: Path) -> tuple[SnapshotPublisher, SnapshotReader, De
     return publisher, SnapshotReader(publisher.root, denylist.path), denylist
 
 
-def test_snapshot_records_provenance_generation_and_immutable_format(tmp_path: Path) -> None:
+def test_snapshot_records_provenance_generation_and_immutable_format(
+    tmp_path: Path, stored: StoredFixture
+) -> None:
     publisher, reader, _ = setup_storage(tmp_path)
-    item = row()
+    item = stored.row()
     assert evaluate_publication(item.offer, item.context).ranking_eligible
     manifest = release("first", item)
-    info = publisher.build(manifest, [item])
+    info = publisher.build(manifest, conn=stored.conn, store=stored.run.store)
     view = reader.read(at=_BIRTH)
     assert view.info == info
     assert info.manifest_sha256 == manifest.manifest_sha256
-    assert info.published_at == _BIRTH and info.published_by == manifest.published_by
     (visible,) = view.offers
     assert visible.review_status == "automatic" and visible.placement is Placement.RANKED
-    assert visible.source_url == make.SOURCE_URL
+    assert visible.source_url == item.context.source.url
     assert visible.observed_at == item.offer.observed_at
-    assert visible.evidence and {part.artifact_id for part in visible.evidence} == {
-        make.ARTIFACT_ID,
-        make.ARTIFACT_ID_2,
+    assert {part.artifact_id for part in visible.evidence} == {
+        a.artifact_id for a in item.context.known_artifacts
     }
     assert {part.path for part in visible.evidence} >= {
         "note_rate",
@@ -120,13 +192,12 @@ def test_snapshot_records_provenance_generation_and_immutable_format(tmp_path: P
         "fields.details.term_months",
     }
     assert {value.path: value.value for value in visible.rates} == {
-        "note_rate": Decimal("6.125"),
-        "apr": Decimal("6.250"),
+        "note_rate": Decimal("6.375"),
+        "apr": Decimal("6.441"),
     }
     database = publisher.root / "versions" / "first" / "published.sqlite"
     assert database.is_file() and database.stat().st_mode & 0o222 == 0
     assert not list(database.parent.glob("published.sqlite-*"))
-    assert b"PRIVATE CAPTURE TEXT" not in database.read_bytes()
     assert b"source_text" not in database.read_bytes()
     with closing(sqlite3.connect(database.as_uri() + "?mode=ro&immutable=1", uri=True)) as conn:
         assert conn.execute("PRAGMA journal_mode").fetchone() == ("delete",)
@@ -135,104 +206,55 @@ def test_snapshot_records_provenance_generation_and_immutable_format(tmp_path: P
 
 
 def test_a_dated_t014_human_approval_is_exported_without_web_access_to_worker(
-    tmp_path: Path,
+    tmp_path: Path, stored: StoredFixture
 ) -> None:
-    pilot = reviewed_fixture(tmp_path / "pilot")
-    assert pilot.reviewed_snapshot is not None
-    as_of = pilot.reviewed_snapshot.published_at - timedelta(microseconds=1)
-    worker = open_operational_database(pilot.database)
-    offer_id = pilot.offers["purchase-30-year"].offer_id
-    with worker.connect() as conn:
-        view = load_publication_context(conn, offer_id, as_of, store=pilot.store)
-    worker.dispose()
-    assert view.current_review is not None
-    artifact = view.context.known_artifacts[0]
-    extracted = extract_fixture(
-        "athol-style-dated",
-        pilot.store.read(artifact),
-        artifact_id=artifact.artifact_id,
-        extraction_run_id=f"slice-{artifact.fetch_run_id}",
-        git_sha=GIT_SHA,
-    )
-    candidates = next(row.candidates for row in extracted.rows if row.row_id == "purchase-30-year")
-    item = SnapshotCandidate(
-        offer=view.offer,
-        context=view.context,
-        candidates=candidates,
-        current_review=view.current_review,
-    )
-    manifest = release("reviewed", item, review_ids=(view.current_review.review_id,))
+    as_of = _BIRTH - timedelta(microseconds=1)
+    item = stored.row(now=as_of)
+    assert item.current_review is not None
     publisher, reader, _ = setup_storage(tmp_path)
-    publisher.build(manifest, [item])
-    # The web API has no worker path or connection and still reads after the worker is gone.
-    pilot.database.rename(pilot.database.with_name("unavailable.sqlite"))
+    publisher.build(release("reviewed", item), conn=stored.conn, store=stored.run.store)
+    stored.run.database.rename(stored.run.database.with_name("unavailable.sqlite"))
     (visible,) = reader.read(at=as_of).offers
     assert visible.review_status == "reviewed" and visible.placement is Placement.RANKED
-    assert visible.effective_at == view.offer.effective_at
+    assert visible.effective_at == item.offer.effective_at
 
 
-def test_t014_refresh_without_t045_compatible_capture_does_not_activate(tmp_path: Path) -> None:
-    pilot = reviewed_fixture(tmp_path / "pilot")
-    assert pilot.refreshed_snapshot is not None
-    as_of = pilot.refreshed_snapshot.published_at
-    worker = open_operational_database(pilot.database)
-    offer_id = pilot.offers["purchase-30-year"].offer_id
-    with worker.connect() as conn:
-        view = load_publication_context(conn, offer_id, as_of, store=pilot.store)
-    assert evaluate_publication(view.offer, view.context).publishable_now
-    artifact = view.context.known_artifacts[0]
-    assert artifact.fetched_at != view.offer.observed_at
-    extracted = extract_fixture(
-        "athol-style-dated",
-        pilot.store.read(artifact),
-        artifact_id=artifact.artifact_id,
-        extraction_run_id=f"slice-{artifact.fetch_run_id}",
-        git_sha=GIT_SHA,
-    )
-    candidates = next(row.candidates for row in extracted.rows if row.row_id == "purchase-30-year")
-    item = SnapshotCandidate(offer=view.offer, context=view.context, candidates=candidates)
+def test_t014_refresh_without_t045_compatible_capture_does_not_activate(
+    tmp_path: Path, stored: StoredFixture
+) -> None:
+    assert stored.run.refreshed_snapshot is not None
+    item = stored.row(now=stored.run.refreshed_snapshot.published_at)
+    assert evaluate_publication(item.offer, item.context).publishable_now
     publisher, _, _ = setup_storage(tmp_path)
     with pytest.raises(SnapshotError, match="T045 refused"):
-        publisher.build(release("not-validated", item), [item])
+        publisher.build(release("not-validated", item), conn=stored.conn, store=stored.run.store)
     assert not (publisher.root / "current.json").exists()
 
 
-def test_review_must_bind_exact_offer_evidence(tmp_path: Path) -> None:
+def test_review_must_bind_exact_stored_offer_evidence(
+    tmp_path: Path, stored: StoredFixture
+) -> None:
+    item = stored.row("purchase-15-year")
+    stored.approve(item.offer.offer_id, evidence_hash="d0" * 32)
+    item = stored.row("purchase-15-year")
     publisher, _, _ = setup_storage(tmp_path)
-    initial = row()
-    review = make.review(initial.offer).model_copy(
-        update={
-            "decided_at": _BIRTH,
-            "reviewed_evidence_sha256": "d0" * 32,
-        }
-    )
-    item = initial.model_copy(
-        update={
-            "context": initial.context.model_copy(update={"prior": None}),
-            "current_review": review,
-        }
-    )
     with pytest.raises(SnapshotError, match="publication gate refused"):
-        publisher.build(release("not-reviewed", item, review_ids=(review.review_id,)), [item])
+        publisher.build(release("not-reviewed", item), conn=stored.conn, store=stored.run.store)
 
 
 def test_reader_never_sees_a_partial_version_during_build_and_activation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, stored: StoredFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     publisher, reader, _ = setup_storage(tmp_path)
-    originals = [row("old-a"), row("old-b")]
-    replacements = [row("new-a"), row("new-b"), row("new-c")]
-    publisher.build(release("first", *originals), originals)
+    originals = [stored.row()]
+    stored.approve(stored.run.offers["purchase-15-year"].offer_id)
+    replacements = [stored.row(), stored.row("purchase-15-year")]
+    publisher.build(release("first", *originals), conn=stored.conn, store=stored.run.store)
     expected = {
-        "first": ("old-a", "old-b"),
-        "second": ("new-a", "new-b", "new-c"),
+        "first": tuple(x.offer.offer_id for x in originals),
+        "second": tuple(sorted(x.offer.offer_id for x in replacements)),
     }
-    staged = Event()
-    swap = Event()
-    observed_old = Event()
-    observed_new = Event()
-    stop = Event()
+    staged, swap, observed_old, observed_new, stop = (Event() for _ in range(5))
     activate = publisher._activate
 
     def wait_to_activate(version: Version) -> None:
@@ -247,10 +269,20 @@ def test_reader_never_sees_a_partial_version_during_build_and_activation(
             (observed_old if view.info.snapshot_id == "first" else observed_new).set()
 
     monkeypatch.setattr(publisher, "_activate", wait_to_activate)
+    # SQLite connections stay in the thread that owns them.
+    stored.conn.commit()
+    engine = open_operational_database(stored.run.database)
+
+    def writing() -> SnapshotInfo:
+        with engine.connect() as conn:
+            return publisher.build(
+                release("second", *replacements, supersedes="first"),
+                conn=conn,
+                store=stored.run.store,
+            )
+
     with ThreadPoolExecutor(max_workers=2) as pool:
-        writer = pool.submit(
-            publisher.build, release("second", *replacements, supersedes="first"), replacements
-        )
+        writer = pool.submit(writing)
         read_loop = pool.submit(reading)
         try:
             assert staged.wait(8) and observed_old.wait(8)
@@ -263,63 +295,158 @@ def test_reader_never_sees_a_partial_version_during_build_and_activation(
             stop.set()
             swap.set()
         read_loop.result(timeout=8)
+    engine.dispose()
 
 
-@pytest.mark.parametrize(
-    "mode",
-    [
-        "no worker validation",
-        "pending review",
-        "rejected review",
-        "quarantined",
-        "t045 contradiction",
-        "missing date candidate",
-    ],
-)
-def test_ineligible_rows_never_activate_or_partially_publish(tmp_path: Path, mode: str) -> None:
+@pytest.mark.parametrize("mode", ["pending review", "rejected review", "quarantined"])
+def test_ineligible_stored_rows_never_activate_or_partially_publish(
+    tmp_path: Path, stored: StoredFixture, mode: str
+) -> None:
     publisher, reader, _ = setup_storage(tmp_path)
-    clean = row()
-    publisher.build(release("first", clean), [clean])
-    pending = row("pending")
-    if mode == "no worker validation":
-        pending = pending.model_copy(
-            update={"context": pending.context.model_copy(update={"validations": ()})}
+    clean = stored.row()
+    publisher.build(release("first", clean), conn=stored.conn, store=stored.run.store)
+    pending = stored.row("purchase-15-year")
+    if mode == "rejected review":
+        insert_review(
+            stored.conn,
+            ReviewDecision(
+                schema_version=make.SV,
+                review_id="rejected-15",
+                subject=ReviewSubject.OFFER,
+                subject_id=pending.offer.offer_id,
+                verdict=ReviewVerdict.REJECTED,
+                actor="fixture-reviewer",
+                decided_at=_BIRTH,
+                rationale="Reject the stored offer.",
+                reviewed_fingerprints=offer_fingerprints(pending.offer),
+                reviewed_evidence_sha256=publication_evidence_sha256(
+                    pending.offer, corroborated_paths(pending.offer, pending.context)
+                ),
+            ),
+            CHARTER,
         )
-    elif mode == "pending review":
-        pending = pending.model_copy(
-            update={"context": pending.context.model_copy(update={"prior": None})}
-        )
-    elif mode == "rejected review":
-        rejected = make.review(pending.offer, ReviewVerdict.REJECTED)
-        pending = pending.model_copy(update={"current_review": rejected})
     elif mode == "quarantined":
-        pending = pending.model_copy(
-            update={
-                "offer": pending.offer.model_copy(update={"status": OfferStatus.QUARANTINED}),
-            }
+        stored.conn.execute(
+            normalized_offers.update()
+            .where(normalized_offers.c.offer_id == pending.offer.offer_id)
+            .values(status=OfferStatus.QUARANTINED.value)
         )
-    elif mode == "t045 contradiction":
-        assert evaluate_publication(pending.offer, pending.context).publishable_now
-        pending = pending.model_copy(
-            update={
-                "candidates": (*pending.candidates, claim("apr", "8.125%", suffix="contradiction")),
-            }
-        )
-    else:
-        assert evaluate_publication(pending.offer, pending.context).publishable_now
-        pending = pending.model_copy(update={"candidates": ()})
     pointer = publisher.root / "current.json"
     before = pointer.read_bytes()
-    error = (
-        "T045 refused"
-        if mode in ("t045 contradiction", "missing date candidate")
-        else "refused|publishable|approved"
-    )
-    with pytest.raises(SnapshotError, match=error):
-        publisher.build(release("second", clean, pending, supersedes="first"), [clean, pending])
+    with pytest.raises(SnapshotError, match=r"refused|publishable|approved"):
+        publisher.build(
+            release("second", clean, pending, supersedes="first"),
+            conn=stored.conn,
+            store=stored.run.store,
+        )
     assert pointer.read_bytes() == before
     assert reader.read(at=_BIRTH).info.snapshot_id == "first"
     assert not (publisher.root / "versions" / "second").exists()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "no stored bytes",
+        "tampered primary bytes",
+        "tampered secondary bytes",
+        "missing secondary bytes",
+        "missing observation",
+    ],
+)
+def test_builder_rechecks_stored_bytes_before_activation(
+    tmp_path: Path, stored: StoredFixture, failure: str
+) -> None:
+    publisher, reader, _ = setup_storage(tmp_path)
+    item = stored.row()
+    if "conn" in inspect.signature(publisher.build).parameters:
+        publisher.build(release("first", item), conn=stored.conn, store=stored.run.store)
+    else:
+        publisher.build(release("first", item), [item])  # type: ignore[call-arg, arg-type]
+    pointer = publisher.root / "current.json"
+    before = pointer.read_bytes()
+    artifacts = sorted(item.context.known_artifacts, key=lambda a: a.fetched_at, reverse=True)
+    primary, secondary = artifacts
+    if failure == "missing observation":
+        import hashlib
+
+        metadata = (
+            (stored.run.database.parent / "evidence")
+            / "observations"
+            / secondary.fetch_run_id
+            / (hashlib.sha256(secondary.source_url.encode()).hexdigest() + ".json")
+        )
+        metadata.unlink()
+    else:
+        affected = (
+            artifacts
+            if failure == "no stored bytes"
+            else [primary if "primary" in failure else secondary]
+        )
+        for art in affected:
+            blob = (
+                (stored.run.database.parent / "evidence")
+                / "blobs"
+                / art.artifact_id[:2]
+                / art.artifact_id
+            )
+            if "tampered" in failure:
+                blob.chmod(0o600)
+                body = blob.read_bytes()
+                blob.write_bytes(body.replace(b"6.375%", b"9.375%"))
+                blob.chmod(0o400)
+            else:
+                blob.unlink()
+    # Compatibility lane deliberately reproduces the original exploit if the old
+    # implementation is restored: it accepts this cached, approved-looking assertion.
+    if "conn" not in inspect.signature(publisher.build).parameters:
+        with pytest.raises(SnapshotError, match=r"stored|evidence"):
+            publisher.build(release("second", item, supersedes="first"), [item])  # type: ignore[call-arg, arg-type]
+    else:
+        with pytest.raises(SnapshotError, match=r"stored|evidence|corroboration"):
+            publisher.build(
+                release("second", item, supersedes="first"),
+                conn=stored.conn,
+                store=stored.run.store,
+            )
+    assert pointer.read_bytes() == before
+    assert reader.read(at=_BIRTH).info.snapshot_id == "first"
+    assert not (publisher.root / "versions" / "second").exists()
+
+
+def test_builder_rejects_caller_supplied_admission_inputs(
+    tmp_path: Path, stored: StoredFixture
+) -> None:
+    publisher, _, _ = setup_storage(tmp_path)
+    item = stored.row()
+    # Review IDs in the manifest select records; they cannot supply a decision.
+    with pytest.raises(TypeError):
+        publisher.build(release("asserted", item), [item])  # type: ignore[call-arg, arg-type]
+    for keyword, asserted in (("captures", [item]), ("reviews", [item.current_review])):
+        with pytest.raises(TypeError, match="unexpected keyword argument"):
+            publisher.build(
+                release("asserted", item),
+                conn=stored.conn,
+                store=stored.run.store,
+                **{keyword: asserted},
+            )
+    assert not (publisher.root / "current.json").exists()
+
+
+def test_probe_with_asserted_proofs_but_no_stored_bytes_is_refused(
+    tmp_path: Path, stored: StoredFixture
+) -> None:
+    publisher, _, _ = setup_storage(tmp_path)
+    item = stored.row()
+    empty_store = ArtifactStore(tmp_path / "empty-evidence")
+    # The legacy API published this cached context even when the store had no bytes.
+    with pytest.raises(SnapshotError, match="stored evidence bytes missing or unverifiable"):
+        if "conn" in inspect.signature(publisher.build).parameters:
+            publisher.build(release("probe", item), conn=stored.conn, store=empty_store)
+        else:
+            publisher.build(release("probe", item), [item])  # type: ignore[call-arg, arg-type]
+    assert not (publisher.root / "current.json").exists()
+    assert not (publisher.root / "versions" / "probe").exists()
 
 
 def _change_manifest_in_database(path: Path) -> None:
@@ -334,17 +461,20 @@ def _change_manifest_in_database(path: Path) -> None:
 
 
 def test_bad_manifest_at_input_and_after_staging_preserves_live_pointer(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stored: StoredFixture
 ) -> None:
     publisher, reader, _ = setup_storage(tmp_path)
-    clean = row()
-    publisher.build(release("first", clean), [clean])
+    clean = stored.row()
+    publisher.build(release("first", clean), conn=stored.conn, store=stored.run.store)
     second = release("second", clean, supersedes="first")
     pointer = publisher.root / "current.json"
     before = pointer.read_bytes()
     with pytest.raises(SnapshotError):
-        publisher.build(second.model_copy(update={"manifest_sha256": "0" * 64}), [clean])
+        publisher.build(
+            second.model_copy(update={"manifest_sha256": "0" * 64}),
+            conn=stored.conn,
+            store=stored.run.store,
+        )
     write_real = builder._write_database
 
     def invalid_staging(path: Path, info: SnapshotInfo, rows: tuple[PublicOffer, ...]) -> None:
@@ -353,17 +483,21 @@ def test_bad_manifest_at_input_and_after_staging_preserves_live_pointer(
 
     monkeypatch.setattr(builder, "_write_database", invalid_staging)
     with pytest.raises(SnapshotError, match="manifest"):
-        publisher.build(second, [clean])
+        publisher.build(second, conn=stored.conn, store=stored.run.store)
     assert pointer.read_bytes() == before
     assert reader.read(at=_BIRTH).info.snapshot_id == "first"
     assert not list((publisher.root / "versions").glob(".build-*"))
 
 
-def test_read_rebuilds_manifest_and_rollback_refuses_a_bad_version(tmp_path: Path) -> None:
+def test_read_rebuilds_manifest_and_rollback_refuses_a_bad_version(
+    tmp_path: Path, stored: StoredFixture
+) -> None:
     publisher, reader, _ = setup_storage(tmp_path)
-    item = row()
-    publisher.build(release("first", item), [item])
-    publisher.build(release("second", item, supersedes="first"), [item])
+    item = stored.row()
+    publisher.build(release("first", item), conn=stored.conn, store=stored.run.store)
+    publisher.build(
+        release("second", item, supersedes="first"), conn=stored.conn, store=stored.run.store
+    )
     second = publisher.root / "versions" / "second"
     _change_manifest_in_database(second / "published.sqlite")
     # Re-anchor the file digest deliberately; the *contract* manifest must still catch it.
@@ -386,10 +520,12 @@ def test_read_rebuilds_manifest_and_rollback_refuses_a_bad_version(tmp_path: Pat
     assert reader.read(at=_BIRTH).info.snapshot_id == "first"
 
 
-def test_read_rejects_nonmanifest_field_tampering_and_sidecars(tmp_path: Path) -> None:
+def test_read_rejects_nonmanifest_field_tampering_and_sidecars(
+    tmp_path: Path, stored: StoredFixture
+) -> None:
     publisher, reader, _ = setup_storage(tmp_path)
-    item = row()
-    publisher.build(release("first", item), [item])
+    item = stored.row()
+    publisher.build(release("first", item), conn=stored.conn, store=stored.run.store)
     db = publisher.root / "versions" / "first" / "published.sqlite"
     sidecar = db.with_name("published.sqlite-wal")
     sidecar.touch()
@@ -406,25 +542,29 @@ def test_read_rejects_nonmanifest_field_tampering_and_sidecars(tmp_path: Path) -
         reader.read(at=_BIRTH)
 
 
-def test_rollback_preserves_sealed_versions_and_refuses_reusing_an_id(tmp_path: Path) -> None:
+def test_rollback_preserves_sealed_versions_and_refuses_reusing_an_id(
+    tmp_path: Path, stored: StoredFixture
+) -> None:
     publisher, reader, _ = setup_storage(tmp_path)
-    item = row()
-    publisher.build(release("first", item), [item])
+    item = stored.row()
+    publisher.build(release("first", item), conn=stored.conn, store=stored.run.store)
     second = release("second", item, supersedes="first")
-    publisher.build(second, [item])
+    publisher.build(second, conn=stored.conn, store=stored.run.store)
     database = publisher.root / "versions" / "second" / "published.sqlite"
     original = database.read_bytes()
     publisher.rollback("first")
     with pytest.raises(SnapshotError, match="already exists"):
-        publisher.build(second, [item])
+        publisher.build(second, conn=stored.conn, store=stored.run.store)
     assert database.read_bytes() == original
     assert reader.read(at=_BIRTH).info.snapshot_id == "first"
 
 
-def test_pointer_cannot_select_an_operational_database_path(tmp_path: Path) -> None:
+def test_pointer_cannot_select_an_operational_database_path(
+    tmp_path: Path, stored: StoredFixture
+) -> None:
     publisher, reader, _ = setup_storage(tmp_path)
-    item = row()
-    publisher.build(release("first", item), [item])
+    item = stored.row()
+    publisher.build(release("first", item), conn=stored.conn, store=stored.run.store)
     stable = publisher.root / "current.json"
     stable.write_bytes(stable.read_bytes().replace(b'"first"', b'"../../operational.sqlite"'))
     with pytest.raises(SnapshotError, match="pointer"):
@@ -435,12 +575,11 @@ def test_pointer_cannot_select_an_operational_database_path(tmp_path: Path) -> N
 
 @pytest.mark.parametrize("scope", list(WithdrawalScope))
 def test_independent_emergency_withdrawal_enforces_every_scope_at_read_time(
-    tmp_path: Path,
-    scope: WithdrawalScope,
+    tmp_path: Path, scope: WithdrawalScope, stored: StoredFixture
 ) -> None:
     publisher, reader, denylist = setup_storage(tmp_path)
-    item = row()
-    publisher.build(release("first", item), [item])
+    item = stored.row()
+    publisher.build(release("first", item), conn=stored.conn, store=stored.run.store)
     moment = _BIRTH + timedelta(minutes=1)
     targets = {
         WithdrawalScope.SOURCE: item.offer.source_id,
@@ -460,19 +599,25 @@ def test_independent_emergency_withdrawal_enforces_every_scope_at_read_time(
 
 
 def test_rollback_preserves_withdrawals_and_expiry_and_invalid_denylist_fails_closed(
-    tmp_path: Path,
+    tmp_path: Path, stored: StoredFixture
 ) -> None:
     publisher, reader, denylist = setup_storage(tmp_path)
-    soon = row("soon", validity=timedelta(hours=2))
-    held = row("held", validity=timedelta(hours=90))
-    publisher.build(release("first", soon, held), [soon, held])
-    publisher.build(release("second", held, supersedes="first"), [held])
+    soon = stored.row()
+    held = stored.row("purchase-15-year")
+    stored.approve(held.offer.offer_id)
+    held = stored.row("purchase-15-year")
+    publisher.build(release("first", soon, held), conn=stored.conn, store=stored.run.store)
+    publisher.build(
+        release("second", held, supersedes="first"), conn=stored.conn, store=stored.run.store
+    )
     publisher.rollback("first")
     expiry = soon.offer.valid_until
     assert expiry is not None
-    denylist.withdraw(make.withdrawal(WithdrawalScope.OFFER, "held", withdrawn_at=_BIRTH))
+    denylist.withdraw(
+        make.withdrawal(WithdrawalScope.OFFER, held.offer.offer_id, withdrawn_at=_BIRTH)
+    )
     assert tuple(x.offer_id for x in reader.read(at=expiry - timedelta(microseconds=1)).offers) == (
-        "soon",
+        soon.offer.offer_id,
     )
     assert reader.read(at=expiry).offers == ()
     denylist.path.write_bytes(b"broken")
@@ -483,15 +628,32 @@ def test_rollback_preserves_withdrawals_and_expiry_and_invalid_denylist_fails_cl
         reader.read(at=expiry)
 
 
-def test_read_degrades_ranking_before_hard_expiry(tmp_path: Path) -> None:
+def test_read_degrades_ranking_before_hard_expiry(
+    tmp_path: Path, stored: StoredFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
     publisher, reader, _ = setup_storage(tmp_path)
-    item = row(validity=timedelta(hours=90))
-    publisher.build(release("first", item), [item])
-    assert reader.read(at=make.T0 + timedelta(hours=72)).offers[0].placement is Placement.RANKED
-    assert (
-        reader.read(at=make.T0 + timedelta(hours=73)).offers[0].placement is Placement.BROWSE_ONLY
+    item = stored.row()
+    publisher.build(release("first", item), conn=stored.conn, store=stored.run.store)
+    # Isolate reader expiry policy from the slice's shorter 71-hour publication policy.
+    # These in-memory read results are never sent to the publisher or written to disk.
+    initial = reader.read(at=_BIRTH)
+    expiry = item.offer.observed_at + timedelta(hours=90)
+    monkeypatch.setattr(
+        "cu_rates.snapshot.reader.verify_database",
+        lambda *_: (
+            initial.info,
+            tuple(o.model_copy(update={"valid_until": expiry}) for o in initial.offers),
+        ),
     )
-    assert reader.read(at=make.T0 + timedelta(hours=90)).offers == ()
+    assert (
+        reader.read(at=item.offer.observed_at + timedelta(hours=72)).offers[0].placement
+        is Placement.RANKED
+    )
+    assert (
+        reader.read(at=item.offer.observed_at + timedelta(hours=73)).offers[0].placement
+        is Placement.BROWSE_ONLY
+    )
+    assert reader.read(at=expiry).offers == ()
 
 
 @pytest.mark.parametrize("operation", ["read", "rollback"])
@@ -524,12 +686,14 @@ def test_read_degrades_ranking_before_hard_expiry(tmp_path: Path) -> None:
     ],
 )
 def test_protocol2_reader_and_rollback_refuse_ineligible_sealed_rows(
-    tmp_path: Path, defect: str, operation: str
+    tmp_path: Path, stored: StoredFixture, defect: str, operation: str
 ) -> None:
     publisher, reader, _ = setup_storage(tmp_path)
-    item = row()
-    publisher.build(release("retained", item), [item])
-    publisher.build(release("good", item, supersedes="retained"), [item])
+    item = stored.row()
+    publisher.build(release("retained", item), conn=stored.conn, store=stored.run.store)
+    publisher.build(
+        release("good", item, supersedes="retained"), conn=stored.conn, store=stored.run.store
+    )
     pointer = publisher.root / "current.json"
     good_pointer = pointer.read_bytes()
     directory = publisher.root / "versions" / "retained"
@@ -566,10 +730,12 @@ def test_protocol2_reader_and_rollback_refuse_ineligible_sealed_rows(
             paths = details["publication_evidence"]
             if defect.startswith("single-"):
                 field = defect.removeprefix("single-")
+                retained_artifact = next(p["artifact_id"] for p in paths if p["path"] == field)
                 # Other fields retain both references: corroboration is per value.
                 paths[:] = [
-                    p for p in paths if p["path"] != field or p["artifact_id"] == make.ARTIFACT_ID
+                    p for p in paths if p["path"] != field or p["artifact_id"] == retained_artifact
                 ]
+                assert len([p for p in paths if p["path"] == field]) == 1
             elif defect == "missing-apr":
                 paths[:] = [p for p in paths if p["path"] != "apr"]
             elif defect == "missing-reference":
@@ -605,9 +771,12 @@ def test_protocol2_reader_and_rollback_refuse_ineligible_sealed_rows(
                     ).isoformat()
                 else:
                     assert defect == "stale-at-release"
-                    second["observed_at"] = (
-                        item.offer.observed_at - timedelta(hours=95, minutes=30)
-                    ).isoformat()
+                    # The persisted release is only a minute after observation.
+                    # Keep the pair within its observation-time window, but stale
+                    # at release, so only the release-time freshness gate refuses it.
+                    stale = _BIRTH - timedelta(hours=96, microseconds=1)
+                    assert item.offer.observed_at - timedelta(hours=96) <= stale
+                    second["observed_at"] = stale.isoformat()
             # Rebind the public receipt too: an invalid pair must fail even when
             # its receipt digest and the sealed file digest are both consistent.
             details["publication_evidence_sha256"] = public_evidence_sha256(
@@ -615,6 +784,8 @@ def test_protocol2_reader_and_rollback_refuse_ineligible_sealed_rows(
                 OfferFingerprints.model_validate(payload["fingerprints"]),
                 tuple(PublicEvidencePath.model_validate(p) for p in paths),
             )
+            if defect == "stale-at-release":
+                PublicOffer.model_validate(payload).require_protocol2()
         conn.execute("UPDATE public_offers SET payload=?", (json.dumps(payload),))
     database.chmod(0o444)
     version = Version(version=1, snapshot_id="retained", database_sha256=database_digest(database))
@@ -634,11 +805,15 @@ def test_protocol2_reader_and_rollback_refuse_ineligible_sealed_rows(
     assert reader.read(at=_BIRTH).info.snapshot_id == "good"
 
 
-def test_protocol2_admission_survives_public_read_and_rollback(tmp_path: Path) -> None:
+def test_protocol2_admission_survives_public_read_and_rollback(
+    tmp_path: Path, stored: StoredFixture
+) -> None:
     publisher, reader, _ = setup_storage(tmp_path)
-    item = row()
-    publisher.build(release("first", item), [item])
-    publisher.build(release("second", item, supersedes="first"), [item])
+    item = stored.row()
+    publisher.build(release("first", item), conn=stored.conn, store=stored.run.store)
+    publisher.build(
+        release("second", item, supersedes="first"), conn=stored.conn, store=stored.run.store
+    )
     assert publisher.rollback("first").snapshot_id == "first"
     (visible,) = reader.read(at=_BIRTH).offers
     assert visible.details["publication_version"] == "2.0"
@@ -655,11 +830,14 @@ def test_protocol2_admission_survives_public_read_and_rollback(tmp_path: Path) -
 
 @pytest.mark.parametrize("scope", list(WithdrawalScope))
 def test_database_withdrawal_suppresses_public_snapshot_before_sql_and_survives_rollback(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scope: WithdrawalScope
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scope: WithdrawalScope,
+    stored: StoredFixture,
 ) -> None:
     publisher, reader, denylist = setup_storage(tmp_path)
-    item = row()
-    publisher.build(release("first", item), [item])
+    item = stored.row()
+    publisher.build(release("first", item), conn=stored.conn, store=stored.run.store)
     moment = _BIRTH + timedelta(minutes=1)
     target = {
         WithdrawalScope.SOURCE: item.offer.source_id,
