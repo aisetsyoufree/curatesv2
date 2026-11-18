@@ -38,7 +38,12 @@ from cu_rates.contracts.publication import (
     DUAL_EVIDENCE_TIME_WINDOW,
     Placement,
 )
-from cu_rates.contracts.scenarios import REQUIRED_DIMENSIONS, StatedBound
+from cu_rates.contracts.scenarios import (
+    CANONICAL_SCENARIOS,
+    REQUIRED_DIMENSIONS,
+    StatedBound,
+    computed_match_state,
+)
 
 
 class PublicEvidence(ContractModel):
@@ -100,6 +105,31 @@ def public_evidence_sha256(
     return hashlib.sha256(
         ("public-publication-evidence-v2:" + json.dumps(payload, sort_keys=True)).encode()
     ).hexdigest()
+
+
+def require_ranked_assumptions(
+    scenario_id: CanonicalScenarioId, assumptions: tuple[PublicAssumption, ...]
+) -> None:
+    """A RANKED row must prove every required canonical assumption from its stated bounds.
+
+    A stored state label is not evidence: the match is recomputed from the stated bound, a
+    duplicated dimension is refused, and a missing, conflicting or untyped one fails closed.
+    """
+    dimensions = [a.dimension for a in assumptions]
+    if len(dimensions) != len(set(dimensions)):
+        raise ValueError("duplicate assumption dimension")
+    scenario = CANONICAL_SCENARIOS[scenario_id]
+    required = REQUIRED_DIMENSIONS[scenario_id]
+    for assumption in assumptions:
+        if assumption.dimension in required and (
+            assumption.stated is None
+            or assumption.state is not MatchState.MATCHES
+            or computed_match_state(scenario, assumption.stated, assumption.dimension)
+            is not MatchState.MATCHES
+        ):
+            raise ValueError("ranked offer has an unproven canonical assumption")
+    if not required <= set(dimensions):
+        raise ValueError("ranked offer lacks evidence for a canonical assumption")
 
 
 class PublicOffer(ContractModel):
@@ -184,13 +214,7 @@ class PublicOffer(ContractModel):
             # a conflict or an untyped statement can never be re-admitted from storage.
             if self.scenario_id is None:
                 raise ValueError("ranked offer has no canonical scenario")
-            matched = {
-                a.dimension
-                for a in self.assumptions
-                if a.state is MatchState.MATCHES and a.stated is not None
-            }
-            if not REQUIRED_DIMENSIONS[self.scenario_id] <= matched:
-                raise ValueError("ranked offer lacks evidence for a canonical assumption")
+            require_ranked_assumptions(self.scenario_id, self.assumptions)
         values = {**rates, **({"points": self.points} if self.points is not None else {})}
         if {p.path for p in paths} != values.keys():
             raise ValueError("publication evidence must cover every financial value")
