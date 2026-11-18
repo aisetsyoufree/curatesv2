@@ -1603,3 +1603,17 @@ def test_automatic_suppression_ledger_is_worker_writable_and_never_the_operator_
     env = (DEPLOY_DIR / "env.example").read_text(encoding="utf-8")
     assert "AUTOMATIC_DENYLIST_PATH=/var/lib/cu-rates/automatic/denylist.json" in env
     assert '"${NVME_ROOT}/automatic"' in (DEPLOY_DIR / "install.sh").read_text(encoding="utf-8")
+
+
+def test_worker_wiring_is_documented_and_the_worker_unit_is_still_the_disabled_stub() -> None:
+    """#115: naming the worker's paths must not enable it."""
+    env = (DEPLOY_DIR / "env.example").read_text(encoding="utf-8")
+    for name in ("OPERATIONAL_DB", "TERMS_LEDGER_PATH", "WORKER_STATE_DIR", "ARTIFACT_ROOT"):
+        assert f"# {name}=/var/lib/cu-rates/" in env  # documented, commented out
+        assert not any(line.startswith(f"{name}=") for line in env.splitlines())
+    assert "python -m cu_rates.worker_config check" in env
+    worker = (SYSTEMD_DIR / "cu-rates-worker.service").read_text(encoding="utf-8")
+    assert "Worker execution disabled per MASTER.md D-15" in worker
+    assert "cu_rates.worker_config" not in worker  # the config check is not a way to start it
+    readme = (DEPLOY_DIR / "README.md").read_text(encoding="utf-8")
+    assert "Worker wiring check" in readme and "read-only" in readme
