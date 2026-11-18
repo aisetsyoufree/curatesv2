@@ -773,3 +773,37 @@ def test_canonical_json_is_pure_ascii() -> None:
     raw = report.canonical_json()
     assert raw.isascii()
     assert b"caf\\u00e9" in raw
+
+
+def test_an_offer_with_no_stated_validity_is_reported_not_a_crash(
+    database: tuple[Engine, Path], tmp_path: Path
+) -> None:
+    """AUD7-12(g): valid_until is nullable in the schema; the audit must not raise TypeError."""
+    registry = seed(database[0], tmp_path, approved_offer=True)
+    report = audit(alter(registry, "normalized_offers", valid_until=None))
+    assert has(report, Reason.STALE, "normalized_offers")  # unbounded validity cannot be fresh
+
+
+def test_a_review_dated_after_the_audit_time_never_counts_as_approval(
+    database: tuple[Engine, Path], tmp_path: Path
+) -> None:
+    """AUD7-12(g): a future-dated human decision does not approve the product."""
+    registry = seed(database[0], tmp_path, approved_offer=True, approved_product=True)
+    assert not has(audit(registry), Reason.PUBLICATION_PRODUCT_UNAPPROVED)
+    rows = tuple(
+        dict(r, decided_at=NOW + timedelta(days=1)) if r["subject"] == "product" else r
+        for r in registry.rows("review_decisions")
+    )
+    delayed = Registry(dict(registry.tables, review_decisions=rows))
+    assert has(audit(delayed), Reason.PUBLICATION_PRODUCT_UNAPPROVED)
+
+
+def test_a_finding_dated_after_the_audit_time_never_creates_verified_coverage(
+    database: tuple[Engine, Path], tmp_path: Path
+) -> None:
+    """AUD7-12(g): only age was checked, so a finding observed in the future counted as verified."""
+    registry = seed(database[0], tmp_path)
+    assert mortgage_state(audit(registry)) is CoverageState.VERIFIED
+    report = audit(alter(registry, "product_findings", observed_at=NOW + timedelta(days=1)))
+    assert mortgage_state(report) is not CoverageState.VERIFIED
+    assert has(report, Reason.INVALID_RECORD, "product_findings")
