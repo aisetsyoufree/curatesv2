@@ -162,7 +162,7 @@ def release(
 
 
 def setup_storage(tmp_path: Path) -> tuple[SnapshotPublisher, SnapshotReader, Denylist]:
-    publisher = SnapshotPublisher(tmp_path / "snapshots with spaces")
+    publisher = SnapshotPublisher(tmp_path / "snapshots with spaces", allow_fixture=True)
     denylist = Denylist(tmp_path / "independent" / "withdrawals.json")
     denylist.initialize()
     return publisher, SnapshotReader(publisher.root, denylist.path), denylist
@@ -927,3 +927,51 @@ def test_denylist_idempotency_cannot_overwrite_or_reactivate_a_lifted_entry(tmp_
     with pytest.raises(ValueError, match="different content"):
         denylist.withdraw(entry)
     assert denylist.path.read_bytes() == before
+
+
+def test_production_publisher_refuses_the_synthetic_fixture(tmp_path: Path) -> None:
+    """AUD9 A2: a default publisher must refuse .example fixture sources even when valid."""
+    from cu_rates.snapshot.builder import _reject_fixture_source
+
+    for url in (
+        "https://athol-style.example/mortgage-rates",
+        "https://x.test/a",
+        "https://x.invalid/",
+        "https://localhost/a",
+        "https://sub.example./a",
+        "https://a.example\u3002/r",
+        "https://a.example\uff0e/r",
+        "https://a.EXAMPLE\uff61/r",
+        "https://a.examp\u217ce/r",
+        "https://127.0.0.1/a",
+        "https://[::1]/a",
+        "https://www.example.com/a",
+        "https://user@a.example/a",
+        "https://a.example:8443/a",
+        "https://x.local/a",
+        "https://bad host/a",
+    ):
+        with pytest.raises(SnapshotError, match="fixture or reserved"):
+            _reject_fixture_source(url)
+    _reject_fixture_source("https://www.examplecu.org/rates")
+    assert SnapshotPublisher(tmp_path)._allow_fixture is False
+
+
+def test_default_publisher_build_refuses_a_valid_fixture_release(
+    tmp_path: Path, stored: StoredFixture
+) -> None:
+    item = stored.row()
+    manifest = release("first", item)
+    default = SnapshotPublisher(tmp_path / "production")
+    with pytest.raises(SnapshotError, match="fixture or reserved"):
+        default.build(manifest, conn=stored.conn, store=stored.run.store)
+    assert not (default.root / "current.json").exists()
+
+
+def test_rollback_refuses_a_retained_fixture_version(tmp_path: Path, stored: StoredFixture) -> None:
+    allowed = SnapshotPublisher(tmp_path / "snap", allow_fixture=True)
+    manifest = release("first", stored.row())
+    info = allowed.build(manifest, conn=stored.conn, store=stored.run.store)
+    default = SnapshotPublisher(tmp_path / "snap")
+    with pytest.raises(SnapshotError, match="fixture or reserved"):
+        default.rollback(info.snapshot_id)

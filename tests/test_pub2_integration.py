@@ -122,7 +122,7 @@ def test_review_of_one_capture_cannot_approve_the_pair(
     item = stored.row("purchase-15-year")
     stored.approve(item.offer.offer_id, evidence_hash=offer_evidence_sha256(item.offer))
     item = stored.row("purchase-15-year")
-    publisher = SnapshotPublisher(tmp_path / "legacy-review")
+    publisher = SnapshotPublisher(tmp_path / "legacy-review", allow_fixture=True)
     with pytest.raises(SnapshotError, match="publication gate refused"):
         publisher.build(release("legacy-review", item), conn=stored.conn, store=stored.run.store)
 
