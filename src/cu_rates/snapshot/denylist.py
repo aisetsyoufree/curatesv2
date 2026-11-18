@@ -104,3 +104,7 @@ class Denylist:
         return frozenset(
             (row.scope.value, row.target_id) for row in self._read().entries if row.in_force_at(at)
         )
+
+    def entries(self) -> tuple[WithdrawalEntry, ...]:
+        """Read immutable withdrawal history, including lifts, for reconciliation."""
+        return self._read().entries
