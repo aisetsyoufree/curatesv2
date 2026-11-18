@@ -146,7 +146,8 @@ def test_every_reason_code_has_a_category() -> None:
 def test_suppress_outranks_quarantine_outranks_review() -> None:
     both = decide(withdrawals=(WD,), validations=(), prior=None)
     assert both.outcome is PublicationOutcome.SUPPRESS
-    assert {R.DENYLISTED, R.VALIDATIONS_MISSING, R.FIRST_PUBLICATION} <= set(both.reasons)
+    assert {R.DENYLISTED, R.VALIDATIONS_MISSING} <= set(both.reasons)
+    assert R.FIRST_PUBLICATION not in both.reasons  # D-21: first publication needs no review
     quarantine = decide(validations=(), prior=None)
     assert quarantine.outcome is PublicationOutcome.QUARANTINE
 
@@ -459,20 +460,6 @@ UNSAFE_CASES: list[tuple[str, dict[str, Any], dict[str, Any], ReasonCode, Public
         PublicationOutcome.QUARANTINE,
     ),
     (
-        "first-publication",
-        {},
-        {"prior": None},
-        R.FIRST_PUBLICATION,
-        PublicationOutcome.REQUIRES_REVIEW,
-    ),
-    (
-        "prior-unreviewed",
-        {},
-        {"prior": prior_of(purchase_offer(), reviewed=False)},
-        R.PRIOR_NOT_REVIEWED,
-        PublicationOutcome.REQUIRES_REVIEW,
-    ),
-    (
         "product-unreviewed",
         {},
         {"product_review": None},
@@ -563,6 +550,8 @@ def test_unsafe_publication_never_auto_publishes(
 def test_unsafe_cases_cover_every_blocking_reason() -> None:
     covered = {case[3] for case in UNSAFE_CASES}
     assert (SUPPRESS_REASONS | QUARANTINE_REASONS | REVIEW_REASONS) - covered == {
+        R.FIRST_PUBLICATION,  # D-21: no longer emitted; first publication is automatic
+        R.PRIOR_NOT_REVIEWED,  # only for a withdrawn or rejected prior (own tests)
         R.SOURCE_ABANDONED,
         R.CONDITIONS_INCOMPLETE,
         R.ARM_TERMS_INCOMPLETE,
@@ -661,7 +650,10 @@ def test_unknown_effective_date_requires_review_instead_of_skipping_abandonment(
     assert not decision.publishable_now
     # Even a first publication (no prior to compare) must surface the missing date.
     first = decide(offer, prior=None)
-    assert {R.EFFECTIVE_DATE_MISSING, R.FIRST_PUBLICATION} <= set(first.reasons)
+    assert (
+        R.EFFECTIVE_DATE_MISSING in first.reasons
+        and first.outcome is not PublicationOutcome.AUTO_PUBLISH
+    )
 
 
 def test_incomplete_conditions_and_arm_terms_need_review_and_browse_only() -> None:
@@ -684,10 +676,25 @@ def test_incomplete_conditions_and_arm_terms_need_review_and_browse_only() -> No
     assert arm_decision.placement is Placement.NONE
 
 
-def test_review_placement_is_reported_but_not_live() -> None:
+def test_an_automatic_unreviewed_prior_is_a_trusted_baseline() -> None:
+    """D-21: later observations compare against an automatic prior without a human review."""
+    decision = decide(prior=prior_of(purchase_offer(), reviewed=False))
+    assert decision.outcome is PublicationOutcome.AUTO_PUBLISH
+    assert R.PRIOR_NOT_REVIEWED not in decision.reasons
+
+
+def test_a_fully_proven_first_publication_is_automatic() -> None:
+    """D-21: no human review of a first observation; the rest of the gate still applies."""
     decision = decide(prior=None)
+    assert decision.outcome is PublicationOutcome.AUTO_PUBLISH
+    assert decision.placement is Placement.RANKED and decision.ranking_eligible
+    assert R.FIRST_PUBLICATION not in decision.reasons
+
+
+def test_review_placement_is_reported_but_not_live() -> None:
+    offer = purchase_offer(effective_at=None)  # a still-reviewable defect
+    decision = decide(offer, prior=None)
     assert decision.outcome is PublicationOutcome.REQUIRES_REVIEW
-    assert decision.placement is Placement.RANKED  # what a reviewer approval would permit
     assert not decision.ranking_eligible
 
 

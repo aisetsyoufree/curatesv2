@@ -21,11 +21,8 @@ from cu_rates.contracts.enums import OfferStatus, ReviewSubject
 from cu_rates.contracts.fingerprints import OfferSnapshot, offer_fingerprints
 from cu_rates.contracts.offers import NormalizedOffer
 from cu_rates.contracts.publication import (
-    REVIEW_REASONS,
     Placement,
     PublicationContext,
-    PublicationOutcome,
-    ReasonCode,
     _origin,
     corroborated_paths,
     evaluate_publication,
@@ -279,16 +276,14 @@ def _admit(row: SnapshotCandidate, manifest: PublishedSnapshot) -> PublicOffer:
 
     decision = evaluate_publication(offer, ctx)
     reviewed = (
-        decision.outcome is PublicationOutcome.REQUIRES_REVIEW
-        and set(decision.reasons) & REVIEW_REASONS == {ReasonCode.FIRST_PUBLICATION}
-        and review is not None
+        review is not None
         and offer.observed_at <= review.decided_at
         and review.review_id in manifest.review_ids
         and review.reviewed_fingerprints == offer_fingerprints(offer)
         and review.reviewed_evidence_sha256
         == publication_evidence_sha256(offer, corroborated_paths(offer, ctx))
     )
-    if not (decision.publishable_now or reviewed) or decision.placement is Placement.NONE:
+    if not decision.publishable_now or decision.placement is Placement.NONE:
         reasons = ", ".join(reason.value for reason in decision.reasons)
         raise SnapshotError(f"publication gate refused offer: {offer.offer_id}: {reasons}")
 

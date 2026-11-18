@@ -160,9 +160,12 @@ def test_dated_review_then_verified_304_rank_only_30y(tmp_path: Path) -> None:
     assert original.status is OfferStatus.CANDIDATE
     assert isinstance(shorter.details, PurchaseMortgageDetails)
     assert shorter.details.term_months == 180
-    assert run.first[_THIRTY].reasons == (R.FIRST_PUBLICATION,)
+    assert run.first[_THIRTY].reasons == ()  # D-21: first publication is automatic
     assert run.first[_THIRTY].placement is Placement.RANKED
-    assert not run.first[_FIFTEEN].publishable_now
+    # D-21: the 15-year row no longer waits for a first-publication review, but its terms differ
+    # from the 30-year scenario, so it can never rank.
+    assert not run.first[_FIFTEEN].ranking_eligible
+    assert run.first[_FIFTEEN].placement is not Placement.RANKED
     assert run.reviewed_snapshot is not None and run.refreshed_snapshot is not None
     assert run.refreshed_snapshot.supersedes == run.reviewed_snapshot.snapshot_id
     assert run.refreshed_snapshot.entries == run.reviewed_snapshot.entries

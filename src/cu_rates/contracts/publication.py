@@ -1368,14 +1368,19 @@ def _change_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[Reas
         reasons.add(R.CORRECTION_PENDING)
     prior = ctx.prior
     if prior is None:
-        reasons.add(R.FIRST_PUBLICATION)
+        # D-21: a first publication needs no human review; it publishes when the rest of the
+        # gate passes (two corroborating captures, validated, confidence not low).
         return reasons
+    # D-21: an automatic prior publication is a trusted baseline. It must exist as of now, still
+    # be in force (not withdrawn), and, if a human did review it, that review must not post-date
+    # this evaluation.
     prior_trusted = (
-        prior.reviewed
-        and prior.review is not None
-        and prior.review.decided_at <= ctx.evaluated_at
-        and prior.published.published_at <= ctx.evaluated_at
+        prior.published.published_at <= ctx.evaluated_at
         and not _snapshot_withdrawn(prior.published.snapshot_id, ctx)
+        and (
+            prior.review is None
+            or (prior.review.approved and prior.review.decided_at <= ctx.evaluated_at)
+        )
     )
     if not prior_trusted:
         reasons.add(R.PRIOR_NOT_REVIEWED)

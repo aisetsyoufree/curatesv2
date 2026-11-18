@@ -438,7 +438,7 @@ def test_a_stated_target_is_not_a_match_and_a_match_is_not_approval() -> None:
     matching = purchase_offer(scenario_matches=on_target)
     first = evaluate_publication(matching, context(matching, prior=None))
     assert evaluate_scenario_match(target, matching.scenario_matches) is MatchState.MATCHES
-    assert not first.publishable_now and R.FIRST_PUBLICATION in first.reasons  # not approval
+    assert not first.publishable_now  # a match is not approval
 
     candidate = purchase_offer(scenario_matches=on_target, status=OfferStatus.CANDIDATE)
     assert not evaluate_publication(candidate, context(candidate)).publishable_now
