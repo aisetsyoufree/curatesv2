@@ -67,7 +67,10 @@ def main(argv: Sequence[str] | None = None, *, now: datetime | None = None) -> i
     parser.add_argument("--db", type=Path, required=True, help="intake database (absolute path)")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("init", help="create the intake database (private, mode 0600)")
-    listing = sub.add_parser("list", help="list cases (open by default)")
+    listing = sub.add_parser(
+        "list",
+        help="list cases (open by default); exit 3 means a case missed its triage target",
+    )
     listing.add_argument("--all", action="store_true", help="include resolved cases")
     show = sub.add_parser("show", help="show one case")
     show.add_argument("case_id")
@@ -157,31 +160,38 @@ def main(argv: Sequence[str] | None = None, *, now: datetime | None = None) -> i
             # retry after a failed decision reuses the entry already written (same content),
             # not a new timestamp that the append-only ledger would reject.
             digest = hashlib.sha256(args.target.encode()).hexdigest()[:12]
-            withdrawal_id = f"case-{args.case_id}.{args.scope}.{digest}"
-            existing = next(
-                (e for e in denylist.entries() if e.withdrawal_id == withdrawal_id), None
-            )
-            # Independent suppression first, then the decision: a crash between the two
-            # leaves the public protected and the case still open for retry.
-            denylist.withdraw(
-                existing
-                or WithdrawalEntry(
+            base_id = f"case-{args.case_id}.{args.scope}.{digest}"
+            # Earlier entries for this same case, scope and target (a lift leaves its entry in
+            # the ledger forever, so a renewed suppression needs a new id: base, base.r1, ...).
+            history = [
+                e
+                for e in denylist.entries()
+                if e.withdrawal_id == base_id or e.withdrawal_id.startswith(f"{base_id}.r")
+            ]
+            latest = max(history, key=lambda e: e.withdrawn_at, default=None)
+            if latest is not None and latest.lifted_at is None:
+                entry = latest  # a retry after a failed decision: reuse it unchanged
+            else:
+                entry = WithdrawalEntry(
                     schema_version=CONTRACT_VERSION,
-                    withdrawal_id=withdrawal_id,
+                    withdrawal_id=base_id if not history else f"{base_id}.r{len(history)}",
                     scope=WithdrawalScope(args.scope),
                     target_id=args.target,
                     actor=args.actor,
                     withdrawn_at=moment,
                     reason=f"correction case {args.case_id}: {args.note}"[:500],
                 )
-            )
+            # Independent suppression first, then the decision: a crash between the two
+            # leaves the public protected and the case still open for retry.
+            denylist.withdraw(entry)
+            detail = f"{args.scope} {args.target}: {args.note}"
             if store.get(args.case_id).resolution is None:
                 store.resolve(
-                    args.case_id,
-                    Resolution.WITHDRAWN,
-                    actor=args.actor,
-                    note=f"{args.scope} {args.target}: {args.note}",
-                    at=moment,
+                    args.case_id, Resolution.WITHDRAWN, actor=args.actor, note=detail, at=moment
+                )
+            else:  # already decided: the suppression still belongs in the case history
+                store.add_note(
+                    args.case_id, actor=args.actor, note=f"suppressed {detail}", at=moment
                 )
             print(f"withdrawn: {args.scope} {args.target}")
         elif args.command == "bulk-reject":

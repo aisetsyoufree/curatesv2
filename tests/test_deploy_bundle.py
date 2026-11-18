@@ -1531,3 +1531,48 @@ def test_ops_negative_control_backup_timer_persistence_required() -> None:
     corrupted = timer_text.replace("Persistent=true", "")
     with pytest.raises(AssertionError):
         assert "Persistent=true" in corrupted
+
+
+def test_correction_inbox_is_wired_closed_by_default_and_least_privilege() -> None:
+    """#100: the form may only add to its own directory, and stays closed until INTAKE_DB is set."""
+    web = parse_systemd_unit(SYSTEMD_DIR / "cu-rates-web.service").get("Service", {})
+    web_rw = set(" ".join(web.get("ReadWritePaths", [])).split())
+    assert web_rw == {"/run/cu-rates-web", "/var/lib/cu-rates/intake"}
+    web_blocked = " ".join(web.get("InaccessiblePaths", []))
+    for private in (
+        "/var/lib/cu-rates/data",
+        "/var/lib/cu-rates/artifacts",
+        "/var/lib/cu-rates/backups",
+    ):
+        assert private in web_blocked  # the form still cannot reach the worker's storage
+
+    env = (DEPLOY_DIR / "env.example").read_text(encoding="utf-8")
+    assert "# INTAKE_DB=/var/lib/cu-rates/intake/intake.sqlite" in env  # commented out: closed
+    assert not any(line.startswith("INTAKE_DB=") for line in env.splitlines())
+    assert "within one business day" in env
+
+    purge = parse_systemd_unit(SYSTEMD_DIR / "cu-rates-intake-purge.service").get("Service", {})
+    assert purge["User"] == ["cu-rates"] and purge["NoNewPrivileges"] == ["true"]
+    assert purge["PrivateNetwork"] == ["true"] and purge["UMask"] == ["0077"]
+    assert set(" ".join(purge["ReadWritePaths"]).split()) == {"/var/lib/cu-rates/intake"}
+    assert (
+        "cu_rates.intake --db /var/lib/cu-rates/intake/intake.sqlite purge-contacts"
+        in purge["ExecStart"][0]
+    )
+    timer = (SYSTEMD_DIR / "cu-rates-intake-purge.timer").read_text(encoding="utf-8")
+    assert "Persistent=true" in timer and "OnCalendar=" in timer
+
+    install = (DEPLOY_DIR / "install.sh").read_text(encoding="utf-8")
+    assert '"${NVME_ROOT}/intake"' in install and "0700" in install
+    assert "cu-rates-intake-purge.timer" in install
+    enabled = [
+        line for line in install.splitlines() if "run_action" in line and "systemctl enable" in line
+    ]
+    assert enabled == [] or all("cu-rates-web.service" in line for line in enabled)
+    actions = install.split("run_action")
+    assert not any(
+        "enable" in chunk.splitlines()[0] and "purge" in chunk.splitlines()[0]
+        for chunk in actions[1:]
+    )  # the purge timer is installed for the operator to enable, never enabled by the installer
+    readme = (DEPLOY_DIR / "README.md").read_text(encoding="utf-8")
+    assert "Correction Inbox" in readme and "bulk-reject" in readme and "INTAKE_DB" in readme

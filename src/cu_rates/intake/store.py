@@ -354,22 +354,53 @@ class IntakeStore:
             self._require_case(raw, case_id)
             if self._resolution(raw, case_id) is not None:
                 raise IntakeError("this case is already resolved")
-            self._add_event(raw, case_id, resolution.value, actor, note, at)
-            raw.execute(
-                "UPDATE reporter_contacts SET delete_after = ? WHERE case_id = ?",
-                (_iso(at + CONTACT_RETENTION), case_id),
-            )
+            self._resolve_in(raw, case_id, resolution, actor, note, at)
+
+    def _resolve_in(
+        self,
+        raw: sqlite3.Connection,
+        case_id: str,
+        resolution: Resolution,
+        actor: str,
+        note: str,
+        at: datetime,
+    ) -> None:
+        self._add_event(raw, case_id, resolution.value, actor, note, at)
+        raw.execute(
+            "UPDATE reporter_contacts SET delete_after = ? WHERE case_id = ?",
+            (_iso(at + CONTACT_RETENTION), case_id),
+        )
 
     def bulk_reject(
         self, *, received_from: datetime, received_to: datetime, actor: str, note: str, at: datetime
     ) -> tuple[str, ...]:
-        """Reject every OPEN case received in a window (junk flooding): one logged event each."""
-        rejected: list[str] = []
-        for case in self.list_cases(only_open=True):
-            if received_from <= case.received_at <= received_to:
-                self.resolve(case.case_id, Resolution.REJECTED, actor=actor, note=note, at=at)
-                rejected.append(case.case_id)
-        return tuple(rejected)
+        """Reject every OPEN case received in a window (junk flooding), all or nothing.
+
+        One write transaction selects the open cases and closes them, so a case another operator
+        resolves meanwhile is simply not selected (never an error half-way through), and a
+        failure part-way leaves every case untouched.
+        """
+        try:
+            with self._connect() as raw:
+                raw.isolation_level = None
+                raw.execute("BEGIN IMMEDIATE")
+                try:
+                    rows = raw.execute("SELECT case_id, received_at FROM cases").fetchall()
+                    rejected = tuple(
+                        row["case_id"]
+                        for row in rows
+                        if received_from <= _parse(row["received_at"]) <= received_to
+                        and self._resolution(raw, row["case_id"]) is None
+                    )
+                    for case_id in rejected:
+                        self._resolve_in(raw, case_id, Resolution.REJECTED, actor, note, at)
+                    raw.execute("COMMIT")
+                except BaseException:
+                    raw.execute("ROLLBACK")
+                    raise
+        except sqlite3.Error as exc:
+            raise IntakeError("the intake database is not available") from exc
+        return rejected
 
     def open_count(self) -> int:
         return len(self.list_cases(only_open=True))

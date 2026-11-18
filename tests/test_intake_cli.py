@@ -242,3 +242,40 @@ def test_an_unusable_denylist_is_an_error_message_not_a_traceback(
     assert code == 1
     assert "error:" in capsys.readouterr().err
     assert IntakeStore(db).get(case_id).resolution is None
+
+
+def test_a_lifted_suppression_can_be_renewed_with_a_new_entry(db: Path, tmp_path: Path) -> None:
+    """Review LOW: an emergency re-suppression must work after the earlier one was lifted."""
+    store = IntakeStore(db)
+    case_id = store.record_case(_case(), now=T0)
+    path, denylist = _denylist(tmp_path)
+    args = (
+        "withdraw", case_id, "--denylist", str(path), "--scope", "offer",
+        "--target", "offer-9", "--actor", "rev", "--note", "n",
+    )  # fmt: skip
+    assert run(db, *args) == 0
+    (first,) = denylist.entries()
+    denylist.lift(first.withdrawal_id, at=T0 + timedelta(hours=1), actor="owner")
+    assert ("offer", "offer-9") not in denylist.active_targets(T0 + timedelta(hours=2))
+    assert run(db, *args, now=T0 + timedelta(hours=3)) == 0
+    assert ("offer", "offer-9") in denylist.active_targets(T0 + timedelta(hours=4))
+    ids = [e.withdrawal_id for e in denylist.entries()]
+    assert len(ids) == 2 and len(set(ids)) == 2 and ids[1].endswith(".r1")
+
+
+def test_withdrawing_on_an_already_decided_case_is_recorded_in_its_history(
+    db: Path, tmp_path: Path
+) -> None:
+    store = IntakeStore(db)
+    case_id = store.record_case(_case(), now=T0)
+    store.resolve(case_id, Resolution.REJECTED, actor="rev", note="first look: not credible", at=T0)
+    path, denylist = _denylist(tmp_path)
+    code = run(
+        db, "withdraw", case_id, "--denylist", str(path), "--scope", "offer",
+        "--target", "offer-1", "--actor", "rev", "--note", "new evidence",
+    )  # fmt: skip
+    assert code == 0
+    assert ("offer", "offer-1") in denylist.active_targets(T0 + timedelta(minutes=1))
+    view = store.get(case_id)
+    assert view.resolution is Resolution.REJECTED  # the original decision stands
+    assert view.events[-1][2] == "note" and "suppressed offer offer-1" in view.events[-1][3]

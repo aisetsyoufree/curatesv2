@@ -2,9 +2,10 @@
 
 import ipaddress
 import secrets
+import threading
 import time
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypedDict
@@ -310,8 +311,9 @@ def analytics_consent() -> Response:
 # operational database, the artifact store or the snapshot. No sessions and no cookies: the
 # only CSRF defence needed is the same Origin check the consent form uses.
 CORRECTIONS_MAX_BODY = 16 * 1024
-CORRECTIONS_PER_HOUR = 30
-CORRECTIONS_PER_CLIENT_PER_HOUR = 3
+# Per PROCESS (Gunicorn runs 3 workers): about 6 per client and 45 in total per host per hour.
+CORRECTIONS_PER_HOUR = 15
+CORRECTIONS_PER_CLIENT_PER_HOUR = 2
 _CORRECTION_FIELDS = frozenset(
     {"category", "kind", "url", "field", "reason", "evidence", "contact", "website"}
 )
@@ -358,33 +360,58 @@ def corrections() -> Response:
     return _render_corrections(index=True)
 
 
+_SUBMISSION_LOCK = threading.Lock()
+
+
 def _client_key() -> str:
-    """Who is posting. Behind the Cloudflare Tunnel (D-09, loopback only) the real client is in
-    CF-Connecting-IP; the origin is not reachable any other way, so it cannot be forged. Without
-    the header (tests, local runs) fall back to the socket address."""
+    """Who is posting, for RATE LIMITING ONLY (never for any security decision).
+
+    Behind the Cloudflare Tunnel (D-09) the real client is in CF-Connecting-IP. Caddy also
+    listens on loopback, so any local process could set it: that is acceptable for a courtesy
+    limit but is exactly why nothing else may trust the header. IPv6 clients are keyed by their
+    /64 so rotating addresses inside one subscriber's block does not multiply the allowance.
+    """
     forwarded = request.headers.get("CF-Connecting-IP", "").strip()
     try:
-        return str(ipaddress.ip_address(forwarded))
+        address = ipaddress.ip_address(forwarded)
     except ValueError:
         return request.remote_addr or "unknown"
+    if isinstance(address, ipaddress.IPv6Address):
+        return str(ipaddress.ip_network(f"{address}/64", strict=False))
+    return str(address)
 
 
-def _allow_submission() -> bool:
-    """Per-client cap first (one visitor cannot use up everyone's allowance), then a global
-    cap so an unmonitored form cannot flood the inbox or the disk."""
+def _allow_submission() -> Callable[[], None] | None:
+    """Reserve a slot, or return None when over a cap. The returned callable refunds the slot.
+
+    Per-client first (one visitor cannot use up everyone's allowance), then a global cap so an
+    unmonitored form cannot flood the inbox or the disk. The counters are per PROCESS: Gunicorn
+    runs several workers, so the host-wide allowance is that many times these constants.
+    """
+    key = _client_key()
     now = time.monotonic()
-    clients: dict[str, deque[float]] = current_app.extensions.setdefault("corrections_clients", {})
-    recent: deque[float] = current_app.extensions.setdefault("corrections_submissions", deque())
-    while recent and now - recent[0] > 3600:
-        recent.popleft()
-    for stale in [k for k, v in clients.items() if not v or now - v[-1] > 3600]:
-        del clients[stale]  # bounded memory: only clients active in the last hour are kept
-    mine = clients.setdefault(_client_key(), deque())
-    if len(mine) >= CORRECTIONS_PER_CLIENT_PER_HOUR or len(recent) >= CORRECTIONS_PER_HOUR:
-        return False
-    mine.append(now)
-    recent.append(now)
-    return True
+    with _SUBMISSION_LOCK:
+        clients: dict[str, deque[float]] = current_app.extensions.setdefault(
+            "corrections_clients", {}
+        )
+        recent: deque[float] = current_app.extensions.setdefault("corrections_submissions", deque())
+        while recent and now - recent[0] > 3600:
+            recent.popleft()
+        for stale in [k for k, v in clients.items() if not v or now - v[-1] > 3600]:
+            del clients[stale]  # bounded memory: only clients active in the last hour are kept
+        mine = clients.setdefault(key, deque())
+        if len(mine) >= CORRECTIONS_PER_CLIENT_PER_HOUR or len(recent) >= CORRECTIONS_PER_HOUR:
+            return None
+        mine.append(now)
+        recent.append(now)
+
+    def refund() -> None:
+        with _SUBMISSION_LOCK:
+            for queue in (clients.get(key), recent):
+                if queue and now in queue:
+                    queue.remove(now)
+
+    return refund
 
 
 @web_bp.post("/corrections")
@@ -432,7 +459,8 @@ def corrections_submit() -> Response:
             values=echo,
             status=400,
         )
-    if not _allow_submission():
+    refund = _allow_submission()
+    if refund is None:
         response = _render_corrections(
             error="Too many reports were received just now. Please try again in an hour.",
             values=echo,
@@ -443,6 +471,7 @@ def corrections_submit() -> Response:
     try:
         reference = IntakeStore(Path(db)).record_case(case, now=datetime.now(UTC))
     except IntakeError:
+        refund()  # a store problem is not the reporter's doing: do not spend their allowance
         return _render_corrections(
             error="Reports cannot be accepted right now. Please try again later.",
             values=echo,

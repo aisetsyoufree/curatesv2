@@ -272,3 +272,51 @@ def test_only_the_information_page_is_indexable(client: FlaskClient) -> None:
     assert "X-Robots-Tag" not in client.get("/corrections").headers
     assert "noindex" in post(client).headers["X-Robots-Tag"]
     assert "noindex" in post(client, GOOD | {"url": "nope"}).headers["X-Robots-Tag"]
+
+
+def test_ipv6_clients_share_one_allowance_per_64(
+    client: FlaskClient, db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review MEDIUM: rotating addresses inside one /64 must not multiply the allowance."""
+    monkeypatch.setattr(views, "CORRECTIONS_PER_CLIENT_PER_HOUR", 1)
+    monkeypatch.setattr(views, "CORRECTIONS_PER_HOUR", 50)
+    first = {"Origin": ORIGIN, "CF-Connecting-IP": "2001:db8:1:2::1"}
+    assert post(client, headers=first).status_code == 200
+    for host in ("2001:db8:1:2::2", "2001:db8:1:2:ffff:ffff:ffff:ffff", "2001:db8:1:2::abcd"):
+        same_block = {"Origin": ORIGIN, "CF-Connecting-IP": host}
+        assert post(client, headers=same_block).status_code == 429
+    other_block = {"Origin": ORIGIN, "CF-Connecting-IP": "2001:db8:1:3::1"}
+    assert post(client, headers=other_block).status_code == 200
+    assert len(cases(db)) == 2
+
+
+def test_a_store_failure_does_not_spend_the_reporters_allowance(
+    client: FlaskClient, db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review LOW: a 503 from the store is not the reporter's doing."""
+    monkeypatch.setattr(views, "CORRECTIONS_PER_CLIENT_PER_HOUR", 1)
+    db.chmod(0o644)  # the store refuses a non-private file: every submit is a 503
+    assert post(client).status_code == 503
+    assert post(client).status_code == 503  # still 503, not 429
+    db.chmod(0o600)
+    assert post(client).status_code == 200  # and the allowance was never used
+
+
+def test_concurrent_submissions_never_corrupt_the_limiter(
+    app: Flask, db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review MEDIUM: the counters are shared by threads; no 500s and the cap holds."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    monkeypatch.setattr(views, "CORRECTIONS_PER_HOUR", 10)
+    monkeypatch.setattr(views, "CORRECTIONS_PER_CLIENT_PER_HOUR", 1)
+
+    def submit(index: int) -> int:
+        headers = {"Origin": ORIGIN, "CF-Connecting-IP": f"198.51.100.{index % 250}"}
+        return app.test_client().post("/corrections", data=GOOD, headers=headers).status_code
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        statuses = list(pool.map(submit, range(60)))
+    assert set(statuses) <= {200, 429, 503}  # never a 500
+    assert statuses.count(200) <= 10
+    assert statuses.count(200) == len(cases(db))

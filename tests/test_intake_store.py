@@ -379,3 +379,37 @@ def test_the_only_database_the_store_ever_opens_is_its_own_path() -> None:
     assert len(connects) == 2
     for call in connects:
         assert ast.unparse(call.args[0]) == "self.path"
+
+
+def test_every_connection_the_store_hands_out_has_secure_delete_on(intake: IntakeStore) -> None:
+    """Review LOW: pins the pragma directly (file-byte checks alone can pass by luck)."""
+    with intake._connect() as raw:
+        assert raw.execute("PRAGMA secure_delete").fetchone()[0] == 1
+
+
+def test_bulk_reject_skips_resolved_cases_and_is_all_or_nothing(
+    intake: IntakeStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review MEDIUM: a case resolved by someone else is skipped, and a failure rolls back."""
+    window = {"received_from": T0 - timedelta(hours=1), "received_to": T0 + timedelta(hours=1)}
+    ids = [intake.record_case(_case(), now=T0) for _ in range(3)]
+    intake.resolve(ids[1], Resolution.CONFIRMED, actor="other", note="n", at=T0)
+    calls = {"n": 0}
+    real = IntakeStore._add_event
+
+    def failing(self: IntakeStore, *args: object, **kwargs: object) -> None:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise sqlite3.OperationalError("disk full")
+        real(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(IntakeStore, "_add_event", failing)
+    with pytest.raises(IntakeError, match="not available"):
+        intake.bulk_reject(**window, actor="rev", note="flood", at=T0 + timedelta(days=1))
+    monkeypatch.setattr(IntakeStore, "_add_event", real)
+    assert (
+        intake.get(ids[0]).resolution is None and intake.get(ids[2]).resolution is None
+    )  # rolled back
+    done = intake.bulk_reject(**window, actor="rev", note="flood", at=T0 + timedelta(days=1))
+    assert sorted(done) == sorted([ids[0], ids[2]])
+    assert intake.get(ids[1]).resolution is Resolution.CONFIRMED  # untouched

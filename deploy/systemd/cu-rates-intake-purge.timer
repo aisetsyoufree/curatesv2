@@ -1,0 +1,12 @@
+[Unit]
+Description=CU-Rates.org Correction Inbox Contact Retention Timer
+Documentation=file:///var/lib/cu-rates/app/deploy/README.md https://github.com/aisetsyoufree/curatesv2
+
+[Timer]
+OnCalendar=*-*-* 04:07:00
+RandomizedDelaySec=900
+Persistent=true
+Unit=cu-rates-intake-purge.service
+
+[Install]
+WantedBy=timers.target
