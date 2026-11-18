@@ -42,8 +42,8 @@ All persistent data, code, virtual environments, and evidence artifacts reside u
 ├── snapshots/            # Public snapshot directory (read-only for web process)
 │   ├── current.json      # Atomic JSON pointer to current active snapshot version
 │   └── versions/         # Verified, immutable public SQLite databases
-├── independent/          # Operator-owned independent withdrawal/denylist ledger (mode 0755, root/operator owned)
-│   └── denylist.json     # Emergency withdrawal denylist (mode 0644)
+├── independent/          # Operator-owned independent withdrawal/denylist ledger (root:cu-rates, mode 0755)
+│   └── denylist.json     # Emergency withdrawal denylist (root:cu-rates, mode 0640)
 ├── data/                 # Operational SQLite database (WAL mode; worker only, mode 0750)
 ├── artifacts/            # Content-addressed raw evidence store (worker only, mode 0700)
 ├── backups/              # Encrypted backup staging area (mode 0750)
@@ -481,7 +481,7 @@ sudo /var/lib/cu-rates/venv/bin/python -m cu_rates.intake --db /var/lib/cu-rates
 sudo -u cu-rates test -r /var/lib/cu-rates/independent/denylist.json
 ```
 
-The root write retains mode `0640` and the parent directory's `cu-rates` group; it never grants world read access. Lifts on the independent ledger also run as root. A group-assignment error aborts replacement and must be resolved before retrying; missing, unreadable or invalid ledgers continue to fail closed.
+The root write retains mode `0640` and the parent directory's `cu-rates` group; it never grants world read access. Lifts on the independent ledger also run as root, with the same Python pattern, `Denylist(Path('/var/lib/cu-rates/independent/denylist.json')).lift('<withdrawal id>', at=datetime.now(UTC), actor='<your name>')`. Never lift the worker's automatic ledger as root: a root-created lock file would block the worker. A group-assignment error aborts replacement and must be resolved before retrying; missing, unreadable or invalid ledgers continue to fail closed.
 
 **Limits to know.** The form's rate limits are per web process (three Gunicorn workers), so roughly 6 reports per client and 45 in total per hour per host; one determined client can still fill the inbox, which is what `bulk-reject` is for. The client address used for those limits comes from `CF-Connecting-IP` and is trusted for that purpose only.
 

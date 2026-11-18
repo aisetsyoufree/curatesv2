@@ -163,7 +163,7 @@ def _check_denylist_readable(
                 status="fail",
                 detail="denylist_path must be an absolute path",
             )
-        metadata = denylist_path.stat()
+        metadata = denylist_path.lstat()
         parent_gid = denylist_path.parent.stat().st_gid
         # Do not let a health check run by the owner/root mask broken web-reader
         # permissions. This checks the deployment's shared-group convention, not ACLs.
