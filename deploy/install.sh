@@ -260,6 +260,8 @@ UNITS=(
     "cu-rates-backup.timer"
     "cu-rates-health.service"
     "cu-rates-health.timer"
+    "cu-rates-quality.service"
+    "cu-rates-quality.timer"
     "cu-rates-intake-purge.service"
     "cu-rates-intake-purge.timer"
 )
@@ -331,7 +333,7 @@ if [[ "${APPLY}" -eq 1 ]]; then
     echo "4. Configure Caddy: copy deploy/caddy/Caddyfile to /etc/caddy/conf.d/cu-rates.caddyfile"
     echo "5. Start web service: sudo systemctl start cu-rates-web.service"
     echo "6. Note: Worker service and timer remain STOPPED, DISABLED, and MASKED per MASTER.md D-15 and D-17."
-    echo "7. Enable scheduled operations (backup and health timers): sudo systemctl enable --now cu-rates-backup.timer cu-rates-health.timer"
+    echo "7. Enable scheduled operations (backup, health, and quality timers): sudo systemctl enable --now cu-rates-backup.timer cu-rates-health.timer cu-rates-quality.timer"
     echo "8. Correction inbox: assign a person to monitor it, run 'sudo -u cu-rates ${NVME_ROOT}/venv/bin/python -m cu_rates.intake --db ${NVME_ROOT}/intake/intake.sqlite init', set INTAKE_DB in ${ENV_FILE}, restart cu-rates-web, then sudo systemctl enable --now cu-rates-intake-purge.timer"
 else
     echo "=== Dry-Run Complete ==="
