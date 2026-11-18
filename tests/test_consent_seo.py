@@ -1,6 +1,7 @@
 """T055 isolated privacy, configuration, SEO and readiness guards (entirely offline)."""
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -49,12 +50,19 @@ def _choose(client: FlaskClient, choice: str) -> TestResponse:
     )
 
 
-def _run_script(consent: str) -> dict[str, Any]:
-    # Optional developer runtime, never installed by this suite. Static/default and
-    # server-side guards run everywhere, including environments without Node.
+def _require_node() -> str:
+    # Optional developer runtime, never installed by this suite. In CI, execution
+    # is required; locally, absent Node skips with an informative notice.
     node = shutil.which("node")
     if node is None:
+        if os.environ.get("CI") == "true":
+            pytest.fail("Node runtime is required in CI for consent-script execution")
         pytest.skip("optional Node runtime unavailable for inert consent-script execution")
+    return node
+
+
+def _run_script(consent: str) -> dict[str, Any]:
+    node = _require_node()
     source = (ROOT / "src/cu_rates/web/static/consent.js").read_text()
     result = subprocess.run(
         [node, str(ROOT / "tests/consent_harness.cjs")],
@@ -186,6 +194,29 @@ def test_optin_loads_one_tag_after_denied_defaults() -> None:
     assert config[2]["page_location"] == "https://cu-rates.org/compare"
     assert config[2]["page_referrer"] == ""
     assert config[2]["cookie_domain"] == "none"
+
+
+@pytest.mark.parametrize(
+    "ci_value,expected_exception,match",
+    [
+        ("true", pytest.fail.Exception, "Node runtime is required in CI"),
+        ("false", pytest.skip.Exception, "optional Node runtime unavailable"),
+        (None, pytest.skip.Exception, "optional Node runtime unavailable"),
+    ],
+)
+def test_missing_node_policy_fails_in_ci_skips_locally(
+    monkeypatch: pytest.MonkeyPatch,
+    ci_value: str | None,
+    expected_exception: type[BaseException],
+    match: str,
+) -> None:
+    if ci_value is None:
+        monkeypatch.delenv("CI", raising=False)
+    else:
+        monkeypatch.setenv("CI", ci_value)
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    with pytest.raises(expected_exception, match=match):
+        _require_node()
 
 
 def test_choice_cookie_only_after_explicit_post_and_nojs_controls() -> None:
