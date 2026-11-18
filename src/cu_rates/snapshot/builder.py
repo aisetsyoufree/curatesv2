@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sqlite3
 from contextlib import closing
+from ipaddress import ip_address
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from urllib.parse import urlsplit, urlunsplit
@@ -25,6 +26,7 @@ from cu_rates.contracts.publication import (
     PublicationContext,
     PublicationOutcome,
     ReasonCode,
+    _origin,
     corroborated_paths,
     evaluate_publication,
     publication_evidence_sha256,
@@ -79,13 +81,38 @@ class SnapshotCandidate(ContractModel):
     current_review: ReviewDecision | None = None
 
 
-_RESERVED_SUFFIXES = (".example", ".test", ".invalid", ".localhost")
+_RESERVED_SUFFIXES = (".example", ".test", ".invalid", ".localhost", ".local", ".internal")
+_RESERVED_NAMES = {
+    "example",
+    "test",
+    "invalid",
+    "localhost",
+    "example.com",
+    "example.net",
+    "example.org",
+}
 
 
 def _reject_fixture_source(url: str) -> None:
-    """Synthetic fixture sources (reserved TLDs, RFC 2606) can never reach a public snapshot."""
-    host = (urlsplit(url).hostname or "").rstrip(".").lower()
-    if host.endswith(_RESERVED_SUFFIXES) or host in {"example", "test", "localhost"}:
+    """Synthetic or non-public sources (RFC 2606 names, IP literals) never reach a snapshot.
+
+    The host is taken from the same IDNA-canonical origin the admission gate uses, so Unicode
+    dot variants cannot hide a reserved suffix.
+    """
+    origin = _origin(url)
+    if origin is None:
+        raise SnapshotError("fixture or reserved source host refused for publication: malformed")
+    host = origin[1].rstrip(".").lower()
+    try:
+        ip_literal = ip_address(host.strip("[]")) is not None
+    except ValueError:
+        ip_literal = False
+    if (
+        ip_literal
+        or host in _RESERVED_NAMES
+        or host.endswith(_RESERVED_SUFFIXES)
+        or host.endswith((".example.com", ".example.net", ".example.org"))
+    ):
         raise SnapshotError(f"fixture or reserved source host refused for publication: {host}")
 
 
@@ -436,7 +463,10 @@ class SnapshotPublisher:
                 version = read_version(directory / DESCRIPTOR)
                 if version.snapshot_id != snapshot_id:
                     raise SnapshotError("rollback descriptor names a different version")
-                info, _ = verify_database(directory, version)
+                info, public_offers = verify_database(directory, version)
+                if not self._allow_fixture:
+                    for public_offer in public_offers:
+                        _reject_fixture_source(public_offer.source_url)
                 self._activate(version)
             return info
         except (OSError, ValueError) as exc:

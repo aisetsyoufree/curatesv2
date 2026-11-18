@@ -939,6 +939,17 @@ def test_production_publisher_refuses_the_synthetic_fixture(tmp_path: Path) -> N
         "https://x.invalid/",
         "https://localhost/a",
         "https://sub.example./a",
+        "https://a.example\u3002/r",
+        "https://a.example\uff0e/r",
+        "https://a.EXAMPLE\uff61/r",
+        "https://a.examp\u217ce/r",
+        "https://127.0.0.1/a",
+        "https://[::1]/a",
+        "https://www.example.com/a",
+        "https://user@a.example/a",
+        "https://a.example:8443/a",
+        "https://x.local/a",
+        "https://bad host/a",
     ):
         with pytest.raises(SnapshotError, match="fixture or reserved"):
             _reject_fixture_source(url)
@@ -955,3 +966,12 @@ def test_default_publisher_build_refuses_a_valid_fixture_release(
     with pytest.raises(SnapshotError, match="fixture or reserved"):
         default.build(manifest, conn=stored.conn, store=stored.run.store)
     assert not (default.root / "current.json").exists()
+
+
+def test_rollback_refuses_a_retained_fixture_version(tmp_path: Path, stored: StoredFixture) -> None:
+    allowed = SnapshotPublisher(tmp_path / "snap", allow_fixture=True)
+    manifest = release("first", stored.row())
+    info = allowed.build(manifest, conn=stored.conn, store=stored.run.store)
+    default = SnapshotPublisher(tmp_path / "snap")
+    with pytest.raises(SnapshotError, match="fixture or reserved"):
+        default.rollback(info.snapshot_id)
