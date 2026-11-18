@@ -113,6 +113,9 @@ ABANDONED_NO_CHANGE = timedelta(days=60)
 # D-18: Two separately captured authoritative evidence paths must corroborate every
 # published value. Captures within this window of each other may corroborate.
 DUAL_EVIDENCE_TIME_WINDOW = timedelta(hours=96)
+# D-20: two captures of the same approved page count as two evidence paths when they are
+# separate fetches at least this far apart; identical bytes are acceptable.
+DUAL_EVIDENCE_MIN_SPACING = timedelta(hours=3)
 # Source-of-record classes: every evidence kind the system models is authoritative.
 # Model output or LLM/web-search agreement is NEVER evidence and has no EvidenceKind.
 AUTHORITATIVE_SOURCE_CLASSES: frozenset[str] = frozenset(kind.value for kind in EvidenceKind)
@@ -1005,13 +1008,13 @@ def _path_reasons(
 def _pair_reasons(p1: EvidencePath, p2: EvidencePath) -> set[ReasonCode]:
     reasons: set[ReasonCode] = set()
     # Separate guards deliberately: each identity is independently necessary.
-    if p1.artifact_id == p2.artifact_id:
-        reasons.add(R.DUPLICATE_EVIDENCE_CAPTURE)
-    if p1.content_sha256 == p2.content_sha256:
-        reasons.add(R.DUPLICATE_EVIDENCE_CAPTURE)
+    # D-20: identical bytes are fine in principle (a static page); what must differ is the fetch,
+    # NOTE: the trusted loader and artifact lookups still key on artifact_id, so identical bytes
+    # from two runs fail closed end to end until that lookup is capture-aware (issue filed).
+    # and the two fetches must be far enough apart to be independent observations.
     if p1.capture_id == p2.capture_id:
         reasons.add(R.DUPLICATE_EVIDENCE_CAPTURE)
-    if p1.observed_at == p2.observed_at:
+    if abs(p1.observed_at - p2.observed_at) < DUAL_EVIDENCE_MIN_SPACING:
         reasons.add(R.DUPLICATE_EVIDENCE_CAPTURE)
     if p1.derived_from or p2.derived_from:
         reasons.add(R.DUPLICATE_EVIDENCE_CAPTURE)

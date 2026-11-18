@@ -23,17 +23,38 @@ from cu_rates.contracts.publication import (
 from . import factories as f
 
 
-@pytest.mark.parametrize("field", ["artifact_id", "content_sha256", "capture_id", "observed_at"])
-def test_each_duplicate_identifier_alone_is_rejected(field: str) -> None:
+@pytest.mark.parametrize("field", ["capture_id", "observed_at"])
+def test_each_duplicate_fetch_identifier_alone_is_rejected(field: str) -> None:
     first, second = f.evidence_path(), f.corroborating_path()
     second = second.model_copy(update={field: getattr(first, field)})
-    for other in {"artifact_id", "content_sha256", "capture_id", "observed_at"} - {field}:
-        assert getattr(first, other) != getattr(second, other)
     assert _pair_reasons(first, second) == {R.DUPLICATE_EVIDENCE_CAPTURE}
     offer = f.purchase_offer(apr=None, points=None)
     decision = evaluate_publication(offer, f.context(offer, evidence_paths=(first, second)))
     assert R.DUPLICATE_EVIDENCE_CAPTURE in decision.reasons
     assert not decision.publishable_now
+
+
+@pytest.mark.parametrize("field", ["artifact_id", "content_sha256"])
+def test_identical_bytes_from_separate_fetches_are_independent_under_d20(field: str) -> None:
+    """D-20: a static page fetched twice, hours apart, is two evidence paths."""
+    first, second = f.evidence_path(), f.corroborating_path()
+    second = second.model_copy(update={field: getattr(first, field)})
+    assert _pair_reasons(first, second) == set()
+
+
+def test_captures_closer_than_the_minimum_spacing_are_not_independent() -> None:
+    from datetime import timedelta
+
+    from cu_rates.contracts.publication import DUAL_EVIDENCE_MIN_SPACING
+
+    assert timedelta(hours=3) == DUAL_EVIDENCE_MIN_SPACING
+    first = f.evidence_path()
+    just_short = f.corroborating_path(
+        observed_at=first.observed_at - DUAL_EVIDENCE_MIN_SPACING + timedelta(seconds=1)
+    )
+    exactly = f.corroborating_path(observed_at=first.observed_at - DUAL_EVIDENCE_MIN_SPACING)
+    assert _pair_reasons(first, just_short) == {R.DUPLICATE_EVIDENCE_CAPTURE}
+    assert _pair_reasons(first, exactly) == set()
 
 
 @pytest.mark.parametrize(
