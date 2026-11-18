@@ -156,3 +156,89 @@ def test_a_missing_database_is_an_error_not_a_silent_create(tmp_path: Path) -> N
     missing = tmp_path / "nope" / "intake.sqlite"
     assert run(missing, "list") == 1
     assert not missing.exists()
+
+
+def _denylist(tmp_path: Path) -> tuple[Path, Denylist]:
+    path = tmp_path / "independent" / "withdrawals.json"
+    denylist = Denylist(path)
+    denylist.initialize()
+    return path, denylist
+
+
+def test_a_failed_withdraw_can_be_retried_without_a_second_entry(
+    db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review MEDIUM: a retry later in time must reuse the entry already written."""
+    store = IntakeStore(db)
+    case_id = store.record_case(_case(), now=T0)
+    path, denylist = _denylist(tmp_path)
+    args = (
+        "withdraw", case_id, "--denylist", str(path), "--scope", "source",
+        "--target", "source-1", "--actor", "rev", "--note", "n",
+    )  # fmt: skip
+    real = IntakeStore.resolve
+    monkeypatch.setattr(IntakeStore, "resolve", lambda *a, **k: (_ for _ in ()).throw(OSError("x")))
+    assert run(db, *args, now=T0 + timedelta(hours=1)) == 1
+    monkeypatch.setattr(IntakeStore, "resolve", real)
+    assert run(db, *args, now=T0 + timedelta(hours=2)) == 0  # a later retry succeeds
+    assert len(denylist.entries()) == 1
+    assert store.get(case_id).resolution is Resolution.WITHDRAWN
+
+
+def test_one_case_can_withdraw_more_than_one_target(db: Path, tmp_path: Path) -> None:
+    store = IntakeStore(db)
+    case_id = store.record_case(_case(), now=T0)
+    path, denylist = _denylist(tmp_path)
+    for target in ("offer-1", "offer-2"):
+        code = run(
+            db, "withdraw", case_id, "--denylist", str(path), "--scope", "offer",
+            "--target", target, "--actor", "rev", "--note", "n",
+        )  # fmt: skip
+        assert code == 0
+    active = denylist.active_targets(T0 + timedelta(minutes=1))
+    assert {("offer", "offer-1"), ("offer", "offer-2")} <= active
+    assert store.get(case_id).resolution is Resolution.WITHDRAWN
+
+
+def test_a_triaged_open_case_does_not_keep_the_overdue_alarm_ringing(
+    db: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Review MEDIUM: triage meets the target; only an untriaged case is overdue."""
+    store = IntakeStore(db)
+    case_id = store.record_case(_case(), now=T0)
+    assert run(db, "list", now=T0 + timedelta(days=3)) == 3
+    run(db, "triage", case_id, "--actor", "rev", "--note", "looked", now=T0 + timedelta(days=3))
+    assert run(db, "list", now=T0 + timedelta(days=9)) == 0
+    assert "triaged" in capsys.readouterr().out
+
+
+def test_bulk_reject_is_a_dry_run_until_confirmed(
+    db: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store = IntakeStore(db)
+    ids = [store.record_case(_case(), now=T0 + timedelta(hours=h)) for h in range(3)]
+    window = ("--from", "2026-11-16T14:00:00+00:00", "--to", "2026-11-16T23:00:00+00:00")
+    base = ("bulk-reject", *window, "--actor", "rev", "--note", "junk flood")
+    assert run(db, *base) == 0
+    assert "would be rejected" in capsys.readouterr().out
+    assert all(store.get(c).resolution is None for c in ids)
+    assert run(db, *base, "--yes") == 0
+    assert "rejected 3 case(s)" in capsys.readouterr().out
+    assert all(store.get(c).resolution is Resolution.REJECTED for c in ids)
+    naive = ("bulk-reject", "--from", "2026-11-16T14:00", "--to", "2026-11-16T23:00")
+    assert run(db, *naive, "--actor", "r", "--note", "n", "--yes") == 1
+
+
+def test_an_unusable_denylist_is_an_error_message_not_a_traceback(
+    db: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    case_id = IntakeStore(db).record_case(_case(), now=T0)
+    bad = tmp_path / "broken.json"
+    bad.write_text("{not json")
+    code = run(
+        db, "withdraw", case_id, "--denylist", str(bad), "--scope", "offer",
+        "--target", "o", "--actor", "rev", "--note", "n",
+    )  # fmt: skip
+    assert code == 1
+    assert "error:" in capsys.readouterr().err
+    assert IntakeStore(db).get(case_id).resolution is None

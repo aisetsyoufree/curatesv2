@@ -1,5 +1,6 @@
 """Web views for CU-Rates.org."""
 
+import ipaddress
 import secrets
 import time
 from collections import deque
@@ -310,20 +311,26 @@ def analytics_consent() -> Response:
 # only CSRF defence needed is the same Origin check the consent form uses.
 CORRECTIONS_MAX_BODY = 16 * 1024
 CORRECTIONS_PER_HOUR = 30
+CORRECTIONS_PER_CLIENT_PER_HOUR = 3
 _CORRECTION_FIELDS = frozenset(
     {"category", "kind", "url", "field", "reason", "evidence", "contact", "website"}
 )
 
 
-def _correction_response(html: str, status: int = 200) -> Response:
+def _correction_response(html: str, status: int = 200, *, index: bool = False) -> Response:
     response = current_app.response_class(html, status=status)
     response.headers["Cache-Control"] = "private, no-store"
-    response.headers["X-Robots-Tag"] = "noindex, follow"
+    if not index:  # only the plain information page is indexable, never a result or an error
+        response.headers["X-Robots-Tag"] = "noindex, follow"
     return response
 
 
 def _render_corrections(
-    *, error: str | None = None, values: Mapping[str, str] | None = None, status: int = 200
+    *,
+    error: str | None = None,
+    values: Mapping[str, str] | None = None,
+    status: int = 200,
+    index: bool = False,
 ) -> Response:
     html = render_template(
         "corrections.html",
@@ -333,7 +340,7 @@ def _render_corrections(
         categories=[(c.value, c.value.replace("_", " ")) for c in ReporterCategory],
         kinds=[(k.value, _KIND_LABELS[k]) for k in ReportKind],
     )
-    return _correction_response(html, status)
+    return _correction_response(html, status, index=index)
 
 
 _KIND_LABELS = {
@@ -348,17 +355,34 @@ _KIND_LABELS = {
 @web_bp.get("/corrections")
 def corrections() -> Response:
     """Explain how to report a problem and show the form (when intake is configured)."""
-    return _render_corrections()
+    return _render_corrections(index=True)
+
+
+def _client_key() -> str:
+    """Who is posting. Behind the Cloudflare Tunnel (D-09, loopback only) the real client is in
+    CF-Connecting-IP; the origin is not reachable any other way, so it cannot be forged. Without
+    the header (tests, local runs) fall back to the socket address."""
+    forwarded = request.headers.get("CF-Connecting-IP", "").strip()
+    try:
+        return str(ipaddress.ip_address(forwarded))
+    except ValueError:
+        return request.remote_addr or "unknown"
 
 
 def _allow_submission() -> bool:
-    """Process-wide cap: an unmonitored form must not be able to flood the inbox or disk."""
-    recent: deque[float] = current_app.extensions.setdefault("corrections_submissions", deque())
+    """Per-client cap first (one visitor cannot use up everyone's allowance), then a global
+    cap so an unmonitored form cannot flood the inbox or the disk."""
     now = time.monotonic()
+    clients: dict[str, deque[float]] = current_app.extensions.setdefault("corrections_clients", {})
+    recent: deque[float] = current_app.extensions.setdefault("corrections_submissions", deque())
     while recent and now - recent[0] > 3600:
         recent.popleft()
-    if len(recent) >= CORRECTIONS_PER_HOUR:
+    for stale in [k for k, v in clients.items() if not v or now - v[-1] > 3600]:
+        del clients[stale]  # bounded memory: only clients active in the last hour are kept
+    mine = clients.setdefault(_client_key(), deque())
+    if len(mine) >= CORRECTIONS_PER_CLIENT_PER_HOUR or len(recent) >= CORRECTIONS_PER_HOUR:
         return False
+    mine.append(now)
     recent.append(now)
     return True
 

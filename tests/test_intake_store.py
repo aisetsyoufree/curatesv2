@@ -257,3 +257,125 @@ def test_the_intake_package_can_reach_nothing_but_its_own_store_and_the_denylist
                 seen += 1
                 assert not name.startswith(forbidden), f"{path.name} imports {name}"
     assert seen > 10
+
+
+def _file_bytes(store: IntakeStore) -> bytes:
+    return store.path.read_bytes()
+
+
+def test_redaction_really_removes_the_text_from_the_file(intake: IntakeStore) -> None:
+    """Review HIGH: without secure_delete the 'removed' text survives in the file and backups."""
+    marker = "SSN-078-05-1120-and-account-9988776655"
+    case_id = intake.record_case(_case(reason=f"my details are {marker} " + "pad " * 300), now=T0)
+    assert marker.encode() in _file_bytes(intake)
+    intake.redact(case_id, actor="rev", reason="unsolicited personal data", at=T0)
+    assert marker.encode() not in _file_bytes(intake)
+
+
+def test_purging_a_contact_really_removes_it_from_the_file(intake: IntakeStore) -> None:
+    secret = "extremely.private.reporter@example.test"
+    case_id = intake.record_case(_case(reply_contact=secret), now=T0)
+    assert secret.encode() in _file_bytes(intake)
+    intake.resolve(case_id, Resolution.REJECTED, actor="rev", note="n", at=T0)
+    intake.purge_expired_contacts(now=T0 + timedelta(days=91))
+    assert secret.encode() not in _file_bytes(intake)
+
+
+def test_a_triaged_case_has_met_its_target_while_still_open(intake: IntakeStore) -> None:
+    case_id = intake.record_case(_case(), now=T0)
+    assert intake.get(case_id).triaged_at is None
+    intake.add_note(case_id, actor="rev", note="n", at=T0 + timedelta(hours=2), triage=True)
+    view = intake.get(case_id)
+    assert view.triaged_at == T0 + timedelta(hours=2) and view.resolution is None
+    intake.add_note(case_id, actor="rev", note="later", at=T0 + timedelta(days=1), triage=True)
+    assert intake.get(case_id).triaged_at == T0 + timedelta(hours=2)  # the first triage counts
+
+
+def test_a_locked_or_broken_store_is_reported_as_unavailable_not_a_crash(
+    intake: IntakeStore,
+) -> None:
+    """Review MEDIUM: the public form must show a message, never a 500 that loses the input."""
+    blocker = sqlite3.connect(intake.path, timeout=0.1)
+    blocker.execute("BEGIN EXCLUSIVE")
+    try:
+        with pytest.raises(IntakeError, match="not available"):
+            intake.record_case(_case(), now=T0)
+    finally:
+        blocker.rollback()
+        blocker.close()
+    intake.path.write_bytes(b"this is not a database" * 100)
+    os.chmod(intake.path, 0o600)
+    with pytest.raises(IntakeError, match="not available"):
+        intake.record_case(_case(), now=T0)
+
+
+def test_bulk_reject_closes_only_open_cases_inside_the_window(intake: IntakeStore) -> None:
+    early = intake.record_case(_case(), now=T0)
+    inside = [intake.record_case(_case(), now=T0 + timedelta(hours=h)) for h in (5, 6)]
+    kept = intake.record_case(_case(), now=T0 + timedelta(days=2))
+    done_already = intake.record_case(_case(), now=T0 + timedelta(hours=5))
+    intake.resolve(done_already, Resolution.CONFIRMED, actor="a", note="n", at=T0)
+    rejected = intake.bulk_reject(
+        received_from=T0 + timedelta(hours=4),
+        received_to=T0 + timedelta(hours=8),
+        actor="rev",
+        note="junk flood",
+        at=T0 + timedelta(days=1),
+    )
+    assert sorted(rejected) == sorted(inside)
+    assert intake.get(early).resolution is None and intake.get(kept).resolution is None
+    assert intake.get(done_already).resolution is Resolution.CONFIRMED  # never overwritten
+    assert all(intake.get(c).resolution is Resolution.REJECTED for c in inside)
+
+
+def test_initialize_refuses_a_group_writable_directory_and_creates_the_file_privately(
+    tmp_path: Path,
+) -> None:
+    open_dir = tmp_path / "open"
+    open_dir.mkdir(mode=0o777)
+    os.chmod(open_dir, 0o777)
+    with pytest.raises(IntakeError, match="writable"):
+        IntakeStore(open_dir / "intake.sqlite").initialize()
+    assert not (open_dir / "intake.sqlite").exists()
+    private = IntakeStore(tmp_path / "private" / "intake.sqlite")
+    private.initialize()
+    private.initialize()  # idempotent
+    assert private.path.stat().st_mode & 0o777 == 0o600
+
+
+def test_concurrent_writers_cannot_overshoot_the_open_case_cap(
+    intake: IntakeStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review LOW: the count check and the insert are one atomic step."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    monkeypatch.setattr(store_module, "MAX_OPEN_CASES", 5)
+
+    def attempt(_: int) -> bool:
+        try:
+            intake.record_case(_case(), now=T0)
+        except IntakeError:
+            return False
+        return True
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(attempt, range(24)))
+    assert sum(results) == 5
+    assert len(intake.list_cases()) == 5
+
+
+def test_the_only_database_the_store_ever_opens_is_its_own_path() -> None:
+    """The site audit exempts exactly cu_rates.intake.store; this pins what that module does."""
+    import ast
+
+    source = (Path(__file__).resolve().parents[1] / "src/cu_rates/intake/store.py").read_text()
+    connects = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "connect"
+    ]
+    assert len(connects) == 2
+    for call in connects:
+        assert ast.unparse(call.args[0]) == "self.path"

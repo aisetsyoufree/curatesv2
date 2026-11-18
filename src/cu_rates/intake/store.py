@@ -25,7 +25,7 @@ import re
 import secrets
 import sqlite3
 from collections.abc import Iterator
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -214,6 +214,7 @@ class CaseView:
     triage_due: datetime
     resolution: Resolution | None
     resolved_at: datetime | None
+    triaged_at: datetime | None
     events: tuple[tuple[datetime, str, str, str], ...]
     reply_contact: str | None
 
@@ -239,7 +240,13 @@ class IntakeStore:
     # -- lifecycle -----------------------------------------------------------------------
     def initialize(self) -> None:
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if self.path.parent.stat().st_mode & 0o022:
+            raise IntakeError("the intake directory must not be group- or world-writable")
+        # Create the file private from the first instant (no window at umask permissions).
+        with suppress(FileExistsError):
+            os.close(os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
         with closing(sqlite3.connect(self.path)) as raw, raw:
+            raw.execute("PRAGMA secure_delete=ON")
             raw.executescript(_SCHEMA)
             raw.execute(
                 "INSERT OR IGNORE INTO meta VALUES ('schema_version', ?)", (INTAKE_SCHEMA_VERSION,)
@@ -258,41 +265,56 @@ class IntakeStore:
             raise IntakeError("the intake database is not a private regular file")
         with closing(sqlite3.connect(self.path, timeout=5)) as raw:
             raw.execute("PRAGMA foreign_keys=ON")
+            # Redaction and contact deletion must really remove the bytes from the file (and
+            # so from any copy or backup of it), not merely hide the rows.
+            raw.execute("PRAGMA secure_delete=ON")
             raw.row_factory = sqlite3.Row
             yield raw
 
     # -- intake (the only call the public web process makes) ------------------------------
     def record_case(self, case: NewCase, *, now: datetime) -> str:
         """Store a new case and return its reference. Raises IntakeError when it cannot."""
-        with self._connect() as raw:
-            if self.path.stat().st_size > MAX_DB_BYTES:
-                raise IntakeError("the intake store is full")
-            (open_cases,) = raw.execute(
-                "SELECT COUNT(*) FROM cases c WHERE NOT EXISTS (SELECT 1 FROM case_events e "
-                f"WHERE e.case_id = c.case_id AND e.action IN ({_RESOLUTIONS_SQL}))"
-            ).fetchone()
-            if open_cases >= MAX_OPEN_CASES:
-                raise IntakeError("too many unresolved cases")
-            case_id = secrets.token_hex(16)
-            with raw:
-                raw.execute(
-                    "INSERT INTO cases VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        case_id,
-                        _iso(now),
-                        case.reporter_category.value,
-                        case.kind.value,
-                        case.affected_url.strip(),
-                        case.affected_field.strip(),
-                        case.reason.strip(),
-                        case.evidence_url.strip(),
-                    ),
-                )
-                if case.reply_contact:
+        try:
+            with self._connect() as raw:
+                raw.isolation_level = None  # explicit transaction control
+                # The caps and the insert are one atomic step: concurrent web workers cannot
+                # both pass the check and overshoot it.
+                raw.execute("BEGIN IMMEDIATE")
+                try:
+                    if self.path.stat().st_size > MAX_DB_BYTES:
+                        raise IntakeError("the intake store is full")
+                    (open_cases,) = raw.execute(
+                        "SELECT COUNT(*) FROM cases c WHERE NOT EXISTS (SELECT 1 FROM "
+                        "case_events e WHERE e.case_id = c.case_id "
+                        f"AND e.action IN ({_RESOLUTIONS_SQL}))"
+                    ).fetchone()
+                    if open_cases >= MAX_OPEN_CASES:
+                        raise IntakeError("too many unresolved cases")
+                    case_id = secrets.token_hex(16)
                     raw.execute(
-                        "INSERT INTO reporter_contacts VALUES (?, ?, NULL)",
-                        (case_id, case.reply_contact),
+                        "INSERT INTO cases VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            case_id,
+                            _iso(now),
+                            case.reporter_category.value,
+                            case.kind.value,
+                            case.affected_url.strip(),
+                            case.affected_field.strip(),
+                            case.reason.strip(),
+                            case.evidence_url.strip(),
+                        ),
                     )
+                    if case.reply_contact:
+                        raw.execute(
+                            "INSERT INTO reporter_contacts VALUES (?, ?, NULL)",
+                            (case_id, case.reply_contact),
+                        )
+                    raw.execute("COMMIT")
+                except BaseException:
+                    raw.execute("ROLLBACK")
+                    raise
+        except sqlite3.Error as exc:  # locked, corrupt, full disk: all mean "unavailable"
+            raise IntakeError("the intake database is not available") from exc
         return case_id
 
     # -- operator actions ----------------------------------------------------------------
@@ -337,6 +359,20 @@ class IntakeStore:
                 "UPDATE reporter_contacts SET delete_after = ? WHERE case_id = ?",
                 (_iso(at + CONTACT_RETENTION), case_id),
             )
+
+    def bulk_reject(
+        self, *, received_from: datetime, received_to: datetime, actor: str, note: str, at: datetime
+    ) -> tuple[str, ...]:
+        """Reject every OPEN case received in a window (junk flooding): one logged event each."""
+        rejected: list[str] = []
+        for case in self.list_cases(only_open=True):
+            if received_from <= case.received_at <= received_to:
+                self.resolve(case.case_id, Resolution.REJECTED, actor=actor, note=note, at=at)
+                rejected.append(case.case_id)
+        return tuple(rejected)
+
+    def open_count(self) -> int:
+        return len(self.list_cases(only_open=True))
 
     def redact(self, case_id: str, *, actor: str, reason: str, at: datetime) -> None:
         """Blank free text and contact (unsolicited personal data); log that it happened."""
@@ -399,6 +435,7 @@ class IntakeStore:
                 "SELECT contact FROM reporter_contacts WHERE case_id = ?", (case_id,)
             ).fetchone()
             contact = None if found is None else found["contact"]
+        triaged = next((at for at, _actor, action, _note in events if action == "triaged"), None)
         return CaseView(
             case_id=case_id,
             received_at=received,
@@ -411,6 +448,7 @@ class IntakeStore:
             triage_due=business_days_after(received, 1 if kind in URGENT_KINDS else 5),
             resolution=None if resolved is None else resolved[0],
             resolved_at=None if resolved is None else resolved[1],
+            triaged_at=triaged,
             events=events,
             reply_contact=contact,
         )

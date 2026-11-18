@@ -228,3 +228,47 @@ def test_the_content_security_policy_still_confines_the_form(client: FlaskClient
 def test_the_intake_path_must_be_absolute_and_normalized(bad: str) -> None:
     with pytest.raises(ValueError, match="INTAKE_DB"):
         validated_config({"INTAKE_DB": bad})
+
+
+def test_one_client_cannot_use_up_everyone_elses_allowance(
+    client: FlaskClient, db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review MEDIUM: a per-client cap sits in front of the global one."""
+    monkeypatch.setattr(views, "CORRECTIONS_PER_CLIENT_PER_HOUR", 2)
+    monkeypatch.setattr(views, "CORRECTIONS_PER_HOUR", 5)
+    attacker = {"Origin": ORIGIN, "CF-Connecting-IP": "203.0.113.7"}
+    assert [post(client, headers=attacker).status_code for _ in range(2)] == [200, 200]
+    assert post(client, headers=attacker).status_code == 429
+    other = {"Origin": ORIGIN, "CF-Connecting-IP": "198.51.100.9"}
+    assert post(client, headers=other).status_code == 200  # a legitimate reporter still gets in
+    assert len(cases(db)) == 3
+
+
+def test_a_forged_client_header_cannot_crash_or_bypass_the_cap(
+    client: FlaskClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(views, "CORRECTIONS_PER_CLIENT_PER_HOUR", 1)
+    junk = {"Origin": ORIGIN, "CF-Connecting-IP": "not-an-ip"}
+    assert post(client, headers=junk).status_code == 200
+    assert post(client, headers=junk).status_code == 429  # falls back to the socket address
+
+
+def test_a_locked_store_shows_a_message_instead_of_an_error_page(
+    client: FlaskClient, db: Path
+) -> None:
+    blocker = sqlite3.connect(db, timeout=0.1)
+    blocker.execute("BEGIN EXCLUSIVE")
+    try:
+        response = post(client)
+    finally:
+        blocker.rollback()
+        blocker.close()
+    assert response.status_code == 503
+    html = response.get_data(as_text=True)
+    assert "cannot be accepted right now" in html and 'name="reason"' in html
+
+
+def test_only_the_information_page_is_indexable(client: FlaskClient) -> None:
+    assert "X-Robots-Tag" not in client.get("/corrections").headers
+    assert "noindex" in post(client).headers["X-Robots-Tag"]
+    assert "noindex" in post(client, GOOD | {"url": "nope"}).headers["X-Robots-Tag"]

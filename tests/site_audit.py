@@ -567,7 +567,9 @@ def is_forbidden_module(name: str, *, from_module: str = "") -> bool:
         # Two narrow, reviewed exceptions: the read-only snapshot reader, and the correction
         # intake store (a separate private file the web process may only add cases to; a test
         # asserts the intake package can reach nothing else of value).
-        return not from_module.startswith(("cu_rates.snapshot", "cu_rates.intake"))
+        return not (
+            from_module.startswith("cu_rates.snapshot") or from_module == "cu_rates.intake.store"
+        )
     return name == "cu_rates.db" or name.startswith(("cu_rates.db.", "cu_rates.artifact_store"))
 
 

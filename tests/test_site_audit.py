@@ -530,3 +530,19 @@ def test_sqlite_sql_and_pragma_negative_controls() -> None:
     }
     findings = database_findings(unauthorized_sql_src, ["cu_rates.web"])
     assert any("sqlite forbidden literal SQL" in f for f in findings)
+
+
+def test_the_sqlite_exemptions_are_exactly_the_snapshot_package_and_the_intake_store() -> None:
+    """Review LOW: no other intake module (nor a lookalike package) may import sqlite3."""
+    from tests.site_audit import is_forbidden_module
+
+    assert not is_forbidden_module("sqlite3", from_module="cu_rates.snapshot.reader")
+    assert not is_forbidden_module("sqlite3", from_module="cu_rates.intake.store")
+    for other in (
+        "cu_rates.intake.cli",
+        "cu_rates.intake",
+        "cu_rates.intakeX",
+        "cu_rates.intake.store_backup",
+        "cu_rates.web.views",
+    ):
+        assert is_forbidden_module("sqlite3", from_module=other), other

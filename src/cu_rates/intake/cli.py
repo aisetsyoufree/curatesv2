@@ -7,6 +7,8 @@ resolved or redacted. The public web process can only add cases.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import sqlite3
 import sys
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -15,16 +17,18 @@ from pathlib import Path
 from cu_rates.contracts.audit import WithdrawalEntry
 from cu_rates.contracts.base import CONTRACT_VERSION
 from cu_rates.contracts.enums import WithdrawalScope
-from cu_rates.snapshot import Denylist
+from cu_rates.snapshot import Denylist, SnapshotError
 
-from .store import CaseView, IntakeError, IntakeStore, Resolution
+from .store import MAX_OPEN_CASES, CaseView, IntakeError, IntakeStore, Resolution
 
 
 def _line(view: CaseView, now: datetime) -> str:
     state = view.resolution.value if view.resolution else "OPEN"
     flag = ""
-    if view.resolution is None and view.triage_due < now:
-        flag = "  OVERDUE"
+    if view.resolution is None and view.triaged_at is None and view.triage_due < now:
+        flag = "  OVERDUE"  # a triaged case has met its target even while it is still open
+    elif view.triaged_at is not None and view.resolution is None:
+        flag = "  triaged"
     return (
         f"{view.case_id}  {view.received_at:%Y-%m-%d %H:%M}Z  {view.kind.value:<8} "
         f"{state:<12} due {view.triage_due:%Y-%m-%d}{flag}"
@@ -87,6 +91,14 @@ def main(argv: Sequence[str] | None = None, *, now: datetime | None = None) -> i
     withdraw.add_argument("--target", required=True)
     withdraw.add_argument("--actor", required=True)
     withdraw.add_argument("--note", required=True)
+    bulk = sub.add_parser(
+        "bulk-reject", help="reject every OPEN case received in a window (junk flooding)"
+    )
+    bulk.add_argument("--from", dest="received_from", type=datetime.fromisoformat, required=True)
+    bulk.add_argument("--to", dest="received_to", type=datetime.fromisoformat, required=True)
+    bulk.add_argument("--actor", required=True)
+    bulk.add_argument("--note", required=True)
+    bulk.add_argument("--yes", action="store_true", help="actually do it (otherwise a dry run)")
     redact = sub.add_parser("redact", help="remove unsolicited personal data from a case")
     redact.add_argument("case_id")
     redact.add_argument("--actor", required=True)
@@ -104,8 +116,16 @@ def main(argv: Sequence[str] | None = None, *, now: datetime | None = None) -> i
             cases = store.list_cases(only_open=not args.all)
             for view in cases:
                 print(_line(view, moment))
-            overdue = sum(1 for v in cases if v.resolution is None and v.triage_due < moment)
-            print(f"{len(cases)} case(s), {overdue} overdue", file=sys.stderr)
+            overdue = sum(
+                1
+                for v in cases
+                if v.resolution is None and v.triaged_at is None and v.triage_due < moment
+            )
+            print(
+                f"{len(cases)} case(s), {overdue} overdue; intake accepts new reports until "
+                f"{MAX_OPEN_CASES} are open",
+                file=sys.stderr,
+            )
             return 3 if overdue else 0
         elif args.command == "show":
             view = store.get(args.case_id)
@@ -132,12 +152,22 @@ def main(argv: Sequence[str] | None = None, *, now: datetime | None = None) -> i
             print(f"resolved: {args.decision}")
         elif args.command == "withdraw":
             store.get(args.case_id)  # the case must exist before anything is suppressed
+            denylist = Denylist(_absolute(args.denylist, "--denylist"))
+            # One id per case, scope and target: a second target needs no id clash, and a
+            # retry after a failed decision reuses the entry already written (same content),
+            # not a new timestamp that the append-only ledger would reject.
+            digest = hashlib.sha256(args.target.encode()).hexdigest()[:12]
+            withdrawal_id = f"case-{args.case_id}.{args.scope}.{digest}"
+            existing = next(
+                (e for e in denylist.entries() if e.withdrawal_id == withdrawal_id), None
+            )
             # Independent suppression first, then the decision: a crash between the two
             # leaves the public protected and the case still open for retry.
-            Denylist(_absolute(args.denylist, "--denylist")).withdraw(
-                WithdrawalEntry(
+            denylist.withdraw(
+                existing
+                or WithdrawalEntry(
                     schema_version=CONTRACT_VERSION,
-                    withdrawal_id=f"case-{args.case_id}.withdraw",
+                    withdrawal_id=withdrawal_id,
                     scope=WithdrawalScope(args.scope),
                     target_id=args.target,
                     actor=args.actor,
@@ -145,21 +175,36 @@ def main(argv: Sequence[str] | None = None, *, now: datetime | None = None) -> i
                     reason=f"correction case {args.case_id}: {args.note}"[:500],
                 )
             )
-            store.resolve(
-                args.case_id,
-                Resolution.WITHDRAWN,
-                actor=args.actor,
-                note=f"{args.scope} {args.target}: {args.note}",
-                at=moment,
-            )
+            if store.get(args.case_id).resolution is None:
+                store.resolve(
+                    args.case_id,
+                    Resolution.WITHDRAWN,
+                    actor=args.actor,
+                    note=f"{args.scope} {args.target}: {args.note}",
+                    at=moment,
+                )
             print(f"withdrawn: {args.scope} {args.target}")
+        elif args.command == "bulk-reject":
+            window = {"received_from": args.received_from, "received_to": args.received_to}
+            if any(value.tzinfo is None for value in window.values()):
+                raise IntakeError("--from and --to must include a timezone, e.g. 2026-11-18T00:00Z")
+            if not args.yes:
+                matching = [
+                    c.case_id
+                    for c in store.list_cases(only_open=True)
+                    if args.received_from <= c.received_at <= args.received_to
+                ]
+                print(f"dry run: {len(matching)} open case(s) would be rejected (add --yes)")
+            else:
+                done = store.bulk_reject(actor=args.actor, note=args.note, at=moment, **window)
+                print(f"rejected {len(done)} case(s)")
         elif args.command == "redact":
             store.redact(args.case_id, actor=args.actor, reason=args.reason, at=moment)
             print("redacted")
         elif args.command == "purge-contacts":
             purged = store.purge_expired_contacts(now=moment)
             print(f"deleted {len(purged)} expired reply contact(s)")
-    except (IntakeError, ValueError, OSError) as exc:
+    except (IntakeError, ValueError, OSError, sqlite3.Error, SnapshotError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     return 0
