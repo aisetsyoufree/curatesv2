@@ -93,19 +93,24 @@ This step:
 - **Explicitly ensures `cu-rates-worker.service` and `cu-rates-worker.timer` remain STOPPED, DISABLED, and MASKED (`ln -sf /dev/null /etc/systemd/system/<unit>`) per Decisions D-15 and D-17.**
 - **Records installed commit in root-owned state file `/var/lib/cu-rates/installed-commit` (mode 0644) per Decision D-17.**
 
-### Step 3: Clone Repository as Service User
-Clone the application repository into the pre-created `/var/lib/cu-rates/app` directory AS the dedicated `cu-rates` service user (avoiding root ownership and git dubious ownership issues):
+### Step 3: Clone Repository as Root at a Pinned Commit
+The code the service runs must not be writable by the service user (it would otherwise let a compromised web process alter code that root later executes for withdrawals and backups). `app/` and `venv/` are therefore `root:cu-rates` (readable, not writable, by the service). Clone as root and check out an explicit reviewed tag or full commit SHA, then record what actually runs (D-17):
 ```bash
-sudo -u cu-rates git clone https://github.com/aisetsyoufree/curatesv2.git /var/lib/cu-rates/app
-cd /var/lib/cu-rates/app
+sudo git clone https://github.com/aisetsyoufree/curatesv2.git /var/lib/cu-rates/app
+sudo git -C /var/lib/cu-rates/app checkout --detach <reviewed-tag-or-sha>
+sudo git -C /var/lib/cu-rates/app rev-parse HEAD | sudo tee /var/lib/cu-rates/installed-commit
 ```
+The installer's own `installed-commit` records the bundle it ran from; the command above replaces it with the commit that is actually deployed.
 
-### Step 4: Provision Virtual Environment
-Install production dependencies including Gunicorn into the isolated venv at `/var/lib/cu-rates/venv` as the `cu-rates` service user, setting `UV_PROJECT_ENVIRONMENT` and a writable `UV_CACHE_DIR` inside the state dir:
+### Step 4: Provision Virtual Environment as Root
+Build the venv as root so the service user cannot modify code or dependencies, using the lockfile only:
 ```bash
 cd /var/lib/cu-rates/app
-sudo -u cu-rates UV_PROJECT_ENVIRONMENT=/var/lib/cu-rates/venv UV_CACHE_DIR=/var/lib/cu-rates/.cache/uv uv sync --locked --no-dev --group deploy
+sudo UV_PROJECT_ENVIRONMENT=/var/lib/cu-rates/venv uv sync --locked --no-dev --group deploy
+sudo chmod -R go-w /var/lib/cu-rates/app /var/lib/cu-rates/venv
+sudo -u cu-rates /var/lib/cu-rates/venv/bin/python -c "import cu_rates"   # must be readable by the service user
 ```
+Updating code later is the same procedure as root; restart `cu-rates-web` afterwards. The environment file `/etc/cu-rates/cu-rates.env` is `root:cu-rates` mode 0640.
 
 ### Step 5: Initialize Emergency Withdrawal Ledger
 The emergency withdrawal mechanism requires an initialized ledger file at `/var/lib/cu-rates/independent/denylist.json` before any withdrawal records can be appended (uninitialized reads fail closed). Initial provisioning creates the parent directory `/var/lib/cu-rates/independent` (operator-owned, mode 0755) but does not establish the ledger. Set its group to the web-reader group and initialize the ledger **as root**:
@@ -237,13 +242,14 @@ Upgrades preserve operational state and snapshot data.
 1. **Pull Latest Release:**
    ```bash
    cd /var/lib/cu-rates/app
-   sudo -u cu-rates git fetch --tags
-   sudo -u cu-rates git checkout <target-tag-or-sha>
+   sudo git fetch --tags
+   sudo git checkout --detach <target-tag-or-sha>
+   git rev-parse HEAD | sudo tee /var/lib/cu-rates/installed-commit
    ```
 
 2. **Update Virtual Environment:**
    ```bash
-   sudo -u cu-rates UV_PROJECT_ENVIRONMENT=/var/lib/cu-rates/venv UV_CACHE_DIR=/var/lib/cu-rates/.cache/uv uv sync --locked --no-dev --group deploy
+   sudo UV_PROJECT_ENVIRONMENT=/var/lib/cu-rates/venv uv sync --locked --no-dev --group deploy
    ```
 
 3. **Reload Systemd Units (if changed):**
@@ -275,8 +281,8 @@ Upgrades preserve operational state and snapshot data.
 To roll back application code to a prior commit:
 ```bash
 cd /var/lib/cu-rates/app
-sudo -u cu-rates git checkout <previous-tag-or-sha>
-sudo -u cu-rates UV_PROJECT_ENVIRONMENT=/var/lib/cu-rates/venv UV_CACHE_DIR=/var/lib/cu-rates/.cache/uv uv sync --locked --no-dev --group deploy
+sudo git checkout --detach <previous-tag-or-sha>
+sudo UV_PROJECT_ENVIRONMENT=/var/lib/cu-rates/venv uv sync --locked --no-dev --group deploy
 sudo systemctl restart cu-rates-web.service
 ```
 
