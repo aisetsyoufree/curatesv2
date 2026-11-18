@@ -10,16 +10,16 @@ from dataclasses import dataclass
 
 from sqlalchemy import select
 from sqlalchemy.engine import Connection
+from sqlalchemy.exc import NoResultFound
 
 from cu_rates.adapters.registry import approved_adapter, load_configuration, normalize_row
-from cu_rates.adapters.static_html import Confidence, extract
+from cu_rates.adapters.static_html import Confidence, configuration_parser, extract
 from cu_rates.artifact_store import ArtifactStore, ArtifactStoreError
-from cu_rates.contracts.enums import OfferStatus, RunStatus
+from cu_rates.contracts.enums import RunStatus
 from cu_rates.contracts.offers import NormalizedOffer
 from cu_rates.contracts.publication import VerifiedScenarioStatement
 from cu_rates.contracts.sources import FetchRun, RateSource, SourceFingerprint
 from cu_rates.db.schema import products, slice_normalization_failures
-from cu_rates.pipeline.extract import layout_sha256
 from cu_rates.pipeline.trusted import (
     _product,
     insert_artifact,
@@ -50,7 +50,7 @@ def extract_stored_capture(
 ) -> CaptureExtraction:
     """Persist candidates, proofs and checks from stored bytes; never publish or fetch.
 
-    Source identity, relationship, collection approval and first-value review still belong
+    Source identity, product relationship and collection approval still belong
     to their existing gates. Calling this function cannot make any of them approved.
     """
     approval = load_source_approval(conn, source.source_id, run.finished_at)
@@ -59,6 +59,7 @@ def extract_stored_capture(
     if (
         approval is None
         or approval.approved_layout_sha256 != config.layout_sha256
+        or approval.adapter != configuration_parser(config)
         or adapter.fixture
         or run.source_id != source.source_id
         or run.status is not RunStatus.SUCCEEDED
@@ -101,20 +102,60 @@ def extract_stored_capture(
             {**stage, "status": "failed", "candidate_count": 0, "error": f"low confidence: {exc}"},
         )
         return CaptureExtraction((), "low", (str(exc),))
+    # Prepare every row before persisting any candidate, fingerprint, offer or proof.
+    prepared = []
+    errors = list(result.diagnostics)
+    row_errors = []
+    if result.confidence != "low":
+        for row in result.rows:
+            try:
+                offer = normalize_row(row, config, artifact)
+                product = _product(
+                    conn.execute(
+                        select(products).where(products.c.product_id == offer.product_id)
+                    ).one()
+                )
+                proof = validate_offer(
+                    offer,
+                    ValidationContext(
+                        evaluated_at=run.finished_at,
+                        source=source,
+                        product=product,
+                        artifacts=(artifact,),
+                        fetch_runs=(run,),
+                        candidates=row.candidates,
+                    ),
+                )
+                if proof.quarantine is not None:
+                    raise ValueError(
+                        "row validation failed: "
+                        + "; ".join(
+                            result.detail or result.rule_id
+                            for result in proof.results
+                            if not result.passed
+                        )
+                    )
+                prepared.append((row, offer, proof))
+            except (ValueError, NoResultFound) as exc:
+                errors.append(f"{row.row.offer_id}: {exc}")
+                row_errors.append((row.row.offer_id, str(exc)))
+    low = result.confidence == "low" or bool(errors)
     insert_extraction_run(
         conn,
         {
             **stage,
-            "status": "failed" if result.confidence == "low" else "succeeded",
-            "candidate_count": 0
-            if result.confidence == "low"
-            else sum(len(r.candidates) for r in result.rows),
-            "error": "; ".join(result.diagnostics) if result.confidence == "low" else None,
+            "status": "failed" if low else "succeeded",
+            "candidate_count": 0 if low else sum(len(r.candidates) for r in result.rows),
+            "error": "; ".join(errors) if low else None,
         },
     )
-    # A low-confidence page may contain partial rows: retain diagnostics, never promote them.
-    if result.confidence == "low":
-        return CaptureExtraction((), "low", result.diagnostics)
+    for row_id, reason in row_errors:
+        conn.execute(
+            slice_normalization_failures.insert(),
+            dict(extraction_run_id=extraction_id, row_id=row_id, reason=reason),
+        )
+    if low:
+        return CaptureExtraction((), "low", tuple(errors))
     insert_fingerprint(
         conn,
         SourceFingerprint(
@@ -124,58 +165,31 @@ def extract_stored_capture(
             artifact_id=artifact.artifact_id,
             observed_at=artifact.fetched_at,
             content_sha256=artifact.artifact_id,
-            structure_sha256=layout_sha256(store.read(artifact)),
+            structure_sha256=config.layout_sha256,
             adapter=adapter.parser,
         ),
         f"layout-{run.run_id}",
     )
     offers = []
-    errors = []
-    for row in result.rows:
+    for row, offer, proof in prepared:
         for candidate in row.candidates:
             persist_candidate(conn, candidate, config.institution_charter)
-        try:
-            offer = normalize_row(row, config, artifact)
-            product = _product(
-                conn.execute(
-                    select(products).where(products.c.product_id == offer.product_id)
-                ).one()
-            )
-            proof = validate_offer(
-                offer,
-                ValidationContext(
-                    evaluated_at=run.finished_at,
-                    source=source,
-                    product=product,
-                    artifacts=(artifact,),
-                    fetch_runs=(run,),
-                    candidates=row.candidates,
-                ),
-            )
-            if proof.quarantine is not None:
-                offer = offer.model_copy(update={"status": OfferStatus.QUARANTINED})
-            insert_capture(conn, offer, run.run_id)
-            insert_validations(conn, proof.for_publication(offer))
-            insert_statements(
-                conn,
-                config.institution_charter,
-                tuple(
-                    VerifiedScenarioStatement(
-                        offer_id=offer.offer_id,
-                        dimension=m.dimension,
-                        fetch_run_id=run.run_id,
-                        stated=m.stated,
-                        provenance=m.provenance,
-                    )
-                    for m in offer.scenario_matches
-                    if m.stated is not None and m.provenance is not None
-                ),
-            )
-            offers.append(offer)
-        except ValueError as exc:
-            errors.append(f"{row.row.offer_id}: {exc}")
-            conn.execute(
-                slice_normalization_failures.insert(),
-                dict(extraction_run_id=extraction_id, row_id=row.row.offer_id, reason=str(exc)),
-            )
-    return CaptureExtraction(tuple(offers), "low" if errors else result.confidence, tuple(errors))
+        insert_capture(conn, offer, run.run_id)
+        insert_validations(conn, proof.for_publication(offer))
+        insert_statements(
+            conn,
+            config.institution_charter,
+            tuple(
+                VerifiedScenarioStatement(
+                    offer_id=offer.offer_id,
+                    dimension=m.dimension,
+                    fetch_run_id=run.run_id,
+                    stated=m.stated,
+                    provenance=m.provenance,
+                )
+                for m in offer.scenario_matches
+                if m.stated is not None and m.provenance is not None
+            ),
+        )
+        offers.append(offer)
+    return CaptureExtraction(tuple(offers), result.confidence, ())

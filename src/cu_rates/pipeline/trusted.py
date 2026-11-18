@@ -564,13 +564,20 @@ def insert_capture(conn: Connection, offer: NormalizedOffer, run_id: str) -> Non
     )
 
 
-def verify_located_claim(body: bytes, provenance: Provenance) -> str:
+def verify_located_claim(
+    body: bytes, provenance: Provenance, *, approval: SourceApproval | None = None
+) -> str:
     locator = provenance.locator
     if not isinstance(locator, HtmlLocator):
         raise ValueError("stored claims require HTML locators")
     node = resolve_text(body, locator.selector, locator.selector_type)
     located = excerpt_is_located(node, provenance.source_text)
-    if provenance.extraction.parser.name == "static-html":
+    if (
+        approval is not None
+        and approval.approved
+        and approval.adapter is not None
+        and approval.adapter.name == "static-html"
+    ):
         located = fragment_is_located(node, provenance.source_text)
     if sha256(node.encode()).hexdigest() != locator.normalized_text_sha256 or not located:
         raise ValueError("stored locator or excerpt differs from source")
@@ -730,7 +737,25 @@ def _identity_review(
         return None
     try:
         for evidence in review.evidence:
-            verify_located_claim(store.read_body(evidence.artifact_id), evidence)
+            source_ids = (
+                conn.execute(
+                    select(fetch_runs.c.source_id)
+                    .join(
+                        artifact_observations,
+                        artifact_observations.c.fetch_run_id == fetch_runs.c.run_id,
+                    )
+                    .where(artifact_observations.c.artifact_id == evidence.artifact_id)
+                )
+                .scalars()
+                .unique()
+                .all()
+            )
+            approval = (
+                load_source_approval(conn, source_ids[0], evaluated_at)
+                if len(source_ids) == 1
+                else None
+            )
+            verify_located_claim(store.read_body(evidence.artifact_id), evidence, approval=approval)
     except (ArtifactStoreError, ValueError, OSError):
         return None
     return review
@@ -864,7 +889,8 @@ def load_publication_context(
             if verification.confidence == "low":
                 raise ValueError("low-confidence extraction is quarantined")
             body, verified = raw, (artifact,)
-        except (ArtifactStoreError, ValueError, OSError):
+        except Exception:
+            # A malformed capture or adapter failure must not abort other captures.
             pass
 
     primary_verified = bool(verified)
@@ -1032,7 +1058,8 @@ def load_publication_context(
             )
             if not verification.comparable or verification.confidence == "low":
                 continue
-        except (ArtifactStoreError, ValueError, OSError):
+        except Exception:
+            # Isolate failed captures, including unexpected parser/adapter exceptions.
             continue
         proofs = tuple(
             proof
@@ -1097,7 +1124,7 @@ def load_publication_context(
             validations=tuple(latest[key] for key in sorted(latest)),
             prior=prior,
             product_review=_subject_review(conn, "product", offer.product_id, evaluated_at),
-            corrections=_corrections(conn, offer_id, evaluated_at, store),
+            corrections=_corrections(conn, offer_id, evaluated_at, store, approval),
             withdrawals=_withdrawals(conn),
             evaluated_at=evaluated_at,
         ),
@@ -1305,7 +1332,11 @@ def _subject_review(
 
 
 def _corrections(
-    conn: Connection, offer_id: str, evaluated_at: UtcDatetime, store: ArtifactStore
+    conn: Connection,
+    offer_id: str,
+    evaluated_at: UtcDatetime,
+    store: ArtifactStore,
+    approval: SourceApproval | None,
 ) -> tuple[Correction, ...]:
     results: list[Correction] = []
     for row in conn.execute(
@@ -1323,7 +1354,7 @@ def _corrections(
         evidence = tuple(_load_provenance(conn, ids)[key] for key in sorted(ids))
         try:
             for item in evidence:
-                verify_located_claim(store.read_body(item.artifact_id), item)
+                verify_located_claim(store.read_body(item.artifact_id), item, approval=approval)
         except (ArtifactStoreError, OSError, ValueError):
             # Keep the correction in force even if its supporting bytes are unavailable.
             evidence = ()

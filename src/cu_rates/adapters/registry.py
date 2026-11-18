@@ -18,6 +18,7 @@ from cu_rates.adapters.static_html import (
     Confidence,
     RowExtraction,
     SourceConfiguration,
+    configuration_parser,
     extract,
 )
 from cu_rates.contracts.enums import OfferStatus
@@ -58,11 +59,19 @@ def approved_adapter(
         or approval.source_url != source.url
     ):
         raise ValueError("source has no applicable approved adapter")
-    adapter = ADAPTERS.get((approval.adapter.name, approval.adapter.version))
+    name, version = approval.adapter.name, approval.adapter.version
+    adapter = ADAPTERS.get((name, version))
+    if adapter is None and name == PARSER.name:
+        adapter = ADAPTERS.get((name, version.split("+cfg.", 1)[0]))
     if adapter is None:
         raise ValueError("unknown adapter name/version")
     if adapter.fixture and not allow_fixture:
         raise ValueError("fixture adapter refused in production mode")
+    if not adapter.fixture:
+        identity = configuration_parser(load_configuration(source))
+        if approval.adapter != identity:
+            raise ValueError("adapter configuration digest is not approved")
+        return Adapter(identity)
     return adapter
 
 
@@ -138,7 +147,10 @@ def verify_offer_against_stored_bytes(
         candidates, comparable = verified_offer_candidates(source, offer, body, artifact)
         return Verification(candidates, comparable, "high")
     config = load_configuration(source)
-    if approval.approved_layout_sha256 != config.layout_sha256:
+    if (
+        approval.approved_layout_sha256 != config.layout_sha256
+        or approval.adapter != configuration_parser(config)
+    ):
         raise ValueError("configuration layout is not approved")
     # Use the original extraction identity, then compare the entire offer including all
     # locators, excerpts, parser/config/code provenance. Status/expiry are lifecycle policy.

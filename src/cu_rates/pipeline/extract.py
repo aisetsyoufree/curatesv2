@@ -37,6 +37,9 @@ _VOID = frozenset(
         "wbr",
     ]
 )
+MAX_BODY_BYTES = 2 * 1024 * 1024
+MAX_NESTING_DEPTH = 128
+_NONVISIBLE = frozenset({"script", "style", "template", "noscript"})
 _PAGE = {
     "athol-style": "Example North Charter mortgage rates",
     "athol-style-dated": "Example North Charter mortgage rates",
@@ -63,15 +66,25 @@ class _Node:
         return [part for part in self.parts if isinstance(part, _Node)]
 
     def raw(self) -> str:
-        return "".join(item if isinstance(item, str) else item.raw() for item in self.parts)
+        chunks: list[str] = []
+        pending: list[str | _Node] = [self]
+        while pending:
+            item = pending.pop()
+            if isinstance(item, str):
+                chunks.append(item)
+            elif item.tag not in _NONVISIBLE:
+                pending.extend(reversed(item.parts))
+        return "".join(chunks)
 
     def text(self) -> str:
         return " ".join(self.raw().split())
 
     def walk(self) -> Iterator[_Node]:
-        yield self
-        for child in self.children:
-            yield from child.walk()
+        pending = [self]
+        while pending:
+            node = pending.pop()
+            yield node
+            pending.extend(reversed(node.children))
 
 
 class _Tree(HTMLParser):
@@ -79,20 +92,25 @@ class _Tree(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.root = _Node("document", {})
         self.current = self.root
+        self.depth = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = {key: value or "" for key, value in attrs}
         if len(values) != len(attrs):
             raise ValueError("duplicate HTML attributes")
+        if self.depth + 1 > MAX_NESTING_DEPTH:
+            raise ValueError("HTML nesting depth limit exceeded")
         node = _Node(tag, values, self.current)
         self.current.parts.append(node)
         if tag not in _VOID:
             self.current = node
+            self.depth += 1
 
     def handle_endtag(self, tag: str) -> None:
         if self.current.tag != tag or self.current.parent is None:
             raise ValueError("fixture HTML is not explicitly balanced")
         self.current = self.current.parent
+        self.depth -= 1
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag not in _VOID:
@@ -104,6 +122,8 @@ class _Tree(HTMLParser):
 
 
 def _parse(body: bytes) -> _Node:
+    if len(body) > MAX_BODY_BYTES:
+        raise ValueError("HTML body size limit exceeded")
     parser = _Tree()
     parser.feed(body.decode("utf-8"))
     parser.close()
@@ -123,9 +143,9 @@ def _by_id(root: _Node, element_id: str) -> _Node:
     return _only((node for node in root.walk() if node.attrs.get("id") == element_id), element_id)
 
 
-def resolve_text(body: bytes, selector: str, selector_type: str = "css") -> str:
+def resolve_text(body: bytes | _Node, selector: str, selector_type: str = "css") -> str:
     """Resolve only the slice's explicit CSS subset and XPath attribute form."""
-    root = _parse(body)
+    root = _parse(body) if isinstance(body, bytes) else body
     if selector_type == "xpath":
         match = re.fullmatch(r"//a\[@href='([^']+)'\]/@href", selector)
         if match:
@@ -169,14 +189,14 @@ def resolve_text(body: bytes, selector: str, selector_type: str = "css") -> str:
     raise ValueError(f"unsupported or unresolvable {selector_type} selector {selector}")
 
 
-def layout_sha256(body: bytes) -> str:
+def layout_sha256(body: bytes | _Node) -> str:
     """Bind the approved tag/column/locator structure, excluding rate and date values."""
-
-    def shape(node: _Node) -> object:
+    root = _parse(body) if isinstance(body, bytes) else body
+    shapes: dict[_Node, list[object]] = {}
+    for node in reversed(list(root.walk())):
         label = node.text() if node.tag in {"h1", "h2", "caption", "th", "title"} else None
-        return [node.tag, node.attrs, label, [shape(child) for child in node.children]]
-
-    payload = json.dumps(shape(_parse(body)), sort_keys=True, separators=(",", ":"))
+        shapes[node] = [node.tag, node.attrs, label, [shapes[child] for child in node.children]]
+    payload = json.dumps(shapes[root], sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
@@ -269,7 +289,7 @@ def extract_fixture(
         row: str, path: str, selector: str, text: str | None = None, *, attribute: bool = False
     ) -> ExtractedCandidate:
         selector_type: Literal["xpath", "css"] = "xpath" if attribute else "css"
-        node = resolve_text(body, selector, selector_type)
+        node = resolve_text(root, selector, selector_type)
         if text is None:
             text = node
         if not excerpt_is_located(node, text):

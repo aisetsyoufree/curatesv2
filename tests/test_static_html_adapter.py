@@ -10,8 +10,18 @@ from sqlalchemy import select
 from sqlalchemy.engine import Connection
 
 from cu_rates.adapters import registry
-from cu_rates.adapters.registry import normalize_row, verify_offer_against_stored_bytes
-from cu_rates.adapters.static_html import PARSER, SourceConfiguration, extract
+from cu_rates.adapters.registry import (
+    Verification,
+    normalize_row,
+    verify_offer_against_stored_bytes,
+)
+from cu_rates.adapters.static_html import (
+    PARSER,
+    RowExtraction,
+    SourceConfiguration,
+    configuration_parser,
+    extract,
+)
 from cu_rates.artifact_store import ArtifactStore
 from cu_rates.contracts.audit import PublishedSnapshot, ReviewDecision
 from cu_rates.contracts.enums import (
@@ -26,6 +36,7 @@ from cu_rates.contracts.enums import (
 )
 from cu_rates.contracts.evidence import ExtractionProvenance, HtmlLocator, Provenance, RawArtifact
 from cu_rates.contracts.fingerprints import offer_fingerprints, product_content_sha256
+from cu_rates.contracts.offers import NormalizedOffer
 from cu_rates.contracts.publication import (
     PublicationOutcome,
     ValidationPolicy,
@@ -107,7 +118,7 @@ def inputs(
         policy_version="1",
         rationale="Synthetic configuration approval only.",
         approved_layout_sha256=config.layout_sha256,
-        adapter=PARSER,
+        adapter=configuration_parser(config),
     )
     return config, source, body, artifact, approval
 
@@ -502,7 +513,10 @@ def test_stored_static_captures_reach_verified_snapshot(tmp_path: Path, name: st
         info = publisher.build(manifest, conn=conn, store=store)
         assert info.snapshot_id == "static-reviewed"
         view = load_publication_context(conn, f"{name}.purchase", NOW, store=store)
-        assert view.context.source_approval and view.context.source_approval.adapter == PARSER
+        assert (
+            view.context.source_approval
+            and view.context.source_approval.adapter == configuration_parser(inputs(name)[0])
+        )
         assert len(view.context.verified_scenario_statements) >= 24
         with pytest.raises(SnapshotError, match="fixture or reserved"):
             SnapshotPublisher(tmp_path / "production").build(manifest, conn=conn, store=store)
@@ -687,7 +701,7 @@ def test_snapshot_rechecks_low_confidence_independently(
         monkeypatch.setattr(builder, "load_publication_context", lambda *a, **k: view)
         monkeypatch.setattr(builder, "_admit", lambda *a: public)
         publisher = SnapshotPublisher(tmp_path / "public", allow_fixture=True)
-        with pytest.raises(SnapshotError, match="low-confidence"):
+        with pytest.raises(SnapshotError, match="verify persisted evidence"):
             publisher.build(manifest, conn=conn, store=store)
         assert not (publisher.root / "current.json").exists()
     engine.dispose()
@@ -724,3 +738,400 @@ def test_table_rate_changes_use_same_configuration() -> None:
     offer = normalize_row(result.rows[0], config, artifact)
     assert offer.note_rate and offer.note_rate.value == Decimal("4.112")
     assert verify_offer_against_stored_bytes(source, approval, offer, body, artifact).comparable
+
+
+@pytest.mark.parametrize("change", ["selector", "column", "label", "target", "paths", "excerpt"])
+@pytest.mark.parametrize("boundary", ["dispatch", "extract", "old offer", "new offer"])
+def test_configuration_edits_require_new_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str, boundary: str
+) -> None:
+    from cu_rates.pipeline import adapter_capture
+
+    config, source, body, artifact, approval = inputs()
+    original = normalize_row(
+        extract(config, source, body, artifact, extraction_run_id="original", git_sha=GIT).rows[0],
+        config,
+        artifact,
+    )
+    row = config.rows[0]
+    fields = list(row.fields)
+    rate_index = next(i for i, f in enumerate(fields) if f.path == "note_rate")
+    if change in {"selector", "column"}:
+        index = (
+            rate_index
+            if change == "selector"
+            else next(i for i, f in enumerate(fields) if f.path == "apr")
+        )
+        selector = (
+            "#mortgage > td:nth-child(6)" if change == "selector" else "#mortgage > td:nth-child(5)"
+        )
+        fields[index] = fields[index].model_copy(update={"selector": selector})
+    elif change == "label":
+        fields[rate_index] = fields[rate_index].model_copy(
+            update={
+                "label": fields[rate_index].label.model_copy(
+                    update={"selector": "#apr-label", "text": "APR"}
+                )
+            }
+        )
+    elif change == "target":
+        row = row.model_copy(update={"comparison_target": None})
+    elif change == "paths":
+        fields = [f for f in fields if f.path != "apr"]
+    else:
+        fields[0] = fields[0].model_copy(update={"excerpt": "mortgage", "context_text": "mortgage"})
+    changed = config.model_copy(
+        update={"rows": (row.model_copy(update={"fields": tuple(fields)}),)}
+    )
+    assert changed.sha256 != config.sha256
+    database = tmp_path / "worker.sqlite"
+    upgrade_database(database)
+    store = ArtifactStore(tmp_path / "private")
+    engine = open_operational_database(database)
+    with engine.begin() as conn:
+        source, profile = prepare(conn, store)
+        monkeypatch.setattr(registry, "load_configuration", lambda _: changed)
+        monkeypatch.setattr(adapter_capture, "load_configuration", lambda _: changed)
+        if boundary == "dispatch":
+            with pytest.raises(ValueError, match="configuration digest"):
+                registry.approved_adapter(source, approval)
+        elif boundary == "extract":
+            art = store.put(
+                body,
+                source_url=source.url,
+                media_type="text/html",
+                fetched_at=NOW,
+                http_status=200,
+                fetch_run_id="edited",
+            )
+            with pytest.raises(ValueError, match="configuration digest"):
+                extract_stored_capture(conn, store, source, fetch_run(profile, art))
+        else:
+            offer = original
+            if boundary == "new offer":
+                offer = normalize_row(
+                    extract(
+                        changed, source, body, artifact, extraction_run_id="changed", git_sha=GIT
+                    ).rows[0],
+                    changed,
+                    artifact,
+                )
+            with pytest.raises(ValueError, match="configuration digest"):
+                verify_offer_against_stored_bytes(source, approval, offer, body, artifact)
+    engine.dispose()
+
+
+def test_prose_rate_changes_keep_configuration_digest() -> None:
+    config, source, body, _, approval = inputs("prose")
+    digest = config.sha256
+    assert "4.111" not in config.model_dump_json() and "4.222" not in config.model_dump_json()
+    body = body.replace(b"4.111%", b"4.112%").replace(b"4.222%", b"4.223%")
+    _, _, _, artifact, _ = inputs("prose", body)
+    result = extract(config, source, body, artifact, extraction_run_id="changed", git_sha=GIT)
+    assert result.confidence == "medium" and config.sha256 == digest
+    offer = normalize_row(result.rows[0], config, artifact)
+    assert offer.note_rate and offer.note_rate.value == Decimal("4.112")
+    assert verify_offer_against_stored_bytes(source, approval, offer, body, artifact).comparable
+
+
+@pytest.mark.parametrize("kind", ["oversized", "deep"])
+def test_html_resource_limits_fail_closed(kind: str) -> None:
+    from cu_rates.pipeline.extract import resolve_text
+
+    body = b"<div>" * 5000 + b"4.1%" + b"</div>" * 5000
+    if kind == "oversized":
+        body = b'<p id="note">' + b"x" * (2 * 1024 * 1024 + 1) + b"</p>"
+    with pytest.raises(ValueError, match="limit"):
+        resolve_text(body, "#note")
+    config, source, _, artifact, _ = inputs(body=body)
+    result = extract(config, source, body, artifact, extraction_run_id="limited", git_sha=GIT)
+    assert result.confidence == "low" and any("limit" in d for d in result.diagnostics)
+
+
+@pytest.mark.parametrize("tag", ["script", "style", "template", "noscript"])
+def test_nonvisible_text_is_not_rate_evidence(tag: str) -> None:
+    from cu_rates.pipeline.extract import resolve_text
+
+    body = f'<p id="note">4.1%<{tag}>9.9%</{tag}></p>'.encode()
+    assert resolve_text(body, "#note") == "4.1%"
+
+
+@pytest.mark.parametrize("failure", ["normalize", "missing product", "validation"])
+def test_row_errors_prevent_all_page_inserts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    from cu_rates.db.schema import extracted_candidates, slice_offer_captures, source_fingerprints
+    from cu_rates.pipeline import adapter_capture
+
+    database = tmp_path / "worker.sqlite"
+    upgrade_database(database)
+    store = ArtifactStore(tmp_path / "private")
+    engine = open_operational_database(database)
+    with engine.begin() as conn:
+        source, profile = prepare(conn, store, "multi")
+        if failure == "validation":
+            insert_product(
+                conn,
+                ProductIdentity.model_validate(
+                    dict(
+                        schema_version="1.0",
+                        product_id=inputs("multi")[0].rows[1].product_id,
+                        institution_charter=8000401,
+                        family="mortgage",
+                        name="Wrong family",
+                        lifecycle="active",
+                        rate_availability="public_rate",
+                        conforming_status="conforming",
+                        government_guaranty="none",
+                    )
+                ),
+            )
+            insert_relationship(
+                conn,
+                InstitutionSourceRelationship(
+                    schema_version="1.0",
+                    relationship_id="multi.equity.relationship",
+                    institution_charter=8000401,
+                    source_id=source.source_id,
+                    product_id=inputs("multi")[0].rows[1].product_id,
+                    kind=SourceRelationshipKind.FIRST_PARTY,
+                    approved_by="synthetic-human",
+                    approved_at=NOW - timedelta(days=1),
+                ),
+            )
+
+        def fail_second(
+            row: RowExtraction, config: SourceConfiguration, artifact: RawArtifact
+        ) -> NormalizedOffer:
+            if row.row.offer_id != "multi.purchase":
+                raise ValueError("second row failure")
+            return normalize_row(row, config, artifact)
+
+        if failure == "normalize":
+            monkeypatch.setattr(adapter_capture, "normalize_row", fail_second)
+        body = (FIXTURES / "multi.html").read_bytes()
+        art = store.put(
+            body,
+            source_url=source.url,
+            media_type="text/html",
+            fetched_at=NOW,
+            http_status=200,
+            fetch_run_id="partial",
+        )
+        result = extract_stored_capture(conn, store, source, fetch_run(profile, art))
+        assert result.confidence == "low" and not result.offers
+        run = conn.execute(
+            select(extraction_runs).where(extraction_runs.c.run_id == "extract-partial")
+        ).one()
+        assert run.status == "failed" and run.candidate_count == 0
+        for table in (extracted_candidates, slice_offer_captures, source_fingerprints):
+            assert not conn.execute(select(table)).all()
+    engine.dispose()
+
+
+def test_mortgage_alias_requires_purpose_without_configured_purpose() -> None:
+    config, source, body, _, _ = inputs()
+    body = body.replace(b"<td>mortgage</td>", b"<td>First mortgage</td>")
+    _, _, _, artifact, _ = inputs(body=body)
+    row = config.rows[0].model_copy(
+        update={
+            "comparison_target": None,
+            "fields": tuple(
+                f
+                for f in config.rows[0].fields
+                if f.path not in {"details.purpose", "details.rate_type", "details.lock_days"}
+            ),
+        }
+    )
+    config = config.model_copy(update={"rows": (row,)})
+    result = extract(
+        config, source, body, artifact, extraction_run_id="missing-purpose", git_sha=GIT
+    )
+    assert result.confidence == "low"
+    assert any(
+        "required fields missing: details.lock_days, details.purpose, details.rate_type" in d
+        for d in result.diagnostics
+    )
+
+
+def test_located_claim_uses_approved_adapter() -> None:
+    from cu_rates.pipeline.trusted import verify_located_claim
+
+    config, _, body, artifact, approval = inputs("prose")
+    claim = (
+        extract(config, inputs("prose")[1], body, artifact, extraction_run_id="claim", git_sha=GIT)
+        .rows[0]
+        .candidates[6]
+        .provenance
+    )
+    forged = claim.model_copy(
+        update={"extraction": claim.extraction.model_copy(update={"parser": SLICE_PARSER})}
+    )
+    assert verify_located_claim(body, forged, approval=approval) == "4.111%"
+    slice_approval = approval.model_copy(update={"adapter": SLICE_PARSER})
+    with pytest.raises(ValueError):
+        verify_located_claim(body, claim, approval=slice_approval)
+
+
+def test_trusted_loader_skips_capture_exceptions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cu_rates.pipeline import trusted
+
+    database = tmp_path / "worker.sqlite"
+    upgrade_database(database)
+    store = ArtifactStore(tmp_path / "private")
+    engine = open_operational_database(database)
+    with engine.begin() as conn:
+        reviewed_adapter(conn, store)
+
+        def fail_first(
+            source: RateSource,
+            approval: SourceApproval | None,
+            offer: NormalizedOffer,
+            body: bytes,
+            artifact: RawArtifact,
+            *,
+            allow_fixture: bool = False,
+        ) -> Verification:
+            if artifact.fetch_run_id == "first":
+                raise RecursionError("bad historical capture")
+            return verify_offer_against_stored_bytes(
+                source, approval, offer, body, artifact, allow_fixture=allow_fixture
+            )
+
+        monkeypatch.setattr(trusted, "verify_offer_against_stored_bytes", fail_first)
+        view = load_publication_context(conn, "table.purchase", NOW, store=store)
+        assert not evaluate_publication(view.offer, view.context).publishable_now
+        assert {p.capture_id for p in view.context.evidence_paths} == {"second"}
+    engine.dispose()
+
+
+def test_extraction_parses_html_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    from cu_rates.pipeline import extract as html
+
+    config, source, body, artifact, _ = inputs("multi")
+    calls = 0
+    original = html._Tree.feed
+
+    def counted(parser: html._Tree, data: str) -> None:
+        nonlocal calls
+        calls += 1
+        original(parser, data)
+
+    monkeypatch.setattr(html._Tree, "feed", counted)
+    assert (
+        extract(config, source, body, artifact, extraction_run_id="once", git_sha=GIT).confidence
+        == "high"
+    )
+    assert calls == 1
+
+
+@pytest.mark.parametrize("kind", ["oversized", "deep"])
+@pytest.mark.parametrize("latest", [False, True])
+def test_trusted_loader_isolates_resource_limited_captures(
+    tmp_path: Path, kind: str, latest: bool
+) -> None:
+    from cu_rates.pipeline.trusted import insert_capture
+
+    database = tmp_path / "worker.sqlite"
+    upgrade_database(database)
+    store = ArtifactStore(tmp_path / "private")
+    engine = open_operational_database(database)
+    with engine.begin() as conn:
+        source, profile, _ = reviewed_adapter(conn, store)
+        original = load_publication_context(conn, "table.purchase", NOW, store=store).offer
+        body = b"<div>" * 5000 + b"x" + b"</div>" * 5000
+        if kind == "oversized":
+            body = b"x" * (2 * 1024 * 1024 + 1)
+        when = NOW + timedelta(hours=4) if latest else NOW - timedelta(hours=2)
+        art = store.put(
+            body,
+            source_url=source.url,
+            media_type="text/html",
+            fetched_at=when,
+            http_status=200,
+            fetch_run_id="malformed",
+        )
+        insert_run(conn, fetch_run(profile, art))
+        insert_artifact(conn, art)
+        old_artifact = next(original.iter_provenance()).artifact_id
+        forged = NormalizedOffer.model_validate_json(
+            original.model_copy(update={"observed_at": when})
+            .model_dump_json()
+            .replace(old_artifact, art.artifact_id)
+        )
+        insert_capture(conn, forged, "malformed")
+        view = load_publication_context(conn, original.offer_id, max(NOW, when), store=store)
+        assert "malformed" not in {p.capture_id for p in view.context.evidence_paths}
+        if latest:
+            assert view.offer.status is OfferStatus.QUARANTINED
+            assert not evaluate_publication(view.offer, view.context).publishable_now
+        else:
+            assert {p.capture_id for p in view.context.evidence_paths} == {"first", "second"}
+            assert evaluate_publication(view.offer, view.context).publishable_now
+    engine.dispose()
+
+
+def test_tree_text_and_walk_are_iterative() -> None:
+    from cu_rates.pipeline.extract import _Node
+
+    root = _Node("document", {})
+    current = root
+    for _ in range(5000):
+        child = _Node("div", {}, current)
+        current.parts.append(child)
+        current = child
+    current.parts.append("4.1%")
+    assert root.text() == "4.1%"
+    assert sum(1 for _ in root.walk()) == 5001
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        b"Note rate: 4.111% (invented; autopay required)",
+        b"Note rate: 4.111% 9.9% (invented)",
+        b"4.111% Note rate: (invented)",
+    ],
+)
+def test_prose_template_rejects_qualifiers_and_value_movement(replacement: bytes) -> None:
+    config, source, body, _, _ = inputs("prose")
+    body = body.replace(b"Note rate: 4.111% (invented)", replacement)
+    _, _, _, artifact, _ = inputs("prose", body)
+    result = extract(config, source, body, artifact, extraction_run_id="context", git_sha=GIT)
+    assert result.confidence == "low" and any("context" in d for d in result.diagnostics)
+
+
+def test_fixture_adapter_identity_requires_exact_version() -> None:
+    _, source, _, _, approval = inputs()
+    approval = approval.model_copy(
+        update={
+            "adapter": SLICE_PARSER.model_copy(
+                update={"version": f"{SLICE_PARSER.version}+cfg.{'a' * 64}"}
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="unknown adapter"):
+        registry.approved_adapter(source, approval, allow_fixture=True)
+
+
+def test_prose_literal_rate_configuration_fails_closed() -> None:
+    config, source, body, artifact, _ = inputs("prose")
+    fields = tuple(
+        f.model_copy(
+            update={
+                "context_template": None,
+                "excerpt": "4.111%",
+                "context_text": "Note rate: 4.111% (invented)",
+            }
+        )
+        if f.path == "note_rate"
+        else f
+        for f in config.rows[0].fields
+    )
+    config = config.model_copy(
+        update={"rows": (config.rows[0].model_copy(update={"fields": fields}),)}
+    )
+    result = extract(config, source, body, artifact, extraction_run_id="literal", git_sha=GIT)
+    assert result.confidence == "low" and any("rate excerpts" in d for d in result.diagnostics)

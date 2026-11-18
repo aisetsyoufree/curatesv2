@@ -76,8 +76,8 @@
             "selector": "#rate-label",
             "text": "Note rate"
           },
-          "excerpt": "4.111%",
-          "context_text": "Note rate: 4.111% (invented)"
+          "excerpt": null,
+          "context_template": "Note rate: {value} (invented)"
         },
         {
           "path": "apr",
@@ -86,8 +86,8 @@
             "selector": "#apr-label",
             "text": "APR"
           },
-          "excerpt": "4.222%",
-          "context_text": "APR: 4.222% (invented)"
+          "excerpt": null,
+          "context_template": "APR: {value} (invented)"
         },
         {
           "path": "effective_at",

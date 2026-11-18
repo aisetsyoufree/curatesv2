@@ -32,8 +32,8 @@ from cu_rates.contracts.evidence import (
     RawArtifact,
 )
 from cu_rates.contracts.sources import ExtractedCandidate, RateSource
-from cu_rates.normalize import FieldState, OfferContext, normalize_offer
-from cu_rates.pipeline.extract import layout_sha256, resolve_text
+from cu_rates.normalize import FieldState, OfferContext, _family, normalize_offer
+from cu_rates.pipeline.extract import _parse, layout_sha256, resolve_text
 
 PARSER = ParserVersion(name="static-html", version="1.0.0")
 Confidence = Literal["high", "medium", "low"]
@@ -57,6 +57,8 @@ class Field(ConfigurationData):
     # Pin the complete normalized prose context so negation/qualifier changes cannot
     # leave a still-matching numerical fragment publishable.
     context_text: str | None = None
+    # A single numeric value slot; surrounding text is escaped and matched exactly.
+    context_template: str | None = None
 
 
 class Row(ConfigurationData):
@@ -92,6 +94,11 @@ class SourceConfiguration(ConfigurationData):
         return hashlib.sha256(payload.encode()).hexdigest()
 
 
+def configuration_parser(config: SourceConfiguration) -> ParserVersion:
+    """The approval identity binds executable version and canonical configuration."""
+    return ParserVersion(name=PARSER.name, version=f"{PARSER.version}+cfg.{config.sha256}")
+
+
 @dataclass(frozen=True)
 class RowExtraction:
     row: Row
@@ -117,13 +124,12 @@ def fragment_is_located(node: str, excerpt: str) -> bool:
 
 def required_paths(row: Row, candidates: tuple[ExtractedCandidate, ...]) -> set[str]:
     core = {"product_family", "note_rate", "apr", "points", "details.term_months", "effective_at"}
-    raw = {c.proposed_path: c.raw_value.lower() for c in candidates}
-    # A mortgage is also identified by its configured purpose; a missing family cannot
-    # turn off the mortgage requirements.
-    if "details.purpose" in {f.path for f in row.fields} or raw.get("product_family") in {
-        "mortgage",
-        "conventional conforming fixed purchase",
-    }:
+    family = next((c.raw_value for c in candidates if c.proposed_path == "product_family"), "")
+    try:
+        mortgage = _family(family) is ProductFamily.MORTGAGE
+    except ValueError:
+        mortgage = False  # missing/invalid family is independently a required-field failure
+    if mortgage:
         core |= {"details.purpose", "details.rate_type", "details.lock_days"}
     if row.comparison_target is not None:
         from cu_rates.contracts.scenarios import CANONICAL_SCENARIOS, REQUIRED_DIMENSIONS
@@ -163,8 +169,10 @@ def extract(
         or len(body) != artifact.byte_length
     ):
         errors.append("artifact bytes or source binding differs")
+    root = None
     try:
-        if layout_sha256(body) != config.layout_sha256:
+        root = _parse(body)
+        if layout_sha256(root) != config.layout_sha256:
             errors.append("layout drift")
     except (ValueError, UnicodeError) as exc:
         errors.append(f"invalid HTML: {exc}")
@@ -173,14 +181,31 @@ def extract(
         failures = list(errors)
         candidates: list[ExtractedCandidate] = []
         fragmented = False
-        for rule in row.fields:
+        for rule in row.fields if root is not None else ():
+            assert root is not None
             try:
-                if resolve_text(body, rule.label.selector) != rule.label.text:
+                if resolve_text(root, rule.label.selector) != rule.label.text:
                     raise ValueError("ambiguous or changed label")
-                node = resolve_text(body, rule.selector)
-                if rule.excerpt is not None and rule.context_text != node:
-                    raise ValueError("excerpt context changed or is not configured")
-                value = node if rule.excerpt is None else rule.excerpt
+                node = resolve_text(root, rule.selector)
+                if rule.path in {"note_rate", "apr"} and (
+                    rule.excerpt is not None or rule.context_text is not None
+                ):
+                    raise ValueError("rate excerpts require a context template")
+                if rule.context_template is not None:
+                    if rule.excerpt is not None or rule.context_text is not None:
+                        raise ValueError("template cannot include a literal excerpt/context")
+                    parts = rule.context_template.split("{value}")
+                    if len(parts) != 2:
+                        raise ValueError("context template requires exactly one value position")
+                    pattern = re.escape(parts[0]) + r"([0-9]+(?:\.[0-9]+)?%)" + re.escape(parts[1])
+                    match = re.fullmatch(pattern, node)
+                    if match is None:
+                        raise ValueError("excerpt context template changed")
+                    value = match[1]
+                else:
+                    if rule.excerpt is not None and rule.context_text != node:
+                        raise ValueError("excerpt context changed or is not configured")
+                    value = node if rule.excerpt is None else rule.excerpt
                 if not fragment_is_located(node, value):
                     raise ValueError("excerpt does not uniquely match the located value")
                 fragmented |= value != node
@@ -201,7 +226,7 @@ def extract(
                             source_text=value,
                             extraction=ExtractionProvenance(
                                 git_sha=git_sha,
-                                parser=PARSER,
+                                parser=configuration_parser(config),
                                 configuration_sha256=config.sha256,
                                 normalization_version="t040.static-html.v1",
                                 rule_id="t040.literal.v1",
