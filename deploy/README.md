@@ -431,6 +431,25 @@ journalctl -u cu-rates-backup
 
 ---
 
+## 7b. Correction Inbox (issue #100)
+
+The public site has a correction form (`/corrections`). It is **closed until you set `INTAKE_DB`**, so nothing is stored until someone has agreed to read the inbox.
+
+**What it is.** A small private SQLite file (`/var/lib/cu-rates/intake/intake.sqlite`, directory mode 0700, owned by `cu-rates`) separate from the worker database, artifacts and snapshots. The web process can only **add** cases to it. Cases and their history are append-only; the optional reply email lives in a separate table, is never copied into the history, and is deleted 90 days after a case is resolved.
+
+**To open it** (after a person is assigned to the inbox):
+
+```bash
+sudo -u cu-rates /var/lib/cu-rates/venv/bin/python -m cu_rates.intake --db /var/lib/cu-rates/intake/intake.sqlite init
+# set INTAKE_DB=/var/lib/cu-rates/intake/intake.sqlite in /etc/cu-rates/cu-rates.env, then:
+sudo systemctl restart cu-rates-web
+sudo systemctl enable --now cu-rates-intake-purge.timer   # daily deletion of expired reply contacts
+```
+
+**Working the inbox** (as the service user): `... --db <path> list` (exit status 3 means a case missed its triage target: one business day for rate, identity, privacy and security reports, five for others), `show <id>`, `triage`, `note`, `resolve --decision confirmed|amended|quarantined|rejected`, `withdraw` (immediately suppresses an offer, product, institution, source or snapshot on the independent denylist, then records the decision), `bulk-reject --from ... --to ... --yes` (junk flooding), and `redact` (removes unsolicited personal data from a case). The purge timer runs `purge-contacts`.
+
+**Limits to know.** The form's rate limits are per web process (three Gunicorn workers), so roughly 6 reports per client and 45 in total per hour per host; one determined client can still fill the inbox, which is what `bulk-reject` is for. The client address used for those limits comes from `CF-Connecting-IP` and is trusted for that purpose only.
+
 ## 8. Uninstall Runbook
 
 To cleanly decommission the deployment without affecting other host services:

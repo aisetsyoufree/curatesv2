@@ -167,6 +167,7 @@ DIRS=(
     "${NVME_ROOT}/snapshots"
     "${NVME_ROOT}/snapshots/versions"
     "${NVME_ROOT}/backups"
+    "${NVME_ROOT}/intake"
     "${CONFIG_DIR}"
     "/run/cu-rates-web"
     "/run/cu-rates-worker"
@@ -216,6 +217,10 @@ run_action "verify independent directory '${INDEPENDENT_DIR}' is not owned by se
 run_action "set 0750 permissions on data and backup directories" \
     chmod 0750 "${NVME_ROOT}/data" "${NVME_ROOT}/backups"
 
+# The correction inbox directory must be private (the store refuses a group/world-writable parent)
+run_action "set 0700 permissions on the correction inbox directory" \
+    chmod 0700 "${NVME_ROOT}/intake"
+
 # Artifact storage must be mode 0700 (ArtifactStore strictly rejects group/other access)
 run_action "set 0700 permissions on artifact storage directory" \
     chmod 0700 "${NVME_ROOT}/artifacts"
@@ -253,6 +258,8 @@ UNITS=(
     "cu-rates-backup.timer"
     "cu-rates-health.service"
     "cu-rates-health.timer"
+    "cu-rates-intake-purge.service"
+    "cu-rates-intake-purge.timer"
 )
 
 for unit in "${UNITS[@]}"; do
@@ -323,6 +330,7 @@ if [[ "${APPLY}" -eq 1 ]]; then
     echo "5. Start web service: sudo systemctl start cu-rates-web.service"
     echo "6. Note: Worker service and timer remain STOPPED, DISABLED, and MASKED per MASTER.md D-15 and D-17."
     echo "7. Enable scheduled operations (backup and health timers): sudo systemctl enable --now cu-rates-backup.timer cu-rates-health.timer"
+    echo "8. Correction inbox: assign a person to monitor it, run 'sudo -u cu-rates ${NVME_ROOT}/venv/bin/python -m cu_rates.intake --db ${NVME_ROOT}/intake/intake.sqlite init', set INTAKE_DB in ${ENV_FILE}, restart cu-rates-web, then sudo systemctl enable --now cu-rates-intake-purge.timer"
 else
     echo "=== Dry-Run Complete ==="
     echo "No filesystem, user, or service changes were made."

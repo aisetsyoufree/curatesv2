@@ -14,7 +14,10 @@ http://cu-rates.org:8080 {
     reverse_proxy 127.0.0.1:18200 {
         header_up Host {host}
         # CF-Connecting-IP provided by Cloudflare is forwarded as an opaque header only.
-        # The application must NOT trust CF-Connecting-IP or forwarded headers for security decisions.
+        # The application must NOT trust CF-Connecting-IP or forwarded headers for security
+        # decisions. The single exception is the correction form's courtesy rate limit
+        # (src/cu_rates/web/views.py _client_key): a forged value there can only change which
+        # bucket a request is counted in, never grant access to anything.
         header_up CF-Connecting-IP {header.CF-Connecting-IP}
         header_up X-Forwarded-Proto https
     }
