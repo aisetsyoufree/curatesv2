@@ -11,7 +11,7 @@ from hashlib import sha256
 from pathlib import Path
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import event, select, update
 
 from cu_rates.artifact_store import ArtifactStore
 from cu_rates.contracts.audit import WithdrawalEntry
@@ -872,3 +872,143 @@ def test_stale_inactive_roster_cannot_change_identity_or_suppress_snapshot(
     assert row.status == "active"
     assert row.charter_verified == 1
     assert {o.institution_charter for o in reader.read(at=_MOMENT).offers} == {CHARTER}
+
+
+@pytest.mark.parametrize(
+    "failure_table", ["roster_imports", "roster_import_entries", "withdrawal_entries"]
+)
+@pytest.mark.parametrize("offer_position", range(4))
+def test_entire_batch_is_suppressed_before_any_db_write_failure(
+    stored: StoredFixture,
+    public_snapshot: tuple[SnapshotReader, Denylist],
+    failure_table: str,
+    offer_position: int,
+) -> None:
+    reader, denylist = public_snapshot
+    charters = [61001, 61002, 61003]
+    charters.insert(offer_position, CHARTER)
+    for charter in charters:
+        if charter != CHARTER:
+            stored.conn.execute(
+                institutions.insert().values(
+                    charter_number=charter,
+                    schema_version="1.0",
+                    legal_name=f"Synthetic Charter {charter}",
+                    status="active",
+                    charter_verified=1,
+                )
+            )
+    statuses = [("Merged", "60002"), ("Liquidated", ""), ("Converted", ""), ("Merged", "bogus")]
+    csv = (
+        _HEADER
+        + "".join(
+            f"{charter},Synthetic Charter {charter},MA,{status},Boston,"
+            f"{'2026-11-15' if status != 'Converted' else ''},{successor},2026-11-16\n"
+            for charter, (status, successor) in zip(charters, statuses, strict=True)
+        )
+        + "60002,Successor CU,MA,Active,Cambridge,,,2026-11-16\n"
+        + "61004,New Synthetic Charter,MA,Converted,Boston,,,2026-11-16\n"
+    ).encode()
+    required_charters = {*charters, 61004}
+    expected = frozenset(("institution", str(charter)) for charter in required_charters)
+    before = {
+        table.name: stored.conn.execute(select(table)).all()
+        for table in (institutions, roster_imports, roster_import_entries, withdrawal_entries)
+    }
+    observed: list[tuple[frozenset[tuple[str, str]], tuple[int, ...]]] = []
+
+    def fail_insert(
+        conn: object,
+        cursor: object,
+        statement: str,
+        parameters: object,
+        context: object,
+        executemany: bool,
+    ) -> None:
+        if statement.lower().startswith(("insert into ", "update ", "delete from ")):
+            observed.append(
+                (
+                    denylist.active_targets(_MOMENT),
+                    tuple(o.institution_charter for o in reader.read(at=_MOMENT).offers),
+                )
+            )
+        if statement.lower().startswith("insert into " + failure_table + " "):
+            raise RuntimeError("injected batch DB failure")
+
+    event.listen(stored.conn, "before_cursor_execute", fail_insert)
+    try:
+        with pytest.raises(RuntimeError, match="injected batch DB failure"):
+            _snapshot_import(stored, denylist, csv)
+    finally:
+        event.remove(stored.conn, "before_cursor_execute", fail_insert)
+    # Check every DB mutation through the failing insert, not just exception cleanup.
+    assert observed
+    assert all(state == (expected, ()) for state in observed)
+    assert denylist.active_targets(_MOMENT) == expected
+    assert reader.read(at=_MOMENT).offers == ()
+    for table in (institutions, roster_imports, roster_import_entries, withdrawal_entries):
+        assert stored.conn.execute(select(table)).all() == before[table.name]
+    ledger = denylist.path.read_bytes()
+    report = _snapshot_import(stored, denylist, csv, moment=_MOMENT + timedelta(seconds=1))
+    assert set(report.suppressed_charters) == required_charters
+    assert denylist.path.read_bytes() == ledger
+    assert len(stored.conn.execute(select(withdrawal_entries)).all()) == len(required_charters)
+
+
+@pytest.mark.parametrize("status", ["Merged", "Liquidated", "Converted"])
+@pytest.mark.parametrize("exact_replay", [True, False])
+def test_replay_after_recorded_human_lift_preserves_restoration(
+    stored: StoredFixture,
+    public_snapshot: tuple[SnapshotReader, Denylist],
+    status: str,
+    exact_replay: bool,
+) -> None:
+    reader, denylist = public_snapshot
+    successor = "60002" if status == "Merged" else ""
+    csv = _snapshot_roster(status, successor=successor)
+    first = _snapshot_import(stored, denylist, csv)
+    (entry,) = denylist.entries()
+    later = _MOMENT + timedelta(minutes=1)
+    stored.conn.execute(
+        withdrawal_lifts.insert().values(
+            withdrawal_id=entry.withdrawal_id, lifted_at=later, lifted_by="human-reviewer"
+        )
+    )
+    denylist.lift(entry.withdrawal_id, at=later, actor="human-reviewer")
+    stored.conn.execute(
+        update(institutions)
+        .where(institutions.c.charter_number == CHARTER)
+        .values(status="active", successor_charter_number=None, charter_verified=1)
+    )
+    tables = (
+        institutions,
+        roster_imports,
+        roster_import_entries,
+        withdrawal_entries,
+        withdrawal_lifts,
+    )
+    before = {table.name: stored.conn.execute(select(table)).all() for table in tables}
+    ledger = denylist.path.read_bytes()
+    assert {o.institution_charter for o in reader.read(at=later).offers} == {CHARTER}
+    if not exact_replay:
+        csv = _snapshot_roster(status, successor=successor, as_of="2026-11-17")
+    report = _snapshot_import(stored, denylist, csv, moment=later)
+    verified = stored.conn.execute(
+        select(institutions.c.charter_verified).where(institutions.c.charter_number == CHARTER)
+    ).scalar_one()
+    if exact_replay:
+        assert report.is_noop
+        assert report.import_id == first.import_id
+        assert report.suppressed_charters == report.review_charters == ()
+        assert verified == 1
+        assert denylist.path.read_bytes() == ledger
+        assert {o.institution_charter for o in reader.read(at=later).offers} == {CHARTER}
+        for table in tables:
+            assert stored.conn.execute(select(table)).all() == before[table.name]
+    else:
+        # A lift of old evidence must not exempt a fresh inactivity report.
+        assert not report.is_noop
+        assert report.suppressed_charters == report.review_charters == (CHARTER,)
+        assert verified == 0
+        assert reader.read(at=later).offers == ()
+        assert len(denylist.entries()) == 2

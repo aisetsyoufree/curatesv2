@@ -312,6 +312,39 @@ class RosterImporter:
             ).all()
         }
 
+        inserted: list[int] = []
+        updated: list[int] = []
+        unchanged: list[int] = []
+        mergers: list[int] = []
+        closures: list[int] = []
+        review: list[int] = []
+        stale: list[int] = []
+        suppressed: list[int] = []
+        clean: set[int] = set()
+
+        # Inactivity is credible independently of successor identity. Persist the
+        # entire batch's independent protection before ANY operational DB mutation:
+        # even the first roster/withdrawal insert may fail. Stale reports retain
+        # their existing no-change guard.
+        suppressions: dict[int, WithdrawalEntry] = {}
+        valid_charters = {inst.charter_number for inst, _ in parsed.valid_rows}
+        if not stale_file:
+            for charter, row in parsed.inactive_rows.items():
+                if row.source_as_of_date < stored_dates.get(charter, row.source_as_of_date):
+                    continue
+                known = conn.execute(
+                    select(institutions.c.charter_number).where(
+                        institutions.c.charter_number == charter
+                    )
+                ).first()
+                if known is None and charter not in valid_charters:
+                    continue
+                entry = self._prepare_suppression(charter, row.status, artifact_id, now)
+                if entry is not None:
+                    suppressions[charter] = entry
+
+        # All DB changes share the import's transaction/savepoint. Independent
+        # suppression deliberately survives rollback so existing snapshots stay safe.
         if existing is None:
             conn.execute(
                 insert(roster_imports).values(
@@ -326,39 +359,16 @@ class RosterImporter:
                 )
             )
 
-        inserted: list[int] = []
-        updated: list[int] = []
-        unchanged: list[int] = []
-        mergers: list[int] = []
-        closures: list[int] = []
-        review: list[int] = []
-        stale: list[int] = []
-        suppressed: list[int] = []
-        clean: set[int] = set()
-
-        # Inactivity is credible independently of successor identity. Reconcile it
-        # before applying (or rejecting) identity changes, including legacy rows and
-        # exact artifact replays. Stale reports retain their existing no-change guard.
-        valid_charters = {inst.charter_number for inst, _ in parsed.valid_rows}
-        if not stale_file:
-            for charter, row in parsed.inactive_rows.items():
-                if row.source_as_of_date < stored_dates.get(charter, row.source_as_of_date):
-                    continue
-                known = conn.execute(
-                    select(institutions.c.charter_number).where(
-                        institutions.c.charter_number == charter
-                    )
-                ).first()
-                if known is None and charter not in valid_charters:
-                    continue
-                self._suppress(conn, charter, row.status, artifact_id, now)
-                conn.execute(
-                    update(institutions)
-                    .where(institutions.c.charter_number == charter)
-                    .values(charter_verified=0)
-                )
-                suppressed.append(charter)
-                review.append(charter)
+        for charter, entry in suppressions.items():
+            assert self._denylist is not None  # Required by _prepare_suppression.
+            insert_withdrawal(conn, entry, denylist=self._denylist)
+            conn.execute(
+                update(institutions)
+                .where(institutions.c.charter_number == charter)
+                .values(charter_verified=0)
+            )
+            suppressed.append(charter)
+            review.append(charter)
 
         if existing is not None:
             return replace(
@@ -476,14 +486,13 @@ class RosterImporter:
             errors=parsed.errors,
         )
 
-    def _suppress(
+    def _prepare_suppression(
         self,
-        conn: Connection,
         charter: int,
         status: InstitutionStatus,
         artifact_id: str,
         now: datetime,
-    ) -> None:
+    ) -> WithdrawalEntry | None:
         if self._denylist is None:
             raise ValueError("a denylist is required to import a merger or closure")
         withdrawal_id = f"roster-{artifact_id}.suppress.{charter}"
@@ -491,6 +500,10 @@ class RosterImporter:
         # A retry must reuse every immutable field, especially the original time.
         # An existing unlifted suppression also covers a newer roster artifact.
         entry = next((e for e in entries if e.withdrawal_id == withdrawal_id), None)
+        if entry is not None and entry.lifted_at is not None:
+            # A human already reconciled this exact evidence. Replaying it must
+            # neither re-suppress the institution nor clear its verification.
+            return None
         if entry is None:
             entry = next(
                 (
@@ -516,7 +529,8 @@ class RosterImporter:
                     f"in roster artifact {artifact_id}"
                 ),
             )
-        insert_withdrawal(conn, entry, denylist=self._denylist)
+        self._denylist.withdraw(entry)
+        return entry
 
     def _existing_import(
         self,
