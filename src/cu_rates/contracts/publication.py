@@ -992,7 +992,13 @@ def corroborated_paths(offer: NormalizedOffer, ctx: PublicationContext) -> tuple
                 for p in ctx.evidence_paths
                 if p.path == path and p.value == value and not _path_reasons(p, offer, ctx)
             ),
-            key=lambda p: (p.observed_at, p.capture_id, p.artifact_id, p.content_sha256),
+            key=lambda p: (
+                p.observed_at,
+                p.capture_id,
+                p.artifact_id,
+                p.content_sha256,
+                p.model_dump_json(),  # total order: ties can never fall back to input order
+            ),
         )
         for i, first in enumerate(paths):
             second = next((p for p in paths[i + 1 :] if not _pair_reasons(first, p)), None)
