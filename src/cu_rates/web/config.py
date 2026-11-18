@@ -85,6 +85,15 @@ def validated_config(values: Mapping[str, Any]) -> dict[str, Any]:
             or ".." in PurePosixPath(value).parts
         ):
             raise ValueError(f"{key} must be an absolute path without whitespace or traversal")
+    # Public reads need the snapshot and BOTH withdrawal ledgers. The worker's own blocks live
+    # in the automatic ledger, so a partial configuration (including an env file that predates
+    # it) would silently show offers that were told to be suppressed. Applies to every path
+    # into the app: environment and create_app(dict) alike.
+    paths = ("SNAPSHOT_ROOT", "DENYLIST_PATH", "AUTOMATIC_DENYLIST_PATH")
+    if any(config[key] is not None for key in paths) and any(config[key] is None for key in paths):
+        raise ValueError(
+            "SNAPSHOT_ROOT, DENYLIST_PATH and AUTOMATIC_DENYLIST_PATH must be set together"
+        )
     return config
 
 
@@ -102,9 +111,4 @@ def config_from_environment(environ: Mapping[str, str] | None = None) -> dict[st
             values[key] = value == "1"
         else:
             values[key] = value
-    if values.get("DENYLIST_PATH") is not None and values.get("AUTOMATIC_DENYLIST_PATH") is None:
-        # The worker's own blocks live in the automatic ledger. A deployment (such as one that
-        # predates it, whose env file the installer never overwrites) that sets only the
-        # operator ledger would silently show offers the worker was told to suppress.
-        raise ValueError("AUTOMATIC_DENYLIST_PATH must be set whenever DENYLIST_PATH is set")
     return validated_config(values)

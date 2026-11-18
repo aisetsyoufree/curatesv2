@@ -119,10 +119,13 @@ def test_the_health_check_enforces_the_same_ledgers_as_the_site(env, tmp_path: P
 
 
 def test_the_web_setting_must_be_an_absolute_normalized_path() -> None:
-    assert validated_config({"AUTOMATIC_DENYLIST_PATH": "/var/lib/cu-rates/automatic/d.json"})
+    trio = {"SNAPSHOT_ROOT": "/s", "DENYLIST_PATH": "/o/d.json"}
+    assert validated_config(
+        trio | {"AUTOMATIC_DENYLIST_PATH": "/var/lib/cu-rates/automatic/d.json"}
+    )
     for bad in ("relative.json", "/x/../y.json", "//host/x", ""):
         with pytest.raises(ValueError, match="AUTOMATIC_DENYLIST_PATH"):
-            validated_config({"AUTOMATIC_DENYLIST_PATH": bad})
+            validated_config(trio | {"AUTOMATIC_DENYLIST_PATH": bad})
 
 
 def test_the_production_environment_requires_both_ledgers_together(
@@ -131,12 +134,26 @@ def test_the_production_environment_requires_both_ledgers_together(
     """Review MEDIUM: an env file that predates the automatic ledger must not silently ignore it."""
     from cu_rates.web.config import config_from_environment
 
-    only_operator = {"DENYLIST_PATH": "/var/lib/cu-rates/independent/denylist.json"}
-    with pytest.raises(ValueError, match="AUTOMATIC_DENYLIST_PATH must be set"):
+    only_operator = {"DENYLIST_PATH": "/var/lib/cu-rates/independent/denylist.json"}  # no snapshot
+    with pytest.raises(ValueError, match="must be set together"):
         config_from_environment(only_operator)
-    both = only_operator | {"AUTOMATIC_DENYLIST_PATH": "/var/lib/cu-rates/automatic/denylist.json"}
+    both = only_operator | {
+        "SNAPSHOT_ROOT": "/s",
+        "AUTOMATIC_DENYLIST_PATH": "/var/lib/cu-rates/automatic/denylist.json",
+    }
     assert config_from_environment(both)["AUTOMATIC_DENYLIST_PATH"]
     assert config_from_environment({})["AUTOMATIC_DENYLIST_PATH"] is None  # nothing configured
+    # A8: a snapshot root alone, or via create_app(dict), must not silently skip a ledger.
+    from cu_rates.web.config import validated_config as check
+
+    for partial in (
+        {"SNAPSHOT_ROOT": "/var/lib/cu-rates/snapshots"},
+        {"SNAPSHOT_ROOT": "/s", "DENYLIST_PATH": "/o/d.json"},
+        {"SNAPSHOT_ROOT": "/s", "AUTOMATIC_DENYLIST_PATH": "/a/d.json"},
+    ):
+        with pytest.raises(ValueError, match="must be set together"):
+            check(partial)
+    assert check({"SNAPSHOT_ROOT": "/s", "DENYLIST_PATH": "/o", "AUTOMATIC_DENYLIST_PATH": "/a"})
 
 
 def test_the_public_site_enforces_the_automatic_ledger_end_to_end(env, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
