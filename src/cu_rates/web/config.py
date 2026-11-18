@@ -102,4 +102,9 @@ def config_from_environment(environ: Mapping[str, str] | None = None) -> dict[st
             values[key] = value == "1"
         else:
             values[key] = value
+    if values.get("DENYLIST_PATH") is not None and values.get("AUTOMATIC_DENYLIST_PATH") is None:
+        # The worker's own blocks live in the automatic ledger. A deployment (such as one that
+        # predates it, whose env file the installer never overwrites) that sets only the
+        # operator ledger would silently show offers the worker was told to suppress.
+        raise ValueError("AUTOMATIC_DENYLIST_PATH must be set whenever DENYLIST_PATH is set")
     return validated_config(values)

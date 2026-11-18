@@ -659,7 +659,7 @@ def run_fixture(
     terms = TermsLedger(root / "private" / "terms.json")
     terms.initialize()
     terms.record(_terms(approval), denylist=denylist)
-    registry = FetchRegistry(database, terms, denylist)
+    registry = FetchRegistry(database, terms, denylist, automatic=None)
     worker = _worker(
         root,
         store,

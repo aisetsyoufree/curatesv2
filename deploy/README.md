@@ -299,7 +299,15 @@ The independent denylist above is **operator-owned**: the collection worker can 
 sudo -u cu-rates /var/lib/cu-rates/venv/bin/python -c "from pathlib import Path; from cu_rates.snapshot import Denylist; Denylist(Path('/var/lib/cu-rates/automatic/denylist.json')).initialize()"
 ```
 
-Only an operator lifts an automatic suppression (the same `Denylist.lift`, run on that file). The health check reads both ledgers.
+Only an operator lifts an automatic suppression, **as the service user** (running it as root would leave the ledger root-owned, unreadable by the site, and every public read would then fail closed):
+
+```bash
+sudo -u cu-rates /var/lib/cu-rates/venv/bin/python -c "from datetime import UTC, datetime; from pathlib import Path; from cu_rates.snapshot import Denylist; Denylist(Path('/var/lib/cu-rates/automatic/denylist.json')).lift('<withdrawal id>', at=datetime.now(UTC), actor='<your name>')"
+```
+
+The health check reads both ledgers.
+
+**Upgrading an existing install.** The installer never overwrites `/etc/cu-rates/cu-rates.env`, so add `AUTOMATIC_DENYLIST_PATH=/var/lib/cu-rates/automatic/denylist.json` to it yourself (after creating the ledger as above, and after re-running the installer so the directory and units exist) and restart `cu-rates-web`. The web service refuses to start if `DENYLIST_PATH` is set without it, rather than silently ignoring the worker's blocks.
 
 ### Emergency Withdrawal Denylist
 The web application enforces the configured `DENYLIST_PATH` through `SnapshotReader` on each read. An uninitialized, missing, or invalid `denylist.json` fails closed and suppresses offers.

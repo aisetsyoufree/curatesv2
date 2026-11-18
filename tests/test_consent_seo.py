@@ -476,6 +476,7 @@ def test_env_entrypoint_wiring_and_explicit_config_isolation(
         "ADS_ENABLED": "1",
         "SNAPSHOT_ROOT": comparison_config["SNAPSHOT_ROOT"],
         "DENYLIST_PATH": comparison_config["DENYLIST_PATH"],
+        "AUTOMATIC_DENYLIST_PATH": comparison_config["DENYLIST_PATH"],  # the pair is required
     }
     for key, value in settings.items():
         monkeypatch.setenv(key, value)

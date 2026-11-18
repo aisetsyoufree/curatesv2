@@ -218,6 +218,24 @@ def _retry_after(headers: httpx.Headers, now: float) -> float:
     return 0
 
 
+_PROCESS_TOKEN = f"process-{uuid4().hex}"
+_BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
+
+
+def _read_boot_id() -> str:
+    """Identity of the current boot: the Linux boot id, else a token for this process.
+
+    A process cannot outlive a reboot, so where the platform offers no boot id the fallback is
+    conservative: ticks persisted by a DIFFERENT process are not trusted (they may belong to an
+    earlier boot), but ticks written by this process, or by workers sharing it, are.
+    """
+    try:
+        text = _BOOT_ID_PATH.read_text(encoding="ascii").strip()
+    except OSError:
+        return _PROCESS_TOKEN
+    return text or _PROCESS_TOKEN
+
+
 def _is_challenge(response: _Response) -> bool:
     head = response.body[:_CHALLENGE_PREFIX_BYTES].lower()
     return (
@@ -264,6 +282,7 @@ class FetchWorker:
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
         resolve: Resolver | None = None,
+        boot_id: Callable[[], str] | None = None,
     ) -> None:
         if not re.fullmatch(r"[0-9a-f]{40}", git_sha):
             raise ValueError("invalid Git revision")
@@ -274,6 +293,8 @@ class FetchWorker:
         self._root, self._store, self._transport = root, store, transport
         self._git_sha, self._clock, self._sleep = git_sha, clock, sleep
         self._monotonic = monotonic
+        # Which boot the persisted monotonic ticks belong to.
+        self._boot_id = boot_id if boot_id is not None else _read_boot_id
         self._resolve = resolve if resolve is not None else _resolution_disabled
         self._registry = registry
 
@@ -301,11 +322,32 @@ class FetchWorker:
                 db.execute("PRAGMA synchronous=FULL")
                 db.execute("CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT)")
                 db.execute("CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, value TEXT)")
+                self._scope_ticks_to_this_boot(db)
                 yield db
             finally:
                 db.close()
         finally:
             os.close(fd)
+
+    def _scope_ticks_to_this_boot(self, db: sqlite3.Connection) -> None:
+        """Monotonic ticks only mean something within one boot.
+
+        The monotonic clock restarts after a reboot, so a tick persisted by a long-running
+        previous boot would look like a deadline far in the future and block collection until
+        the new uptime caught up. When the boot identity differs, the tick state is discarded
+        (a new process on a platform without a boot id counts as a new boot). The wall-clock
+        deadlines (spacing, Retry-After, pressure, schedule) are kept, so politeness still
+        survives a restart.
+        """
+        current = self._boot_id()
+        if self._get(db, "boot-id") == current:
+            return
+        db.execute(
+            "DELETE FROM state WHERE key IN ('next-tick', 'pressure-tick') "
+            "OR key LIKE 'tick:%' OR key LIKE 'defer-tick:%' OR key LIKE 'scheduled-tick:%' "
+            "OR key LIKE 'robots:%'"  # cached robots carry a tick too: refetch rather than trust it
+        )
+        self._set(db, "boot-id", current)
 
     @staticmethod
     def _get(db: sqlite3.Connection, key: str) -> str | None:

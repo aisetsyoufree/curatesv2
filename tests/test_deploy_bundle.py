@@ -1587,7 +1587,8 @@ def test_automatic_suppression_ledger_is_worker_writable_and_never_the_operator_
     paths = {
         name: (
             set(" ".join(unit.get("ReadWritePaths", [])).split()),
-            set(" ".join(unit.get("ReadOnlyPaths", [])).split()),
+            # A leading "-" only means "do not fail if the directory is absent".
+            {p.removeprefix("-") for p in " ".join(unit.get("ReadOnlyPaths", [])).split()},
         )
         for name, unit in (("worker", worker), ("web", web), ("health", health))
     }

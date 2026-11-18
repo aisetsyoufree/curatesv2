@@ -117,12 +117,15 @@ class FetchRegistry:
         terms: TermsLedger,
         denylist: Denylist,
         *,
-        automatic: Denylist | None = None,
+        automatic: Denylist | None,
     ) -> None:
         self.database = database.absolute()
         self.terms = terms
         self.denylist = denylist  # operator-owned: read here, never written by the worker
-        self.automatic = automatic  # worker-owned: where the worker records its own blocks
+        # Worker-owned: where the worker records its own blocks. Passing None is an explicit
+        # choice to use the single ledger (offline tests and the fixture slice only); a
+        # production worker must pass its own, because the operator ledger is read-only to it.
+        self.automatic = automatic
 
     @property
     def suppression(self) -> Denylist:

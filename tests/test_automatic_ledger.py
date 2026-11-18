@@ -123,3 +123,44 @@ def test_the_web_setting_must_be_an_absolute_normalized_path() -> None:
     for bad in ("relative.json", "/x/../y.json", "//host/x", ""):
         with pytest.raises(ValueError, match="AUTOMATIC_DENYLIST_PATH"):
             validated_config({"AUTOMATIC_DENYLIST_PATH": bad})
+
+
+def test_the_production_environment_requires_both_ledgers_together(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review MEDIUM: an env file that predates the automatic ledger must not silently ignore it."""
+    from cu_rates.web.config import config_from_environment
+
+    only_operator = {"DENYLIST_PATH": "/var/lib/cu-rates/independent/denylist.json"}
+    with pytest.raises(ValueError, match="AUTOMATIC_DENYLIST_PATH must be set"):
+        config_from_environment(only_operator)
+    both = only_operator | {"AUTOMATIC_DENYLIST_PATH": "/var/lib/cu-rates/automatic/denylist.json"}
+    assert config_from_environment(both)["AUTOMATIC_DENYLIST_PATH"]
+    assert config_from_environment({})["AUTOMATIC_DENYLIST_PATH"] is None  # nothing configured
+
+
+def test_the_public_site_enforces_the_automatic_ledger_end_to_end(env, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    """Review LOW: through create_app, not just the reader class."""
+    from shutil import copytree
+
+    from cu_rates.web.app import create_app
+
+    publisher, operator, automatic, _reader, item = env
+    root = tmp_path / "snapshots"  # the web config forbids whitespace in paths
+    copytree(publisher.root, root)
+    moment = _BIRTH + timedelta(minutes=1)
+    app = create_app(
+        {
+            "SNAPSHOT_ROOT": str(root),
+            "DENYLIST_PATH": str(operator.path),
+            "AUTOMATIC_DENYLIST_PATH": str(automatic.path),
+            "SNAPSHOT_CLOCK": moment,
+        }
+    )
+    client = app.test_client()
+    name = item.context.institution.legal_name
+    assert name in client.get("/compare").get_data(as_text=True)
+    automatic.withdraw(_entry(WithdrawalScope.SOURCE, item.offer.source_id, moment))
+    assert name not in client.get("/compare").get_data(as_text=True)
+    automatic.path.write_text("{not json")  # invalid: fail closed, nothing shown
+    assert name not in client.get("/compare").get_data(as_text=True)
