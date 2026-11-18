@@ -70,7 +70,11 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
         )
         if response.mimetype == "text/html":
             response.headers["Cache-Control"] = "no-cache, must-revalidate"
-            if analytics_ready() or request.endpoint == "web.analytics_consent":
+            if analytics_ready() or request.endpoint in {
+                "web.analytics_consent",
+                "web.corrections",
+                "web.corrections_submit",
+            }:
                 response.headers["Cache-Control"] = "private, no-store"
                 response.vary.add("Cookie")
         return response

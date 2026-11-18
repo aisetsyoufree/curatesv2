@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+
+{% block content %}
+<article>
+  <h1>Report a Correction or Problem</h1>
+
+  <section class="card" aria-labelledby="before-heading">
+    <h2 id="before-heading">Before you write</h2>
+    <p>If something on this site looks wrong, tell us. We check every credible report against the credit union's own published information, and we may remove a value while we check.</p>
+    <p><strong>Please do not send applications, account numbers, Social Security numbers, financial records, or any other personal data.</strong> We do not need them and we do not want them. If personal data arrives anyway, we remove it from our working records.</p>
+    <ul>
+      <li><strong>What we do with it:</strong> your report is stored as a case. We aim to look at a credible report about a rate, a wrong credit union or product, privacy, or security within one business day, and other reports within five business days. These are targets, not promises, and we are not a lender: we cannot change your loan, quote you a rate, or contact a credit union for you.</li>
+      <li><strong>Corrections need a source:</strong> we change a published value only when the credit union's own published information supports it. A report on its own is never treated as a source.</li>
+      <li><strong>Your reply address is optional.</strong> If you give one, it is used only to reply to this report, is kept apart from the case record, is never sent to a credit union or vendor without your permission, and is deleted 90 days after the case is resolved. We do not use it for marketing.</li>
+    </ul>
+  </section>
+
+  <section class="card" aria-labelledby="form-heading">
+    <h2 id="form-heading">Send a report</h2>
+    {% if not form_open %}
+    <p role="status">Online reports are not open yet. This form will be available before any rates are published.</p>
+    {% else %}
+    {% if error %}<p role="alert"><strong>We could not accept that:</strong> {{ error }}</p>{% endif %}
+    <form method="post" action="{{ url_for('web.corrections_submit') }}" accept-charset="utf-8">
+      <p>
+        <label for="category">Who are you?</label><br>
+        <select id="category" name="category" required>
+          {% for value, label in categories %}<option value="{{ value }}"{% if values.get('category') == value %} selected{% endif %}>{{ label|capitalize }}</option>{% endfor %}
+        </select>
+      </p>
+      <p>
+        <label for="kind">What is the report about?</label><br>
+        <select id="kind" name="kind" required>
+          {% for value, label in kinds %}<option value="{{ value }}"{% if values.get('kind') == value %} selected{% endif %}>{{ label }}</option>{% endfor %}
+        </select>
+      </p>
+      <p>
+        <label for="url">Address of the page with the problem</label><br>
+        <input id="url" name="url" type="url" maxlength="2000" required value="{{ values.get('url', '') }}">
+      </p>
+      <p>
+        <label for="field">Which value or section? (for example APR or points)</label><br>
+        <input id="field" name="field" type="text" maxlength="200" value="{{ values.get('field', '') }}">
+      </p>
+      <p>
+        <label for="reason">What is wrong, and how do you know?</label><br>
+        <textarea id="reason" name="reason" rows="6" maxlength="2000" required>{{ values.get('reason', '') }}</textarea>
+      </p>
+      <p>
+        <label for="evidence">Address of a page that shows the correct information (optional)</label><br>
+        <input id="evidence" name="evidence" type="url" maxlength="2000" value="{{ values.get('evidence', '') }}">
+      </p>
+      <p>
+        <label for="contact">Email address for a reply (optional)</label><br>
+        <input id="contact" name="contact" type="email" maxlength="254" autocomplete="off">
+      </p>
+      <p class="visually-hidden" aria-hidden="true">
+        <label for="website">Leave this field empty</label>
+        <input id="website" name="website" type="text" tabindex="-1" autocomplete="off">
+      </p>
+      <button class="control-button" type="submit">Send report</button>
+    </form>
+    <noscript><p>The form works without JavaScript.</p></noscript>
+    {% endif %}
+  </section>
+</article>
+{% endblock %}

@@ -375,6 +375,7 @@ def test_robots_txt_and_sitemap_xml(client: FlaskClient) -> None:
         "https://cu-rates.org/",
         "https://cu-rates.org/methodology",
         "https://cu-rates.org/privacy",
+        "https://cu-rates.org/corrections",
     ]
     assert sitemap_urls == expected_urls
     # 404 and unverified paths must not appear

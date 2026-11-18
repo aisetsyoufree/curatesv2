@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+
+{% block content %}
+<article>
+  <h1>Thank you: your report was received</h1>
+  <section class="card" aria-labelledby="received-heading">
+    <h2 id="received-heading">What happens next</h2>
+    <p>We look at credible reports about a rate, a wrong credit union or product, privacy, or security within one business day, and other reports within five business days. We may remove a value while we check it. We may not be able to reply to every report.</p>
+    <p>Your reference, if you ever need to quote it: <code>{{ reference }}</code></p>
+    <p>Please do not send further personal details. <a href="{{ url_for('web.corrections') }}">Send another report</a> or return to the <a href="{{ url_for('web.home') }}">home page</a>.</p>
+  </section>
+</article>
+{% endblock %}

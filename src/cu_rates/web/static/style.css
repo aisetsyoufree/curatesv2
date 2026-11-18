@@ -577,3 +577,12 @@ li {
   text-align: center;
   background: var(--color-surface-alt);
 }
+
+/* Honeypot field for the corrections form: off-screen for everyone, so only automation fills it. */
+.visually-hidden {
+  position: absolute;
+  left: -10000px;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+}

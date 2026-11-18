@@ -52,6 +52,7 @@ DEFAULTS: dict[str, Any] = {
     "CANONICAL_ORIGIN": "https://cu-rates.org",
     "SNAPSHOT_ROOT": None,
     "DENYLIST_PATH": None,
+    "INTAKE_DB": None,
     "SNAPSHOT_CLOCK": None,
 }
 _GA_ID = re.compile(r"G-[A-Z0-9]{10}")
@@ -72,7 +73,7 @@ def validated_config(values: Mapping[str, Any]) -> dict[str, Any]:
     ):
         raise ValueError("GA_MEASUREMENT_ID must match G-XXXXXXXXXX (uppercase letters/digits)")
     config["GA_MEASUREMENT_ID"] = measurement_id
-    for key in ("SNAPSHOT_ROOT", "DENYLIST_PATH"):
+    for key in ("SNAPSHOT_ROOT", "DENYLIST_PATH", "INTAKE_DB"):
         value = config[key]
         if value is not None and (
             not isinstance(value, str)

@@ -1,6 +1,11 @@
 """Web views for CU-Rates.org."""
 
+import secrets
+import time
+from collections import deque
+from collections.abc import Mapping
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, TypedDict
 
 from flask import (
@@ -14,6 +19,7 @@ from flask import (
 )
 
 from cu_rates.contracts.enums import ProductFamily
+from cu_rates.intake import IntakeError, IntakeStore, NewCase, ReporterCategory, ReportKind
 from cu_rates.web.comparison import (
     ALLOWED_PARAMS,
     ALLOWED_SCENARIOS,
@@ -132,6 +138,12 @@ _PAGE_META: dict[str, tuple[str, str, tuple[tuple[str, str], ...]]] = {
         "An educational directory of publicly advertised Massachusetts credit union "
         "residential lending terms. Not a lender and not personalized financial advice.",
         (("Home", "/"),),
+    ),
+    "web.corrections": (
+        "Report a Correction or Problem",
+        "How to tell CU-Rates.org that a rate, credit union, or product shown here is wrong, "
+        "and what happens to your report. Please do not send personal or account details.",
+        (("Home", "/"), ("Report a Correction or Problem", "/corrections")),
     ),
     "web.methodology": (
         "Methodology and Comparison Principles",
@@ -290,6 +302,129 @@ def analytics_consent() -> Response:
     response.headers["Cache-Control"] = "private, no-store"
     response.headers["X-Robots-Tag"] = "noindex, follow"
     return response
+
+
+# -- Public corrections ----------------------------------------------------------------------
+# The route can only ADD a case to its own small private store (INTAKE_DB). It never opens the
+# operational database, the artifact store or the snapshot. No sessions and no cookies: the
+# only CSRF defence needed is the same Origin check the consent form uses.
+CORRECTIONS_MAX_BODY = 16 * 1024
+CORRECTIONS_PER_HOUR = 30
+_CORRECTION_FIELDS = frozenset(
+    {"category", "kind", "url", "field", "reason", "evidence", "contact", "website"}
+)
+
+
+def _correction_response(html: str, status: int = 200) -> Response:
+    response = current_app.response_class(html, status=status)
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["X-Robots-Tag"] = "noindex, follow"
+    return response
+
+
+def _render_corrections(
+    *, error: str | None = None, values: Mapping[str, str] | None = None, status: int = 200
+) -> Response:
+    html = render_template(
+        "corrections.html",
+        form_open=current_app.config["INTAKE_DB"] is not None,
+        error=error,
+        values=values or {},
+        categories=[(c.value, c.value.replace("_", " ")) for c in ReporterCategory],
+        kinds=[(k.value, _KIND_LABELS[k]) for k in ReportKind],
+    )
+    return _correction_response(html, status)
+
+
+_KIND_LABELS = {
+    ReportKind.RATE: "A rate, APR, points or fee looks wrong or out of date",
+    ReportKind.IDENTITY: "The credit union or product shown is wrong",
+    ReportKind.PRIVACY: "A privacy concern",
+    ReportKind.SECURITY: "A security concern with this website",
+    ReportKind.OTHER: "Something else",
+}
+
+
+@web_bp.get("/corrections")
+def corrections() -> Response:
+    """Explain how to report a problem and show the form (when intake is configured)."""
+    return _render_corrections()
+
+
+def _allow_submission() -> bool:
+    """Process-wide cap: an unmonitored form must not be able to flood the inbox or disk."""
+    recent: deque[float] = current_app.extensions.setdefault("corrections_submissions", deque())
+    now = time.monotonic()
+    while recent and now - recent[0] > 3600:
+        recent.popleft()
+    if len(recent) >= CORRECTIONS_PER_HOUR:
+        return False
+    recent.append(now)
+    return True
+
+
+@web_bp.post("/corrections")
+def corrections_submit() -> Response:
+    """Accept one correction report. Never echoes or logs the reporter's contact address."""
+    db = current_app.config["INTAKE_DB"]
+    if db is None:
+        return _render_corrections(status=503)
+    if request.headers.get("Origin") != current_app.config["CANONICAL_ORIGIN"]:
+        abort(400)
+    if request.mimetype != "application/x-www-form-urlencoded":
+        abort(415)
+    if request.content_length is None or request.content_length > CORRECTIONS_MAX_BODY:
+        abort(413)
+    request.max_content_length = CORRECTIONS_MAX_BODY
+    submitted = request.form
+    if not set(submitted) <= _CORRECTION_FIELDS or any(
+        len(submitted.getlist(name)) != 1 for name in submitted
+    ):
+        abort(400)
+    if submitted.get("website", ""):
+        # A hidden field only automation fills in: answer as if it worked, store nothing.
+        return _correction_response(
+            render_template("corrections_received.html", reference=secrets.token_hex(16))
+        )
+    echo = {
+        name: submitted.get(name, "")
+        for name in ("category", "kind", "url", "field", "reason", "evidence")
+    }  # the reply contact is deliberately never echoed back
+    try:
+        case = NewCase(
+            reporter_category=ReporterCategory(submitted.get("category", "")),
+            kind=ReportKind(submitted.get("kind", "")),
+            affected_url=submitted.get("url", ""),
+            affected_field=submitted.get("field", ""),
+            reason=submitted.get("reason", ""),
+            evidence_url=submitted.get("evidence", ""),
+            reply_contact=submitted.get("contact", "").strip(),
+        )
+    except IntakeError as exc:
+        return _render_corrections(error=str(exc), values=echo, status=400)
+    except ValueError:
+        return _render_corrections(
+            error="Please choose who you are and what the report is about.",
+            values=echo,
+            status=400,
+        )
+    if not _allow_submission():
+        response = _render_corrections(
+            error="Too many reports were received just now. Please try again in an hour.",
+            values=echo,
+            status=429,
+        )
+        response.headers["Retry-After"] = "3600"
+        return response
+    try:
+        reference = IntakeStore(Path(db)).record_case(case, now=datetime.now(UTC))
+    except IntakeError:
+        return _render_corrections(
+            error="Reports cannot be accepted right now. Please try again later.",
+            values=echo,
+            status=503,
+        )
+    return _correction_response(render_template("corrections_received.html", reference=reference))
 
 
 MAX_COMPARE_QUERY_BYTES = 2048
@@ -470,6 +605,7 @@ def sitemap_xml() -> Response:
         f"{origin}/",
         f"{origin}/methodology",
         f"{origin}/privacy",
+        f"{origin}/corrections",
     ]
     # Include /compare only when display-eligible offers exist (same predicate as noindex)
     now = datetime.now(UTC)
