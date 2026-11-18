@@ -150,6 +150,9 @@ class Pilot:
         self,
         handler: Callable[[httpx.Request], httpx.Response],
         resolve: Callable[[str], Iterable[str | _IPAddress]] | None = None,
+        *,
+        monotonic: Callable[[], float] | None = None,
+        boot_id: Callable[[], str] | None = None,
     ) -> FetchWorker:
         def transport_factory(addresses: tuple[_IPAddress, ...]) -> httpx.BaseTransport:
             self.dialed.append(addresses)
@@ -166,9 +169,10 @@ class Pilot:
             git_sha="0" * 40,
             registry=self.registry,
             clock=self.clock.now,
-            monotonic=self.clock.now,
+            monotonic=self.clock.now if monotonic is None else monotonic,
             sleep=self.clock.sleep,
             resolve=public_resolver if resolve is None else resolve,
+            boot_id=boot_id,
         )
 
     def fetch(self, handler: Callable[[httpx.Request], httpx.Response]) -> FetchResult:
@@ -1293,3 +1297,46 @@ def test_terms_prohibition_suppresses_before_record_and_retries_idempotently(
     pilot.terms_ledger.record(review, denylist=pilot.denylist)
     assert (pilot.denylist.path.read_bytes(), pilot.terms_ledger.path.read_bytes()) == before
     assert pilot.fetch(ok).reason == "source-withdrawn"
+
+
+def test_monotonic_state_from_an_earlier_boot_does_not_block_collection(pilot: Pilot) -> None:
+    """AUD7-11(g): after a reboot the monotonic clock restarts near zero. A tick persisted by a
+    long-running previous boot must not look like a deadline days in the future."""
+    before = pilot.worker(ok, monotonic=lambda: 9_000_000.0, boot_id=lambda: "boot-1")
+    assert before.fetch(pilot.source, pilot.profile).run is not None
+    pilot.clock.value += 3600  # an hour of wall-clock time passes, across the reboot
+    after = pilot.worker(ok, monotonic=lambda: 50.0, boot_id=lambda: "boot-2")
+    result = after.fetch(pilot.source, pilot.profile)
+    assert result.run is not None, result.reason
+    with after._state() as db:
+        assert after._get(db, "boot-id") == "boot-2"
+
+
+def test_monotonic_state_is_still_enforced_within_one_boot(pilot: Pilot) -> None:
+    first = pilot.worker(ok, monotonic=lambda: 1_000.0, boot_id=lambda: "boot-1")
+    assert first.fetch(pilot.source, pilot.profile).run is not None
+    # Same boot, same instant: the persisted ticks (and wall-clock deadlines) still apply.
+    second = pilot.worker(ok, monotonic=lambda: 1_000.0, boot_id=lambda: "boot-1")
+    assert second.fetch(pilot.source, pilot.profile).reason == "not-due"
+
+
+def test_wall_clock_politeness_survives_a_reboot(pilot: Pilot) -> None:
+    """Only the monotonic ticks are discarded: spacing by wall clock still holds after a restart."""
+    before = pilot.worker(ok, monotonic=lambda: 9_000_000.0, boot_id=lambda: "boot-1")
+    assert before.fetch(pilot.source, pilot.profile).run is not None
+    after = pilot.worker(ok, monotonic=lambda: 50.0, boot_id=lambda: "boot-2")
+    assert after.fetch(pilot.source, pilot.profile).reason == "not-due"  # no wall time elapsed
+
+
+def test_a_platform_without_a_boot_id_trusts_ticks_only_within_a_process(
+    pilot: Pilot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cu_rates import fetch_worker
+
+    monkeypatch.setattr(fetch_worker, "_PROCESS_TOKEN", "process-a")
+    a = pilot.worker(ok, monotonic=lambda: 9_000_000.0)  # default boot_id: this process
+    assert a.fetch(pilot.source, pilot.profile).run is not None
+    pilot.clock.value += 3600
+    monkeypatch.setattr(fetch_worker, "_PROCESS_TOKEN", "process-b")  # a new process, later
+    b = pilot.worker(ok, monotonic=lambda: 50.0)
+    assert b.fetch(pilot.source, pilot.profile).run is not None
