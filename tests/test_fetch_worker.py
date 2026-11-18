@@ -150,6 +150,9 @@ class Pilot:
         self,
         handler: Callable[[httpx.Request], httpx.Response],
         resolve: Callable[[str], Iterable[str | _IPAddress]] | None = None,
+        *,
+        monotonic: Callable[[], float] | None = None,
+        boot_id: Callable[[], str] | None = None,
     ) -> FetchWorker:
         def transport_factory(addresses: tuple[_IPAddress, ...]) -> httpx.BaseTransport:
             self.dialed.append(addresses)
@@ -166,9 +169,10 @@ class Pilot:
             git_sha="0" * 40,
             registry=self.registry,
             clock=self.clock.now,
-            monotonic=self.clock.now,
+            monotonic=self.clock.now if monotonic is None else monotonic,
             sleep=self.clock.sleep,
             resolve=public_resolver if resolve is None else resolve,
+            boot_id=boot_id,
         )
 
     def fetch(self, handler: Callable[[httpx.Request], httpx.Response]) -> FetchResult:
@@ -1293,3 +1297,72 @@ def test_terms_prohibition_suppresses_before_record_and_retries_idempotently(
     pilot.terms_ledger.record(review, denylist=pilot.denylist)
     assert (pilot.denylist.path.read_bytes(), pilot.terms_ledger.path.read_bytes()) == before
     assert pilot.fetch(ok).reason == "source-withdrawn"
+
+
+def _uptime(pilot: Pilot, start: float) -> Callable[[], float]:
+    """A monotonic clock that starts at ``start`` and advances with the simulated time."""
+    origin = pilot.clock.now()
+    return lambda: start + (pilot.clock.now() - origin)
+
+
+def _fetched(result: FetchResult) -> bool:
+    return result.reason == "fetched" and result.run is not None and result.artifact is not None
+
+
+def test_monotonic_state_from_an_earlier_boot_does_not_block_collection(pilot: Pilot) -> None:
+    """AUD7-11(g): after a reboot the monotonic clock restarts near zero. A tick persisted by a
+    long-running previous boot must not look like a deadline days in the future."""
+    before = pilot.worker(ok, monotonic=_uptime(pilot, 9_000_000.0), boot_id=lambda: "boot-1")
+    assert _fetched(before.fetch(pilot.source, pilot.profile))
+    pilot.clock.value += 3600  # an hour of wall-clock time passes, across the reboot
+    after = pilot.worker(ok, monotonic=_uptime(pilot, 50.0), boot_id=lambda: "boot-2")
+    result = after.fetch(pilot.source, pilot.profile)
+    assert _fetched(result), result.reason
+    with after._state() as db:
+        assert after._get(db, "boot-id") == "boot-2"
+
+
+def test_monotonic_state_is_still_enforced_within_one_boot(pilot: Pilot) -> None:
+    first = pilot.worker(ok, monotonic=_uptime(pilot, 1_000.0), boot_id=lambda: "boot-1")
+    assert _fetched(first.fetch(pilot.source, pilot.profile))
+    # Same boot, same instant: the persisted ticks (and wall-clock deadlines) still apply.
+    second = pilot.worker(ok, monotonic=_uptime(pilot, 1_000.0), boot_id=lambda: "boot-1")
+    assert second.fetch(pilot.source, pilot.profile).reason == "not-due"
+
+
+def test_wall_clock_politeness_survives_a_reboot(pilot: Pilot) -> None:
+    """Only the monotonic ticks are discarded: spacing by wall clock still holds after a restart."""
+    before = pilot.worker(ok, monotonic=_uptime(pilot, 9_000_000.0), boot_id=lambda: "boot-1")
+    assert _fetched(before.fetch(pilot.source, pilot.profile))
+    after = pilot.worker(ok, monotonic=_uptime(pilot, 50.0), boot_id=lambda: "boot-2")
+    assert after.fetch(pilot.source, pilot.profile).reason == "not-due"  # no wall time elapsed
+
+
+def test_a_platform_without_a_boot_id_trusts_ticks_only_within_a_process(
+    pilot: Pilot, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from cu_rates import fetch_worker
+
+    monkeypatch.setattr(fetch_worker, "_BOOT_ID_PATH", tmp_path / "no-boot-id")  # absent
+    monkeypatch.setattr(fetch_worker, "_PROCESS_TOKEN", "process-a")
+    a = pilot.worker(ok, monotonic=_uptime(pilot, 9_000_000.0))  # default boot_id: this process
+    assert _fetched(a.fetch(pilot.source, pilot.profile))
+    pilot.clock.value += 3600
+    monkeypatch.setattr(fetch_worker, "_PROCESS_TOKEN", "process-b")  # a new process, later
+    b = pilot.worker(ok, monotonic=_uptime(pilot, 50.0))
+    assert _fetched(b.fetch(pilot.source, pilot.profile))
+
+
+def test_the_boot_identity_is_the_linux_boot_id_when_the_platform_has_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from cu_rates import fetch_worker
+
+    present = tmp_path / "boot_id"
+    present.write_text("3f2c1b9e-0000-4000-8000-123456789abc\n", encoding="ascii")
+    monkeypatch.setattr(fetch_worker, "_BOOT_ID_PATH", present)
+    assert fetch_worker._read_boot_id() == "3f2c1b9e-0000-4000-8000-123456789abc"
+    present.write_text("\n", encoding="ascii")  # empty: fall back rather than trust nothing
+    assert fetch_worker._read_boot_id() == fetch_worker._PROCESS_TOKEN
+    monkeypatch.setattr(fetch_worker, "_BOOT_ID_PATH", tmp_path / "missing")
+    assert fetch_worker._read_boot_id() == fetch_worker._PROCESS_TOKEN
