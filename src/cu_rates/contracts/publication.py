@@ -984,11 +984,16 @@ def corroborated_paths(offer: NormalizedOffer, ctx: PublicationContext) -> tuple
     """The deterministic valid pair per field; exports/reviews use exactly these paths."""
     selected: list[EvidencePath] = []
     for path, value, _ in financial_items(offer):
-        paths = [
-            p
-            for p in ctx.evidence_paths
-            if p.path == path and p.value == value and not _path_reasons(p, offer, ctx)
-        ]
+        # Canonical order: the selected pair, and the review digest bound to it, must not
+        # depend on the order in which captures happen to be loaded.
+        paths = sorted(
+            (
+                p
+                for p in ctx.evidence_paths
+                if p.path == path and p.value == value and not _path_reasons(p, offer, ctx)
+            ),
+            key=lambda p: (p.observed_at, p.capture_id, p.artifact_id, p.content_sha256),
+        )
         for i, first in enumerate(paths):
             second = next((p for p in paths[i + 1 :] if not _pair_reasons(first, p)), None)
             if second is not None:

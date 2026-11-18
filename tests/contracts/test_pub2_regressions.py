@@ -189,3 +189,26 @@ def test_baseline_paths_resolve_two_fixture_artifacts_and_runs() -> None:
         assert path.observed_at == artifact.fetched_at
         assert path.provenance.artifact_id == artifact.artifact_id
     assert evaluate_publication(f.purchase_offer(), ctx).ranking_eligible
+
+
+def test_three_valid_captures_select_the_same_pair_in_any_input_order() -> None:
+    """AUD7-12(e): the corroborating pair and review digest cannot depend on load order."""
+    import itertools
+
+    from cu_rates.contracts.publication import corroborated_paths, publication_evidence_sha256
+
+    offer = f.purchase_offer(apr=None, points=None)
+    third = f.corroborating_path(artifact_id="dd" * 32, capture_id="fetch-003").model_copy(
+        update={"observed_at": f.T0 + timedelta(minutes=45)}
+    )
+    paths = (f.evidence_path(), f.corroborating_path(), third)
+    assert len({p.capture_id for p in paths}) == 3
+    outcomes = set()
+    for ordering in itertools.permutations(paths):
+        ctx = f.context(offer, evidence_paths=tuple(ordering))
+        selected = corroborated_paths(offer, ctx)
+        assert len(selected) == 2
+        outcomes.add(
+            (tuple(p.capture_id for p in selected), publication_evidence_sha256(offer, selected))
+        )
+    assert len(outcomes) == 1
