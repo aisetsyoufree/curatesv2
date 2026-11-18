@@ -122,6 +122,7 @@ def test_malformed_duplicate_conflicts_and_unverified_charter_is_not_closed(
         clock=lambda: FROZEN,
     )
     _verify(engine, 88020)
+    denylist = _denylist(tmp_path)
     report = import_roster(
         _csv(
             _line(88020, as_of="2026-10-01"),
@@ -133,9 +134,11 @@ def test_malformed_duplicate_conflicts_and_unverified_charter_is_not_closed(
         source_version="2026-10-01",
         source_as_of_date="2026-10-01",
         clock=lambda: FROZEN,
+        denylist=denylist,
     )
     assert 88020 in report.rejected_duplicate_charters
     assert 88020 in report.quarantined_charters
+    assert ("institution", "88020") in denylist.active_targets(FROZEN)
     row = _institution(engine, 88020)
     assert row.status == "active"  # type: ignore[attr-defined]
     assert row.charter_verified == 0  # type: ignore[attr-defined]
@@ -152,14 +155,17 @@ def test_omitted_and_non_ma_rows_do_not_infer_closure(tmp_path: Path) -> None:
         clock=lambda: FROZEN,
     )
     _verify(engine, 88030)
+    denylist = _denylist(tmp_path)
     omitted = import_roster(
         _csv(_line(88031, "Kept Synthetic CU", as_of="2026-10-01")),
         engine_or_connection=engine,
         artifact_store=store,
         source_version="2026-10-01",
         clock=lambda: FROZEN,
+        denylist=denylist,
     )
     assert 88030 in omitted.quarantined_charters
+    assert ("institution", "88030") in denylist.active_targets(FROZEN)
     omitted_row = _institution(engine, 88030)
     assert omitted_row.status == "active"  # type: ignore[attr-defined]
     assert omitted_row.charter_verified == 0  # type: ignore[attr-defined]
@@ -172,8 +178,10 @@ def test_omitted_and_non_ma_rows_do_not_infer_closure(tmp_path: Path) -> None:
         source_version="2026-11-01",
         source_as_of_date="2026-11-01",
         clock=lambda: FROZEN,
+        denylist=denylist,
     )
     assert 88031 in non_ma.quarantined_charters
+    assert ("institution", "88031") in denylist.active_targets(FROZEN)
     kept = _institution(engine, 88031)
     assert kept.status == "active"  # type: ignore[attr-defined]
     assert kept.charter_verified == 0  # type: ignore[attr-defined]

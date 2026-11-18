@@ -25,6 +25,7 @@ from cu_rates.db.records import load_identity_reviews, persist_identity_review
 from cu_rates.db.schema import institution_identity_evidence, institution_identity_reviews
 from cu_rates.pipeline.slice import SliceRun, run_fixture
 from cu_rates.pipeline.trusted import TrustedView, insert_withdrawal, load_publication_context
+from cu_rates.roster import import_roster
 from cu_rates.snapshot import Denylist
 
 OFFER = "purchase-30-year"
@@ -233,15 +234,24 @@ def test_a_review_cannot_cite_another_institutions_evidence(run: SliceRun) -> No
             conn,
             base.model_copy(update={"review_id": "stolen", "institution_charter": 777}),
         )
-    # ...and by the database itself, so a raw writer cannot bypass the check.
+    # ...and by the database itself, so a raw writer cannot bypass the check. Use a FRESH
+    # review of another (real) institution so only the composite foreign key can reject.
     with closing(sqlite3.connect(run.database)) as raw:
         raw.execute("PRAGMA foreign_keys=ON")
         provenance_id = raw.execute(
             "SELECT provenance_id FROM institution_identity_evidence"
         ).fetchone()[0]
-        with pytest.raises(sqlite3.IntegrityError), raw:
+        with raw:
             raw.execute(
-                "INSERT INTO institution_identity_evidence VALUES ('same-owner', ?, 777, 5)",
+                "INSERT INTO institutions VALUES (777, '1.0', 'Other CU', 'active', NULL, 1)"
+            )
+            raw.execute(
+                "INSERT INTO institution_identity_reviews VALUES "
+                "('review-777', '1.0', 777, 'Other CU', 1, 1, 'x', '2026-01-01T00:00:00Z', 'y')"
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"), raw:
+            raw.execute(
+                "INSERT INTO institution_identity_evidence VALUES ('review-777', ?, 777, 0)",
                 (provenance_id,),
             )
 
@@ -274,3 +284,64 @@ def test_a_review_older_than_a_roster_clearing_cannot_vouch_for_a_reflagged_char
     view = _view(run, after=timedelta(minutes=6))
     assert view.context.identity_review is not None
     assert view.context.identity_review.review_id == "identity-review-after-clearing"
+
+
+def test_a_review_citing_another_institutions_evidence_fails_closed_not_open(
+    run: SliceRun,
+) -> None:
+    """Review LOW: a newer review that cannot be trusted must not let an older approval win."""
+    base = _current(run)
+    _newer(run, "identity-review-newer", identity_confirmed=False)
+    with closing(sqlite3.connect(run.database)) as raw, raw:  # foreign keys off: a raw writer
+        raw.execute(
+            "INSERT INTO institution_identity_evidence "
+            "VALUES ('identity-review-newer', 'x', 777, 5)"
+        )
+    view = _view(run, after=timedelta(minutes=5))
+    assert view.context.identity_review is None
+    assert base.approves  # the older approval exists, and still must not be used
+    assert not evaluate_publication(view.offer, view.context).publishable_now
+
+
+def test_tied_approvals_that_disagree_about_the_institution_fail_closed(run: SliceRun) -> None:
+    base = _current(run)
+    with open_operational_database(run.database).begin() as conn:
+        persist_identity_review(
+            conn, base.model_copy(update={"review_id": "tie-other-name", "legal_name": "Other CU"})
+        )
+    view = _view(run)
+    assert view.context.identity_review is None
+    assert R.IDENTITY_REVIEW_MISSING in evaluate_publication(view.offer, view.context).reasons
+
+
+def test_a_verified_charter_that_leaves_the_roster_voids_its_older_review(
+    run: SliceRun, tmp_path: Path
+) -> None:
+    """Review MEDIUM: the importer, not a hand-made row, must date the clearing."""
+    base = _current(run)
+    denylist = Denylist(tmp_path / "independent" / "withdrawals.json")
+    denylist.initialize()
+    stamp = (base.decided_at + timedelta(minutes=2)).isoformat()
+    roster = (
+        "Charter,Credit Union Name,State,Status,City,Date Inactive,Successor Charter,As of Date\n"
+        f"60002,Other Synthetic CU,MA,Active,Boston,,,{stamp[:10]}\n"
+    ).encode()
+    engine = open_operational_database(run.database)
+    report = import_roster(
+        roster,
+        engine_or_connection=engine,
+        artifact_store=run.store,
+        source_version="after-review",
+        clock=lambda: base.decided_at + timedelta(minutes=2),
+        denylist=denylist,
+    )
+    assert base.institution_charter in report.quarantined_charters
+    view = _view(run, after=timedelta(minutes=5))
+    assert view.context.identity_review is None  # the importer's clearing outdates the review
+    assert (
+        "institution",
+        str(base.institution_charter),
+    ) in denylist.active_targets(base.decided_at + timedelta(minutes=3))
+    # A human re-review AFTER the clearing restores eligibility.
+    _newer(run, "identity-review-reverified", decided_at=base.decided_at + timedelta(minutes=3))
+    assert _view(run, after=timedelta(minutes=6)).context.identity_review is not None

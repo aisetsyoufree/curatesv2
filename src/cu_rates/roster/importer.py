@@ -360,9 +360,29 @@ class RosterImporter:
                 ).first()
                 if known is None and charter not in valid_charters:
                     continue
-                entry = self._prepare_suppression(charter, row.status, artifact_id, now)
+                entry = self._prepare_suppression(
+                    charter, f"reported {row.status.value}", artifact_id, now
+                )
                 if entry is not None:
                     suppressions[charter] = entry
+
+        # A verified charter that is no longer on this roster (or whose identity cannot be
+        # resolved) loses its verification too. That event must be datable, so a review
+        # decided before it cannot vouch for a later re-flag, and its already-published
+        # offers must stop being shown: same independent protection, same ordering.
+        departed: set[int] = set()
+        if not stale_file:
+            unresolved = (verified - valid_charters) | (parsed.unresolved_charters & verified)
+            for charter in sorted(unresolved - set(suppressions)):
+                entry = self._prepare_suppression(
+                    charter,
+                    "is no longer verifiable on the Massachusetts roster (absent or unresolved)",
+                    artifact_id,
+                    now,
+                )
+                if entry is not None:
+                    suppressions[charter] = entry
+                    departed.add(charter)
 
         # All DB changes share the import's transaction/savepoint. Independent
         # suppression deliberately survives rollback so existing snapshots stay safe.
@@ -476,18 +496,8 @@ class RosterImporter:
             else:
                 unchanged.append(inst.charter_number)
 
-        quarantined: list[int] = []
-        if not stale_file:
-            unresolved = (verified - clean) | (parsed.unresolved_charters & verified)
-            for charter in sorted(unresolved):
-                if charter in review:
-                    continue
-                quarantined.append(charter)
-                conn.execute(
-                    update(institutions)
-                    .where(institutions.c.charter_number == charter)
-                    .values(charter_verified=0)
-                )
+        # Departed charters were suppressed and unverified above; report them as quarantined.
+        quarantined: list[int] = sorted(departed)
 
         return RosterImportReport(
             import_id=import_id,
@@ -519,12 +529,12 @@ class RosterImporter:
     def _prepare_suppression(
         self,
         charter: int,
-        status: InstitutionStatus,
+        detail: str,
         artifact_id: str,
         now: datetime,
     ) -> WithdrawalEntry | None:
         if self._denylist is None:
-            raise ValueError("a denylist is required to import a merger or closure")
+            raise ValueError("a denylist is required to import a change that clears verification")
         withdrawal_id = f"{_ROSTER_PREFIX}{artifact_id}.suppress.{charter}"
         entries = self._denylist.entries()
         # A retry must reuse every immutable field, especially the original time.
@@ -543,10 +553,7 @@ class RosterImporter:
                 target_id=str(charter),
                 actor="roster-importer",
                 withdrawn_at=now,
-                reason=(
-                    f"Institution {charter} reported {status.value} "
-                    f"in roster artifact {artifact_id}"
-                ),
+                reason=f"Institution {charter} {detail} in roster artifact {artifact_id}",
             )
         self._denylist.withdraw(entry)
         return entry

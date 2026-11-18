@@ -704,13 +704,18 @@ def _identity_review(
     approval. Every cited location is re-checked against stored bytes: evidence that is
     missing or no longer matches yields no review at all (the gate then fails closed).
     """
-    decided = [r for r in load_identity_reviews(conn, charter) if r.decided_at <= evaluated_at]
+    try:
+        decided = [r for r in load_identity_reviews(conn, charter) if r.decided_at <= evaluated_at]
+    except ValueError:
+        return None  # an untrustworthy review exists: fail closed, never fall back to an older one
     if not decided:
         return None
     # Reviews sharing the newest decision time are ordered by nothing meaningful, so an
     # approval must never hide a rejection decided at the same moment: fail closed.
     newest = [r for r in decided if r.decided_at == decided[0].decided_at]
     review = next((r for r in newest if not r.approves), newest[0])
+    if len({r.legal_name for r in newest}) > 1:
+        return None  # tied approvals that disagree about who the institution is
     # The roster importer clears verification when an institution is reported inactive or
     # leaves the Massachusetts roster. A review older than that event cannot vouch for it.
     cleared_at = conn.execute(

@@ -29,7 +29,9 @@ from cu_rates.contracts.enums import (
 )
 from cu_rates.contracts.evidence import Provenance
 
-_MASSACHUSETTS = re.compile(r"\bmassachusetts\b|\bMA\b", re.IGNORECASE)
+_MASSACHUSETTS_WORD = re.compile(r"\bmassachusetts\b", re.IGNORECASE)
+# The postal abbreviation is upper-case and letter-bounded: "Ma Bell", "e-ma-il" do not count.
+_MASSACHUSETTS_ABBREVIATION = re.compile(r"(?<![A-Za-z])MA(?![A-Za-z])")
 
 
 class Institution(VersionedModel):
@@ -154,16 +156,30 @@ class InstitutionIdentityReview(VersionedModel):
 
     @property
     def evidence_states_identity(self) -> bool:
-        """The cited text itself names this charter number and this legal name."""
-        number = re.compile(rf"(?<!\d){self.institution_charter}(?!\d)")
-        name = " ".join(self.legal_name.casefold().split())
+        """The cited text itself names this charter number AND this legal name.
+
+        The number must follow the word "charter" (``Charter Number: 12345``, ``NCUA charter
+        #12345``) so a street number or phone fragment cannot satisfy it, and the name must
+        stand alone. This screens out blatantly wrong evidence; the human review is the proof.
+        """
+        number = re.compile(rf"charter\D{{0,20}}(?<!\d){self.institution_charter}(?!\d)", re.I)
+        # Not preceded by another word ("South Boston Credit Union" is not "Boston Credit
+        # Union"), and not followed by more letters.
+        name = re.compile(
+            rf"(?<![A-Za-z0-9])(?<![A-Za-z] ){re.escape(' '.join(self.legal_name.split()))}"
+            r"(?![A-Za-z0-9])",
+            re.I,
+        )
         return any(
-            number.search(item.source_text)
-            and name in " ".join(item.source_text.casefold().split())
-            for item in self.evidence
+            number.search(text) and name.search(text)
+            for text in (" ".join(item.source_text.split()) for item in self.evidence)
         )
 
     @property
     def evidence_states_massachusetts(self) -> bool:
         """The cited text itself places the institution in Massachusetts."""
-        return any(_MASSACHUSETTS.search(item.source_text) for item in self.evidence)
+        return any(
+            _MASSACHUSETTS_WORD.search(item.source_text)
+            or _MASSACHUSETTS_ABBREVIATION.search(item.source_text)
+            for item in self.evidence
+        )

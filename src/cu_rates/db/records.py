@@ -284,7 +284,10 @@ def persist_identity_review(
 def load_identity_reviews(
     conn: Connection, institution_charter: int
 ) -> tuple[InstitutionIdentityReview, ...]:
-    """Every identity review of one institution, newest decision first."""
+    """Every identity review of one institution, newest decision first.
+
+    Raises ``ValueError`` if any review cites another institution's evidence.
+    """
     rows = conn.execute(
         select(institution_identity_reviews)
         .where(institution_identity_reviews.c.institution_charter == institution_charter)
@@ -301,7 +304,9 @@ def load_identity_reviews(
             .order_by(institution_identity_evidence.c.ordinal)
         ).all()
         if any(item.institution_charter != row.institution_charter for item in evidence_rows):
-            continue  # evidence recorded for another institution: the review is not trusted
+            # Never skip it: dropping a newer (possibly rejecting) review would let an older
+            # approval win. Callers treat this as "no trustworthy review" and fail closed.
+            raise ValueError("an identity review cites evidence recorded for another institution")
         loaded = _load_provenance(conn, {item.provenance_id for item in evidence_rows})
         reviews.append(
             InstitutionIdentityReview.model_validate(
