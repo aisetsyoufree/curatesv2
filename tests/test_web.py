@@ -2698,3 +2698,31 @@ def test_canonical_scenario_assumptions_asserted_independently() -> None:
     assert heloc_map["Rate Structure"] == "Post-introductory variable APR"
     assert heloc_map["Occupancy"] == "Owner-occupied single-family primary residence"
     assert heloc_map["Discounts"] == "None (No relationship or automatic payment discount)"
+
+
+def test_displayed_rates_and_points_are_never_silently_rounded() -> None:
+    """AUD7-13(b): a published five-decimal value is shown exactly, not as a 3-place rounding."""
+    from cu_rates.snapshot.builder import _public_projection
+    from cu_rates.web.comparison import classify_and_format_offer, exact_decimal
+
+    assert exact_decimal(Decimal("6")) == "6.000"
+    assert exact_decimal(Decimal("6.1")) == "6.100"
+    assert exact_decimal(Decimal("6.125")) == "6.125"
+    assert exact_decimal(Decimal("6.12345")) == "6.12345"
+    assert exact_decimal(Decimal("6.12349")) != exact_decimal(Decimal("6.12351"))
+
+    now = make.EVALUATED_AT
+    cand = _make_candidate(
+        "offer-precision",
+        "Precision CU",
+        note_rate_str="6.12345",
+        apr_str="6.54321",
+        points_str="0.12345",
+        now=now,
+    )
+    formatted = classify_and_format_offer(_public_projection(cand, Placement.RANKED, False), now)
+    assert formatted is not None
+    assert formatted.note_rate_display == "6.12345%"
+    assert formatted.apr_display == "6.54321%"
+    assert formatted.points_display == "0.12345"
+    assert "6.123" not in formatted.note_rate_display.replace("6.12345", "")
