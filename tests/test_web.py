@@ -954,6 +954,7 @@ def test_compare_fixture_snapshot_rendering_and_incomparable_separation(
             "TESTING": True,
             "SNAPSHOT_ROOT": str(publisher.root),
             "DENYLIST_PATH": str(denylist.path),
+            "AUTOMATIC_DENYLIST_PATH": str(denylist.path),  # the trio is required
             "SNAPSHOT_CLOCK": now,
         }
     )
@@ -1104,6 +1105,7 @@ def test_compare_freshness_degradation_and_expiry(
             "TESTING": True,
             "SNAPSHOT_ROOT": str(publisher.root),
             "DENYLIST_PATH": str(denylist.path),
+            "AUTOMATIC_DENYLIST_PATH": str(denylist.path),  # the trio is required
             "SNAPSHOT_CLOCK": make.T0 + timedelta(hours=24),
         }
     )
@@ -1117,6 +1119,7 @@ def test_compare_freshness_degradation_and_expiry(
             "TESTING": True,
             "SNAPSHOT_ROOT": str(publisher.root),
             "DENYLIST_PATH": str(denylist.path),
+            "AUTOMATIC_DENYLIST_PATH": str(denylist.path),  # the trio is required
             "SNAPSHOT_CLOCK": make.T0 + timedelta(hours=73),
         }
     )
@@ -1131,6 +1134,7 @@ def test_compare_freshness_degradation_and_expiry(
             "TESTING": True,
             "SNAPSHOT_ROOT": str(publisher.root),
             "DENYLIST_PATH": str(denylist.path),
+            "AUTOMATIC_DENYLIST_PATH": str(denylist.path),  # the trio is required
             "SNAPSHOT_CLOCK": make.T0 + timedelta(hours=95),
         }
     )
@@ -1143,6 +1147,7 @@ def test_compare_freshness_degradation_and_expiry(
             "TESTING": True,
             "SNAPSHOT_ROOT": str(publisher.root),
             "DENYLIST_PATH": str(denylist.path),
+            "AUTOMATIC_DENYLIST_PATH": str(denylist.path),  # the trio is required
             "SNAPSHOT_CLOCK": make.T0 + timedelta(hours=97),
         }
     )
@@ -1828,6 +1833,7 @@ def test_compare_fixture_scenario_isolation_disclosures_zero_values_and_sorting(
             "TESTING": True,
             "SNAPSHOT_ROOT": str(publisher.root),
             "DENYLIST_PATH": str(denylist.path),
+            "AUTOMATIC_DENYLIST_PATH": str(denylist.path),  # the trio is required
             "SNAPSHOT_CLOCK": now + timedelta(hours=2),
         }
     )
@@ -1995,6 +2001,7 @@ def test_compare_empty_filtered_results_have_noindex(
             "TESTING": True,
             "SNAPSHOT_ROOT": str(publisher.root),
             "DENYLIST_PATH": str(denylist.path),
+            "AUTOMATIC_DENYLIST_PATH": str(denylist.path),  # the trio is required
             "SNAPSHOT_CLOCK": now,
         }
     )
@@ -2105,6 +2112,7 @@ def test_compare_zero_guard_filtered_scenario_noindex(
             "TESTING": True,
             "SNAPSHOT_ROOT": str(publisher.root),
             "DENYLIST_PATH": str(denylist.path),
+            "AUTOMATIC_DENYLIST_PATH": str(denylist.path),  # the trio is required
             "SNAPSHOT_CLOCK": now,
         }
     )
@@ -2298,6 +2306,7 @@ def test_compare_structure_separation_not_mixed_or_swapped(
             "TESTING": True,
             "SNAPSHOT_ROOT": str(publisher.root),
             "DENYLIST_PATH": str(denylist.path),
+            "AUTOMATIC_DENYLIST_PATH": str(denylist.path),  # the trio is required
             "SNAPSHOT_CLOCK": now,
         }
     )
@@ -2350,6 +2359,7 @@ def test_compare_default_sort_is_alphabetical_not_apr(
             "TESTING": True,
             "SNAPSHOT_ROOT": str(publisher.root),
             "DENYLIST_PATH": str(denylist.path),
+            "AUTOMATIC_DENYLIST_PATH": str(denylist.path),  # the trio is required
             "SNAPSHOT_CLOCK": now,
         }
     )
@@ -2398,6 +2408,7 @@ def test_sitemap_excludes_detail_only_snapshots(
             "TESTING": True,
             "SNAPSHOT_ROOT": str(publisher.root),
             "DENYLIST_PATH": str(denylist.path),
+            "AUTOMATIC_DENYLIST_PATH": str(denylist.path),  # the trio is required
             "SNAPSHOT_CLOCK": now,
         }
     )
@@ -2627,6 +2638,7 @@ def test_compare_reads_a_snapshot_admitted_from_persisted_pipeline_evidence(tmp_
             "TESTING": True,
             "SNAPSHOT_ROOT": str(publisher.root),
             "DENYLIST_PATH": str(denylist.path),
+            "AUTOMATIC_DENYLIST_PATH": str(denylist.path),  # the trio is required
             "SNAPSHOT_CLOCK": manifest.published_at,
         }
     )
