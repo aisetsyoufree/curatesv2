@@ -14,6 +14,7 @@ from pydantic import JsonValue, TypeAdapter, ValidationError
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import SQLAlchemyError
 
+from cu_rates.adapters.registry import verify_offer_against_stored_bytes
 from cu_rates.artifact_store import ArtifactStore, ArtifactStoreError
 from cu_rates.contracts.audit import PublishedSnapshot, ReviewDecision, snapshot_manifest_sha256
 from cu_rates.contracts.base import ContractModel, Identifier
@@ -29,7 +30,6 @@ from cu_rates.contracts.publication import (
     publication_evidence_sha256,
 )
 from cu_rates.contracts.sources import ExtractedCandidate
-from cu_rates.pipeline.slice import verified_offer_candidates
 from cu_rates.pipeline.trusted import load_publication_context
 from cu_rates.validation import RULE_IDS, ValidationContext, validate_offer
 
@@ -121,7 +121,11 @@ def _load_candidate(
     *,
     allow_fixture: bool = False,
 ) -> SnapshotCandidate:
-    view = load_publication_context(conn, offer_id, manifest.published_at, store=store)
+    view = load_publication_context(
+        conn, offer_id, manifest.published_at, store=store, allow_fixture=allow_fixture
+    )
+    if not allow_fixture:
+        _reject_fixture_source(view.context.source.url)
     # The trusted loader re-verifies every separately persisted capture against its
     # stored bytes and locators. Never accept a caller's offer, context, or review.
     primary = next(
@@ -140,15 +144,20 @@ def _load_candidate(
     if primary is None:
         # T045 does not accept a refreshed 304 observation in place of a direct capture.
         raise SnapshotError(f"T045 refused offer without a direct stored capture: {offer_id}")
-    if not allow_fixture:
-        _reject_fixture_source(view.context.source.url)
-    candidates, _ = verified_offer_candidates(
-        view.context.source, view.offer, store.read(primary), primary
+    proof = verify_offer_against_stored_bytes(
+        view.context.source,
+        view.context.source_approval,
+        view.offer,
+        store.read(primary),
+        primary,
+        allow_fixture=allow_fixture,
     )
+    if proof.confidence == "low":
+        raise SnapshotError("low-confidence extraction is quarantined")
     return SnapshotCandidate(
         offer=view.offer,
         context=view.context,
-        candidates=candidates,
+        candidates=proof.candidates,
         current_review=view.current_review,
     )
 

@@ -40,7 +40,7 @@ def _view(run: SliceRun, *, after: timedelta = timedelta(minutes=4)) -> TrustedV
     offer = run.offers[OFFER]
     with open_operational_database(run.database).connect() as conn:
         return load_publication_context(
-            conn, offer.offer_id, offer.observed_at + after, store=run.store
+            conn, offer.offer_id, offer.observed_at + after, store=run.store, allow_fixture=True
         )
 
 

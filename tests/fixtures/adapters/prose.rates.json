@@ -1,0 +1,185 @@
+{
+  "source_id": "prose.rates",
+  "source_url": "https://prose.example/rates",
+  "institution_charter": 8000401,
+  "layout_sha256": "2af69f00be3730694d9682876314a5b37f8afba977362a64d576b3c92d5b942d",
+  "rows": [
+    {
+      "offer_id": "prose.purchase",
+      "product_id": "prose.mortgage",
+      "comparison_target": "purchase_30y_fixed",
+      "fields": [
+        {
+          "path": "product_family",
+          "selector": "#terms > dd:nth-child(2)",
+          "label": {
+            "selector": "#terms > dt:nth-child(1)",
+            "text": "Product family"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "details.purpose",
+          "selector": "#terms > dd:nth-child(4)",
+          "label": {
+            "selector": "#terms > dt:nth-child(3)",
+            "text": "Purpose"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "details.rate_type",
+          "selector": "#terms > dd:nth-child(6)",
+          "label": {
+            "selector": "#terms > dt:nth-child(5)",
+            "text": "Rate type"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "details.term_months",
+          "selector": "#terms > dd:nth-child(8)",
+          "label": {
+            "selector": "#terms > dt:nth-child(7)",
+            "text": "Term"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "points",
+          "selector": "#terms > dd:nth-child(10)",
+          "label": {
+            "selector": "#terms > dt:nth-child(9)",
+            "text": "Points"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "details.lock_days",
+          "selector": "#terms > dd:nth-child(12)",
+          "label": {
+            "selector": "#terms > dt:nth-child(11)",
+            "text": "Lock"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "note_rate",
+          "selector": "#note",
+          "label": {
+            "selector": "#rate-label",
+            "text": "Note rate"
+          },
+          "excerpt": null,
+          "context_template": "Note rate: {value} (invented)"
+        },
+        {
+          "path": "apr",
+          "selector": "#apr",
+          "label": {
+            "selector": "#apr-label",
+            "text": "APR"
+          },
+          "excerpt": null,
+          "context_template": "APR: {value} (invented)"
+        },
+        {
+          "path": "effective_at",
+          "selector": "#effective",
+          "label": {
+            "selector": "#date-label",
+            "text": "Effective time"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "scenario.occupancy",
+          "selector": "#assumptions",
+          "label": {
+            "selector": "#assumptions-label",
+            "text": "Stated assumptions"
+          },
+          "excerpt": "Owner-occupied single-family primary residence",
+          "context_text": "Owner-occupied single-family primary residence; property type single-family; property value $500,000; loan amount $400,000; loan-to-value 80%; credit score 780; No relationship discount; No autopay discount"
+        },
+        {
+          "path": "scenario.property_type",
+          "selector": "#property",
+          "label": {
+            "selector": "#assumptions-label",
+            "text": "Stated assumptions"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "scenario.property_value",
+          "selector": "#assumptions",
+          "label": {
+            "selector": "#assumptions-label",
+            "text": "Stated assumptions"
+          },
+          "excerpt": "$500,000",
+          "context_text": "Owner-occupied single-family primary residence; property type single-family; property value $500,000; loan amount $400,000; loan-to-value 80%; credit score 780; No relationship discount; No autopay discount"
+        },
+        {
+          "path": "scenario.loan_amount",
+          "selector": "#assumptions",
+          "label": {
+            "selector": "#assumptions-label",
+            "text": "Stated assumptions"
+          },
+          "excerpt": "$400,000",
+          "context_text": "Owner-occupied single-family primary residence; property type single-family; property value $500,000; loan amount $400,000; loan-to-value 80%; credit score 780; No relationship discount; No autopay discount"
+        },
+        {
+          "path": "scenario.ltv",
+          "selector": "#assumptions",
+          "label": {
+            "selector": "#assumptions-label",
+            "text": "Stated assumptions"
+          },
+          "excerpt": "80%",
+          "context_text": "Owner-occupied single-family primary residence; property type single-family; property value $500,000; loan amount $400,000; loan-to-value 80%; credit score 780; No relationship discount; No autopay discount"
+        },
+        {
+          "path": "scenario.credit_score",
+          "selector": "#assumptions",
+          "label": {
+            "selector": "#assumptions-label",
+            "text": "Stated assumptions"
+          },
+          "excerpt": "780",
+          "context_text": "Owner-occupied single-family primary residence; property type single-family; property value $500,000; loan amount $400,000; loan-to-value 80%; credit score 780; No relationship discount; No autopay discount"
+        },
+        {
+          "path": "scenario.relationship_discount",
+          "selector": "#assumptions",
+          "label": {
+            "selector": "#assumptions-label",
+            "text": "Stated assumptions"
+          },
+          "excerpt": "No relationship discount",
+          "context_text": "Owner-occupied single-family primary residence; property type single-family; property value $500,000; loan amount $400,000; loan-to-value 80%; credit score 780; No relationship discount; No autopay discount"
+        },
+        {
+          "path": "scenario.autopay_discount",
+          "selector": "#assumptions",
+          "label": {
+            "selector": "#assumptions-label",
+            "text": "Stated assumptions"
+          },
+          "excerpt": "No autopay discount",
+          "context_text": "Owner-occupied single-family primary residence; property type single-family; property value $500,000; loan amount $400,000; loan-to-value 80%; credit score 780; No relationship discount; No autopay discount"
+        }
+      ]
+    }
+  ]
+}

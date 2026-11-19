@@ -1,0 +1,262 @@
+{
+  "source_id": "multi.rates",
+  "source_url": "https://multi.example/rates",
+  "institution_charter": 8000401,
+  "layout_sha256": "bc8f7cced35e9874fff7a46a01a7a3dc12224b5eaecd6ec551d784c5df3bf062",
+  "rows": [
+    {
+      "offer_id": "multi.purchase",
+      "product_id": "multi.mortgage",
+      "comparison_target": "purchase_30y_fixed",
+      "fields": [
+        {
+          "path": "product_family",
+          "selector": "#mortgage > td:nth-child(1)",
+          "label": {
+            "selector": "#family-label",
+            "text": "Product family"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "details.purpose",
+          "selector": "#mortgage > td:nth-child(2)",
+          "label": {
+            "selector": "#purpose-label",
+            "text": "Purpose"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "details.rate_type",
+          "selector": "#mortgage > td:nth-child(3)",
+          "label": {
+            "selector": "#type-label",
+            "text": "Rate type"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "details.term_months",
+          "selector": "#mortgage > td:nth-child(4)",
+          "label": {
+            "selector": "#term-label",
+            "text": "Term"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "note_rate",
+          "selector": "#mortgage > td:nth-child(5)",
+          "label": {
+            "selector": "#rate-label",
+            "text": "Note rate"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "apr",
+          "selector": "#mortgage > td:nth-child(6)",
+          "label": {
+            "selector": "#apr-label",
+            "text": "APR"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "points",
+          "selector": "#mortgage > td:nth-child(7)",
+          "label": {
+            "selector": "#points-label",
+            "text": "Points"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "details.lock_days",
+          "selector": "#mortgage > td:nth-child(8)",
+          "label": {
+            "selector": "#lock-label",
+            "text": "Lock"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "effective_at",
+          "selector": "#effective",
+          "label": {
+            "selector": "#date-label",
+            "text": "Effective time"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "scenario.occupancy",
+          "selector": "#occupancy",
+          "label": {
+            "selector": "#occupancy-label",
+            "text": "Occupancy"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "scenario.property_type",
+          "selector": "#property",
+          "label": {
+            "selector": "#property-label",
+            "text": "Property type"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "scenario.property_value",
+          "selector": "#value",
+          "label": {
+            "selector": "#value-label",
+            "text": "Property value"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "scenario.loan_amount",
+          "selector": "#amount",
+          "label": {
+            "selector": "#amount-label",
+            "text": "Loan amount"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "scenario.ltv",
+          "selector": "#ltv",
+          "label": {
+            "selector": "#ltv-label",
+            "text": "Loan-to-value"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "scenario.credit_score",
+          "selector": "#score",
+          "label": {
+            "selector": "#score-label",
+            "text": "Credit score"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "scenario.relationship_discount",
+          "selector": "#relationship",
+          "label": {
+            "selector": "#relationship-label",
+            "text": "Relationship discount"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "scenario.autopay_discount",
+          "selector": "#autopay",
+          "label": {
+            "selector": "#autopay-label",
+            "text": "Autopay discount"
+          },
+          "excerpt": null,
+          "context_text": null
+        }
+      ]
+    },
+    {
+      "offer_id": "multi.equity",
+      "product_id": "multi.equity-product",
+      "comparison_target": null,
+      "fields": [
+        {
+          "path": "product_family",
+          "selector": "#equity > dd:nth-child(2)",
+          "label": {
+            "selector": "#equity > dt:nth-child(1)",
+            "text": "Product family"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "details.term_months",
+          "selector": "#equity > dd:nth-child(4)",
+          "label": {
+            "selector": "#equity > dt:nth-child(3)",
+            "text": "Term"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "note_rate",
+          "selector": "#equity > dd:nth-child(6)",
+          "label": {
+            "selector": "#equity > dt:nth-child(5)",
+            "text": "Note rate"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "apr",
+          "selector": "#equity > dd:nth-child(8)",
+          "label": {
+            "selector": "#equity > dt:nth-child(7)",
+            "text": "APR"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "points",
+          "selector": "#equity > dd:nth-child(10)",
+          "label": {
+            "selector": "#equity > dt:nth-child(9)",
+            "text": "Points"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "details.lien_position",
+          "selector": "#equity > dd:nth-child(12)",
+          "label": {
+            "selector": "#equity > dt:nth-child(11)",
+            "text": "Lien position"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "effective_at",
+          "selector": "#effective",
+          "label": {
+            "selector": "#date-label",
+            "text": "Effective time"
+          },
+          "excerpt": null,
+          "context_text": null
+        }
+      ]
+    }
+  ]
+}

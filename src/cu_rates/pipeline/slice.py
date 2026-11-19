@@ -11,6 +11,8 @@ from pathlib import Path
 import httpx
 from sqlalchemy.engine import Connection, Engine
 
+from cu_rates.adapters.normalization import stated_bound as stated_bound
+from cu_rates.adapters.normalization import with_statements as _with_statements
 from cu_rates.artifact_store import ArtifactStore, ArtifactStoreError
 from cu_rates.contracts.audit import (
     PublishedSnapshot,
@@ -29,11 +31,9 @@ from cu_rates.contracts.enums import (
     ProductLifecycle,
     ProductScope,
     RateAvailability,
-    RateType,
     ReviewSubject,
     ReviewVerdict,
     RunStatus,
-    ScenarioDimension,
     SourceRelationshipKind,
 )
 from cu_rates.contracts.evidence import (
@@ -57,7 +57,7 @@ from cu_rates.contracts.registry import (
     InstitutionSourceRelationship,
     ProductIdentity,
 )
-from cu_rates.contracts.scenarios import CANONICAL_SCENARIOS, StatedBound, statement_matches_excerpt
+from cu_rates.contracts.scenarios import CANONICAL_SCENARIOS
 from cu_rates.contracts.sources import (
     ExtractedCandidate,
     FetchProfile,
@@ -72,8 +72,8 @@ from cu_rates.db.records import persist_identity_review
 from cu_rates.db.schema import artifact_blobs, slice_normalization_failures
 from cu_rates.fetch_policy import FetchRegistry, TermsLedger, TermsReview
 from cu_rates.fetch_worker import FetchWorker
-from cu_rates.normalize import OfferContext, ScenarioCheck, normalize_offer
-from cu_rates.normalize._values import Range, comparison_statement
+from cu_rates.normalize import OfferContext, normalize_offer
+from cu_rates.normalize._values import comparison_statement
 from cu_rates.pipeline.extract import (
     FIXTURES,
     SLICE_CONFIGURATION,
@@ -146,29 +146,6 @@ class _Clock:
 
     def advance(self, seconds: float) -> None:
         self.value += seconds
-
-
-def stated_bound(dimension: str, excerpt: str) -> StatedBound | None:
-    """Type the excerpt. A statement the excerpt does not literally support is dropped."""
-    try:
-        value = comparison_statement(dimension, excerpt)
-    except ValueError:
-        return None
-    if isinstance(value, Range) or value is None:
-        return None
-    if isinstance(value, Decimal):
-        bound = StatedBound(exact=value)
-    elif isinstance(value, bool):
-        bound = StatedBound(token="yes" if value else "no")
-    elif isinstance(value, RateType):
-        bound = StatedBound(token=value.value)
-    elif isinstance(value, str):
-        bound = StatedBound(token=value)
-    else:
-        return None
-    if not statement_matches_excerpt(ScenarioDimension(dimension), bound, excerpt):
-        return None
-    return bound
 
 
 @dataclass(frozen=True)
@@ -701,6 +678,7 @@ def run_fixture(
                 evaluated_at=first_at + timedelta(seconds=1),
                 snapshot_id="athol-style.snapshot-1",
                 reviewed=True,
+                allow_fixture=True,
             )
         if reviewed_snapshot is not None:
             clock.advance(120)
@@ -711,15 +689,14 @@ def run_fixture(
             with engine.begin() as conn:
                 insert_reobservation(conn, observation)
                 current = load_publication_context(
-                    conn,
-                    chosen.offer_id,
-                    observation.observed_at,
-                    store=store,
+                    conn, chosen.offer_id, observation.observed_at, store=store, allow_fixture=True
                 ).offer
                 if current.observed_at == observation.observed_at:
                     insert_validations(conn, validate_offer(current, observation.observed_at))
                 publish_at = observation.observed_at + timedelta(minutes=1)
-                ready = load_publication_context(conn, chosen.offer_id, publish_at, store=store)
+                ready = load_publication_context(
+                    conn, chosen.offer_id, publish_at, store=store, allow_fixture=True
+                )
                 refresh = evaluate_publication(ready.offer, ready.context)
                 refreshed_snapshot = publish(
                     conn,
@@ -727,30 +704,10 @@ def run_fixture(
                     store=store,
                     evaluated_at=publish_at,
                     snapshot_id="athol-style.snapshot-2",
+                    allow_fixture=True,
                 )
     return SliceRun(
         database, store, offers, findings, first, reviewed_snapshot, refresh, refreshed_snapshot
-    )
-
-
-def _with_statements(
-    offer: NormalizedOffer,
-    checks: tuple[ScenarioCheck, ...],
-    observed_at: datetime,
-) -> NormalizedOffer:
-    by_dimension = {check.dimension: check for check in checks}
-    matches = []
-    for match in offer.scenario_matches:
-        check = by_dimension.get(match.dimension.value)
-        text = match.source_text
-        bound = None if text is None else stated_bound(match.dimension.value, text)
-        provenance = check.provenance if check is not None and bound is not None else None
-        matches.append(match.model_copy(update={"stated": bound, "provenance": provenance}))
-    return offer.model_copy(
-        update={
-            "scenario_matches": tuple(matches),
-            "valid_until": observed_at + timedelta(hours=71),
-        }
     )
 
 
@@ -758,7 +715,9 @@ def _decide(
     engine: Engine, store: ArtifactStore, offer_id: str, evaluated_at: datetime
 ) -> PublicationDecision:
     with engine.connect() as conn:
-        view = load_publication_context(conn, offer_id, evaluated_at, store=store)
+        view = load_publication_context(
+            conn, offer_id, evaluated_at, store=store, allow_fixture=True
+        )
     return evaluate_publication(view.offer, view.context)
 
 
