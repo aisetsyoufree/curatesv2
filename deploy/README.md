@@ -44,6 +44,10 @@ All persistent data, code, virtual environments, and evidence artifacts reside u
 │   └── versions/         # Verified, immutable public SQLite databases
 ├── independent/          # Operator-owned independent withdrawal/denylist ledger (root:cu-rates, mode 0755)
 │   └── denylist.json     # Emergency withdrawal denylist (root:cu-rates, mode 0640)
+├── automatic/            # Worker-owned automatic suppression ledger (cu-rates:cu-rates)
+│   └── denylist.json     # Automatic suppression denylist (cu-rates:cu-rates)
+├── intake/               # Correction inbox directory (cu-rates:cu-rates, mode 0700)
+│   └── intake.sqlite     # Private correction inbox database
 ├── data/                 # Operational SQLite database (WAL mode; worker only, mode 0750)
 ├── artifacts/            # Content-addressed raw evidence store (worker only, mode 0700)
 ├── backups/              # Local private backup staging (tool enforces mode 0700)
@@ -60,7 +64,7 @@ All persistent data, code, virtual environments, and evidence artifacts reside u
 > **Notice on Hardcoded Unit Paths:** The systemd unit files (`cu-rates-web.service`, `cu-rates-worker.service`, `cu-rates-worker.timer`) assume the hardcoded production root path `/var/lib/cu-rates`. The environment variable `CU_RATES_ROOT` is supported by `deploy/install.sh` solely for installer testing, custom staging, and sandbox validation; it does NOT rewrite or template the hardcoded unit paths in `/etc/systemd/system/`. Deployments intending to use an alternate root path must update the unit files accordingly.
 
 ### Architectural Isolation Principles (`MASTER.md` §6, §7)
-- **Separation of Web and Worker:** The web service process (`cu-rates-web.service`) **NEVER opens or references the worker database** (`/var/lib/cu-rates/data`). The web process reads only verified public snapshots (`/var/lib/cu-rates/snapshots/`), the independent emergency withdrawal ledger (`/var/lib/cu-rates/independent/`), and static application code. Inaccessible paths are enforced in systemd (`InaccessiblePaths=/var/lib/cu-rates/data /var/lib/cu-rates/artifacts /var/lib/cu-rates/backups`). `StateDirectory` is omitted from both web and worker service units so systemd does not grant broad write access to `/var/lib/cu-rates`; the worker unit explicitly restricts writes to `ReadWritePaths=/var/lib/cu-rates/data /var/lib/cu-rates/artifacts /var/lib/cu-rates/snapshots` and keeps `/var/lib/cu-rates/independent` strictly read-only (`ReadOnlyPaths=/var/lib/cu-rates/app /var/lib/cu-rates/independent`).
+- **Separation of Web and Worker:** The web service process (`cu-rates-web.service`) **NEVER opens or references the worker database** (`/var/lib/cu-rates/data`). The web process reads only verified public snapshots (`/var/lib/cu-rates/snapshots/`), the independent emergency withdrawal ledger (`/var/lib/cu-rates/independent/`), the automatic suppression ledger (`/var/lib/cu-rates/automatic/`), and static application code. Inaccessible paths are enforced in systemd (`InaccessiblePaths=/var/lib/cu-rates/data /var/lib/cu-rates/artifacts /var/lib/cu-rates/backups`). `StateDirectory` is omitted from both web and worker service units so systemd does not grant broad write access to `/var/lib/cu-rates`; the worker unit explicitly restricts writes to `ReadWritePaths=/var/lib/cu-rates/data /var/lib/cu-rates/artifacts /var/lib/cu-rates/snapshots /var/lib/cu-rates/automatic` and keeps `/var/lib/cu-rates/independent` strictly read-only (`ReadOnlyPaths=/var/lib/cu-rates/app /var/lib/cu-rates/independent`).
 - **Unprivileged Execution:** All services execute as the dedicated system user `cu-rates` (group `cu-rates`) with no interactive shell (`/usr/sbin/nologin`).
 - **Hardened Sandboxing:** Systemd units enforce `ProtectSystem=strict`, `ProtectHome=true`, `PrivateTmp=true`, `NoNewPrivileges=true`, `PrivateDevices=true`, `ProtectClock=true`, `ProtectHostname=true`, `ProtectProc=invisible`, `ProcSubset=pid`, `CapabilityBoundingSet=` (empty), `AmbientCapabilities=` (empty), `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`, `SystemCallArchitectures=native`, `SystemCallFilter=@system-service`, `UMask=0077`, kernel tunables protection, strict `ReadWritePaths`, and resource quotas (`MemoryMax`, `TasksMax`, `CPUQuota`). Private temporary files are protected with `PrivateTmp=true`; `/tmp` is omitted from `ReadWritePaths`.
 
@@ -431,7 +435,7 @@ CU-Rates provides automated backup and health monitoring via systemd timers. The
      - Independent denylist / withdrawal ledger readability (`/var/lib/cu-rates/independent/denylist.json`)
      - Newest backup validity and age (`/var/lib/cu-rates/backups`)
      - Operational SQLite database integrity via `PRAGMA quick_check` (`/var/lib/cu-rates/data/operational.sqlite`)
-   - **Hardening & Isolation:** Strictly read-only everywhere (`ReadOnlyPaths`, no `ReadWritePaths`), unprivileged execution as `cu-rates`, no network access (`PrivateNetwork=true`, `RestrictAddressFamilies=AF_UNIX`), `Type=oneshot`, `Restart=no`.
+   - **Hardening & Isolation:** Unprivileged execution as `cu-rates`, `ProtectSystem=strict`, no network access (`PrivateNetwork=true`, `RestrictAddressFamilies=AF_UNIX`), `UMask=0077`, `Type=oneshot`, `Restart=no`, and writes ONLY to the data directory (`ReadWritePaths=/var/lib/cu-rates/data`) for SQLite WAL side files (`-shm`/`-wal`) during read-only opens.
    - **Alert Hook:** Non-zero exit (exit code 1) on any check failure marks `cu-rates-health.service` as failed in systemd.
 
 3. **Daily Data Quality Check (`cu-rates-quality.timer` -> `cu-rates-quality.service`):**

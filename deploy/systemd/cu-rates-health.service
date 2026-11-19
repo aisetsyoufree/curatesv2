@@ -21,11 +21,13 @@ ProtectSystem=strict
 ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
+ProtectKernelLogs=true
 ProtectControlGroups=true
 RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
+RemoveIPC=true
 PrivateDevices=true
 ProtectClock=true
 ProtectHostname=true
@@ -44,6 +46,7 @@ SystemCallFilter=@system-service
 # a readonly database" otherwise (pinned by tests/test_ops_wal_readonly.py).
 ReadWritePaths=/var/lib/cu-rates/data
 ReadOnlyPaths=/var/lib/cu-rates/app /var/lib/cu-rates/snapshots /var/lib/cu-rates/independent /var/lib/cu-rates/automatic /var/lib/cu-rates/backups
+InaccessiblePaths=-/var/lib/cu-rates/intake
 
 # Resource Limits (Raspberry Pi 5 with 16 GB RAM)
 MemoryMax=512M
