@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+
+{% block content %}
+<article>
+  <h1>{{ institution.name }}</h1>
+
+  <section class="card" aria-labelledby="identity-heading">
+    <h2 id="identity-heading">Institution</h2>
+    <dl>
+      <dt>Legal name</dt><dd>{{ institution.name }}</dd>
+      <dt>NCUA charter number</dt><dd>{{ institution.charter }}</dd>
+      <dt>City</dt><dd>Not available in the verified public snapshot</dd>
+      {% if snapshot_info %}
+      <dt>Snapshot published</dt><dd>{{ snapshot_info.published_at.strftime('%b %d, %Y %H:%M UTC') }}</dd>
+      {% endif %}
+    </dl>
+    {% if not institution.has_verified %}
+    <p role="status">There are no fresh verified offers for this credit union, so nothing is presented as a current rate. Coverage below is unknown.</p>
+    {% endif %}
+  </section>
+
+  <section class="card" aria-labelledby="coverage-heading">
+    <h2 id="coverage-heading">Coverage by product</h2>
+    <div class="table-responsive">
+      <table class="data-table">
+        <caption>Coverage state for each home-lending product family</caption>
+        <thead>
+          <tr>
+            <th scope="col">Product</th>
+            <th scope="col">Coverage</th>
+            <th scope="col">Verified offers</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in institution.coverage %}
+          <tr>
+            <th scope="row">{{ row.label }}</th>
+            <td>{{ row.state_label }}</td>
+            <td>
+              {% if row.offers %}
+              <ul>
+                {% for offer in row.offers %}
+                <li>
+                  {{ offer.loan_type_display }}: note rate {{ offer.note_rate_display }}, APR {{ offer.apr_display }}, points {{ offer.points_display }}, term {{ offer.term_display }}.
+                  Observed {{ offer.freshness_display }}.
+                  {% if offer.separation_reason %}Not comparable: {{ offer.separation_reason }}.{% endif %}
+                  <a href="{{ offer.source_url }}" class="source-link" rel="nofollow noopener noreferrer" target="_blank" aria-label="Source reference for {{ institution.name }} {{ row.label }}">Source</a>
+                </li>
+                {% endfor %}
+              </ul>
+              {% else %}
+              None shown. Not verified, so unknown.
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  {% include '_coverage_notes.html' %}
+</article>
+{% endblock %}
