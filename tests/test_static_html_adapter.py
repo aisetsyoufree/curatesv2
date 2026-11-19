@@ -1882,6 +1882,13 @@ def test_hidden_section_or_ancestor_is_refused(outer: bytes) -> None:
         resolve_text(b"<body>" + outer + b"</body>", "#n", tolerant=True)
 
 
+def test_a_subscript_inside_selected_text_is_refused() -> None:
+    from cu_rates.pipeline.extract import resolve_text
+
+    with pytest.raises(ValueError, match="subscript"):
+        resolve_text(b'<p id="n">6.12<sub>5</sub>%</p>', "#n", tolerant=True)
+
+
 def test_hidden_wrapper_inside_a_section_cannot_be_unhidden_by_a_stray_end_tag() -> None:
     from cu_rates.pipeline.extract import resolve_text
 

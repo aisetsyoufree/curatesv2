@@ -284,6 +284,9 @@ def _require_visible(node: _Node) -> None:
     for item in node.walk():
         if _attr_hidden(item.attrs) or item.tag in {"details", "dialog"}:
             raise ValueError("selected text contains hidden content")
+        if item.tag == "sub":
+            # A subscript can be part of a number (6.12<sub>5</sub>); never flatten it silently.
+            raise ValueError("selected text contains a subscript")
 
 
 def _parse_section(body: bytes, section_id: str) -> _Node:
