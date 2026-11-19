@@ -434,6 +434,8 @@ def capture(
     when: datetime,
     run_id: str,
     body: bytes | None = None,
+    *,
+    expected_confidence: str | None = None,
 ) -> None:
     body = (
         (FIXTURES / f"{source.source_id.split('.')[0]}.html").read_bytes() if body is None else body
@@ -447,9 +449,8 @@ def capture(
         fetch_run_id=run_id,
     )
     result = extract_stored_capture(conn, store, source, fetch_run(profile, artifact))
-    assert result.confidence == ("medium" if source.source_id == "prose.rates" else "high"), (
-        result.diagnostics
-    )
+    expected = expected_confidence or ("medium" if source.source_id == "prose.rates" else "high")
+    assert result.confidence == expected, result.diagnostics
     assert len(result.offers) == 1 and result.offers[0].status is OfferStatus.CANDIDATE
 
 

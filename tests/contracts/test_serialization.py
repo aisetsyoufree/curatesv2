@@ -48,7 +48,8 @@ def _load() -> dict[str, Any]:
 
 def test_v1_fixture_parses_with_exact_decimals_and_utc() -> None:
     offer = NormalizedOffer.model_validate_json(FIXTURE.read_text())
-    assert offer.schema_version == CONTRACT_VERSION == "1.0"
+    assert offer.schema_version == "1.0"
+    assert CONTRACT_VERSION == "1.1"
     assert isinstance(offer.details, PurchaseMortgageDetails)
     assert offer.note_rate is not None
     assert offer.apr is not None
@@ -69,7 +70,7 @@ def test_v1_fixture_matches_the_current_model_exactly() -> None:
     assert NormalizedOffer.model_validate(offer.model_dump(mode="json")) == offer
 
 
-@pytest.mark.parametrize("version", ["2.0", "3.0", "1.1", "0.9", "01.0", "1.00", "1"])
+@pytest.mark.parametrize("version", ["2.0", "3.0", "1.2", "0.9", "01.0", "1.00", "1"])
 def test_fixture_with_unsupported_version_is_rejected(version: str) -> None:
     payload = {**_load(), "schema_version": version}
     with pytest.raises(ValidationError, match="schema_version"):

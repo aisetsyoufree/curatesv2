@@ -166,6 +166,8 @@ class OfferContext(ContractModel):
     source_id: Identifier
     observed_at: UtcDatetime
     comparison_target: CanonicalScenarioId | None = None
+    # Caller has verified absence in the entire stored page; never invent a source fragment.
+    allow_unspecified_purpose: bool = False
     # Configured, reviewed reading of a date written in prose (no clock time or zone). Both
     # or neither. Without them effective_at must be an ISO timestamp with an explicit offset.
     effective_date_format: _values.DateFormat | None = None
@@ -526,6 +528,8 @@ def normalize_offer(
     """Normalize one row. Paths refer to offer fields, scenario statements, or conditions.
 
     Supply product_family and, for mortgage offers, details.purpose from the source.
+    For reviewed absence only, omit details.purpose and set allow_unspecified_purpose;
+    the adapter must verify that the whole page does not state a purpose.
     Scenario comparison uses explicit source fragments on scenario.<dimension> and
     shared facts such as details.term_months; it never fills a dimension from the target.
     Condition paths are conditions.<id>.<kind>[.<dimension>]; untyped qualifiers remain
@@ -575,8 +579,25 @@ def normalize_offer(
         if path not in traces:
             traces[path] = _parse_trace(path, candidate, context)
     purpose = cast("LoanPurpose | None", _get(traces, "details.purpose"))
+    if context.allow_unspecified_purpose:
+        if (
+            family is not ProductFamily.MORTGAGE
+            or "details.purpose" in inputs
+            or context.comparison_target is not None
+        ):
+            raise NormalizationError(
+                "details.purpose",
+                "unspecified purpose requires an absent source purpose and no comparison target",
+            )
+        purpose = LoanPurpose.UNSPECIFIED
+    elif purpose is LoanPurpose.UNSPECIFIED:
+        raise NormalizationError(
+            "details.purpose", "unspecified purpose requires explicit absence authorization"
+        )
     kind = {
-        ProductFamily.MORTGAGE: "purchase_mortgage"
+        ProductFamily.MORTGAGE: "unspecified_mortgage"
+        if purpose is LoanPurpose.UNSPECIFIED
+        else "purchase_mortgage"
         if purpose is LoanPurpose.PURCHASE
         else "refinance_mortgage",
         ProductFamily.HOME_EQUITY_LOAN: "fixed_equity",
@@ -654,7 +675,12 @@ def _make_offer(
     }
     payload = {
         **context.model_dump(
-            exclude={"comparison_target", "effective_date_format", "effective_timezone"}
+            exclude={
+                "comparison_target",
+                "effective_date_format",
+                "effective_timezone",
+                "allow_unspecified_purpose",
+            }
         ),
         **headline,
         "schema_version": CONTRACT_VERSION,

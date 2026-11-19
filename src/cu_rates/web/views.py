@@ -20,7 +20,7 @@ from flask import (
     url_for,
 )
 
-from cu_rates.contracts.enums import ProductFamily
+from cu_rates.contracts.enums import LoanPurpose, ProductFamily
 from cu_rates.intake import IntakeError, IntakeStore, NewCase, ReporterCategory, ReportKind
 from cu_rates.web.comparison import (
     ALLOWED_PARAMS,
@@ -541,6 +541,8 @@ def compare() -> Response:
 
     formatted_offers = []
     for raw in raw_offers:
+        if raw.purpose is LoanPurpose.UNSPECIFIED:
+            continue  # No purchase/refinance scenario context, including incomplete tables.
         item = classify_and_format_offer(raw, now)
         if item is not None:
             formatted_offers.append(item)

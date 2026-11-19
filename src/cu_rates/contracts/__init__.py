@@ -96,6 +96,7 @@ from cu_rates.contracts.offers import (
     RateTier,
     RefinanceMortgageDetails,
     TierBound,
+    UnspecifiedMortgageDetails,
 )
 from cu_rates.contracts.publication import (
     APR_RULE_ID,
@@ -257,6 +258,7 @@ __all__ = [
     "SourcedRate",
     "TierBound",
     "TierDimension",
+    "UnspecifiedMortgageDetails",
     "ValidationPolicy",
     "ValidationResult",
     "VerifiedScenarioCondition",

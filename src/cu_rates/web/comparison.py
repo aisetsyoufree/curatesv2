@@ -309,6 +309,8 @@ def format_term(offer: PublicOffer) -> str:
 def format_loan_type(offer: PublicOffer) -> str:
     """Format loan type using only verified attributes present in snapshot data."""
     parts: list[str] = []
+    if offer.purpose is LoanPurpose.UNSPECIFIED:
+        parts.append("loan purpose not stated by the source")
 
     rate_type = offer.details.get("rate_type")
     if rate_type == "fixed":
@@ -423,6 +425,8 @@ def classify_and_format_offer(offer: PublicOffer, now: datetime) -> FormattedOff
         return None
 
     reasons: list[str] = []
+    if offer.purpose is LoanPurpose.UNSPECIFIED:
+        reasons.append("loan purpose not stated by the source")
     if note_rate is None and offer.family is not ProductFamily.HELOC:
         reasons.append("Missing note rate disclosure")
     if offer.placement is Placement.BROWSE_ONLY:

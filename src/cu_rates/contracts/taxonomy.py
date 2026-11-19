@@ -27,7 +27,8 @@ value or a mapping is a minor bump; renaming or removing a persisted value, or c
 what a value means, is a major bump. Readers accept their own major and any minor up to their
 own. This addition keeps every existing enum value unchanged (``ProductFamily`` gains no
 ``unknown``: ambiguity lives only in findings, so it can never reach a product or offer) and
-adds only new types, so the contract schema stays 1.0.
+originally added only new types at contract 1.0. T040c adds the shared LoanPurpose
+``unspecified`` and widens PURPOSES_BY_FAMILY, so both versions advance to 1.1.
 
 Which version governs what: enums shared with the contract (``ProductFamily``,
 ``LoanPurpose``, ``RateAvailability``, ``SourceRelationshipKind``, ``FetchMethod``,
@@ -72,7 +73,7 @@ from cu_rates.contracts.enums import (
 from cu_rates.contracts.evidence import Provenance
 
 TAXONOMY_MAJOR = 1
-TAXONOMY_MINOR = 0
+TAXONOMY_MINOR = 1
 TAXONOMY_VERSION = f"{TAXONOMY_MAJOR}.{TAXONOMY_MINOR}"
 _VERSION_RE = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", re.ASCII)
 
@@ -192,6 +193,10 @@ class ProductFinding(VersionedModel):
 
     @model_validator(mode="after")
     def _purpose_belongs_to_family(self) -> Self:
+        if LoanPurpose.UNSPECIFIED in self.purposes and (
+            self.schema_version == "1.0" or self.taxonomy_version == "1.0"
+        ):
+            raise ValueError("unspecified purpose requires contract and taxonomy 1.1")
         if self.family is not None and not set(self.purposes) <= PURPOSES_BY_FAMILY[self.family]:
             raise ValueError(f"{self.family.value} has no loan purpose; purposes are mortgage-only")
         return self

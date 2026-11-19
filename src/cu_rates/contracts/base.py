@@ -17,7 +17,7 @@ from pydantic import (
 )
 
 CONTRACT_MAJOR = 1
-CONTRACT_MINOR = 0
+CONTRACT_MINOR = 1
 CONTRACT_VERSION = f"{CONTRACT_MAJOR}.{CONTRACT_MINOR}"
 
 # Version policy: "<major>.<minor>" with canonical ASCII integers (no leading zeros, no

@@ -37,7 +37,7 @@ def test_unknown_fields_are_rejected() -> None:
 
 
 def test_schema_version_is_explicit_not_defaulted() -> None:
-    assert institution().schema_version == CONTRACT_VERSION == "1.0"
+    assert institution().schema_version == CONTRACT_VERSION == "1.1"
     payload = institution().model_dump(mode="json")
     del payload["schema_version"]
     with pytest.raises(ValidationError, match="schema_version"):
@@ -56,7 +56,7 @@ def test_current_version_parses_including_in_nested_models() -> None:
         "3.1",
         "0.9",
         "0.0",  # other majors
-        "1.1",
+        "1.2",
         "1.9",
         "1.10",
         "1.100",  # newer minor: models forbid unknown fields, so unreadable

@@ -77,6 +77,11 @@ Loan purpose is separate from product family:
 - `purchase`
 - `rate_term_refinance`
 - `cash_out_refinance`
+- `unspecified`: the source does not state a mortgage purpose; browse/detail only,
+  labeled "loan purpose not stated by the source", never a canonical scenario or ranking.
+  Static HTML extraction requires the reviewed `allow_unspecified_purpose` flag with
+  no purpose field or comparison target, and refuses any purpose mention on the page.
+  It never substitutes this value for a stated purpose.
 
 Program dimensions are composable:
 
@@ -590,9 +595,9 @@ runs offline; no live collection has been approved or enabled.
 
 - **Toolchain:** `uv`-managed Python 3.12, committed lockfile, Ruff, strict mypy, pytest, and
   the executable `scripts/check` quality gate.
-- **Contracts (`cu_rates.contracts`):** frozen, versioned Pydantic v2 records at schema 1.0
-  (additive changes only), a separate taxonomy version 1.0 (product scope, out-of-scope
-  products, collection method, finding and review states; findings carry evidence and no
+- **Contracts (`cu_rates.contracts`):** frozen, versioned Pydantic v2 records at schema 1.1
+  (additive changes only; 1.0 remains readable), a separate taxonomy version 1.1 (product
+  scope, out-of-scope products, collection method, finding and review states; findings carry evidence and no
   rate fields), and offer fingerprints (`fp1`, pinned to its original hashes, and `fp2`).
 - **Evidence (`artifact_store`):** private SHA-256 content-addressed store with immutable
   per-fetch observations and tamper detection.

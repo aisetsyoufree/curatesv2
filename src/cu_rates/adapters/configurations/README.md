@@ -26,9 +26,9 @@ Supported CSS is deliberately bounded: `#id`, then child (` > `) or descendant (
 selector must resolve to exactly one element. HTML must be UTF-8; unsupported layouts
 (including omitted closing tags) fail closed.
 
-Tolerant mode (`sections`, parser 1.1.0): list the ids of the subtrees the configuration
+Tolerant mode (`sections`, introduced in parser 1.1.0, retained in 1.2.0): list the ids of the subtrees the configuration
 reads. Only those elements are parsed; the rest of the page (stray `</link>`, unclosed body,
-menus) may be imbalanced and is never read, and the layout pin covers only those sections.
+menus) may be imbalanced and is never used as evidence, and the layout pin covers only those sections.
 Imbalance, duplicate attributes or excessive depth inside a section still fail the capture, a
 section id must occur once in the page, and every selector must start with a listed id.
 `<sup>` footnote markers are removed from text in this mode, by tag only; `*` or `(1)` are not.
@@ -46,7 +46,8 @@ re-reviewed; pick sections whose ancestors are stable.
 
 **Sections MUST include every qualifying heading, caption, note and disclosure that gives the
 rates their meaning** (which product, rate type, conditions, footnote text). Text outside the
-listed sections is neither read nor pinned, so a change there cannot be detected. A label and its
+listed sections is not pinned or used as evidence. Only the unspecified-purpose absence veto
+described below scans it; other changes there cannot be detected. A label and its
 value must resolve to the same table row (`tr`) unless the label is in `thead`/`tfoot` or the
 field is a `group_header`; this is checked on the resolved elements at extraction.
 
@@ -59,15 +60,26 @@ canonical `comparison_target` and no `scenario.*` fields. Lock days, points, loa
 credit score and the rest stay "unstated" in `scenario_matches` (never configured as if
 stated), the gate reports `scenario_unstated` and the row can only be browse-only. Points and
 effective time are optional for such rows (gate: `points_unknown`, `effective_date_missing`).
-Contract limit: a mortgage offer requires a stated purpose (it selects the offer kind), so a
-mortgage row whose page does not state one fails closed. Equity rows must state lien position.
+Mortgage rows still require a stated purpose unless explicitly reviewed under parser 1.2.0's
+`allow_unspecified_purpose: true`. That flag requires no `details.purpose` field and no
+`comparison_target`; it may compose with `browse_only: true`, still without `scenario.*`
+fields. The adapter checks the **whole stored page**, including outside configured sections,
+for purchase/refinance/cash-out/home-buying mentions; even a negated mention refuses the row.
+This scan tolerates ordinary outside-section imbalance, supplies no evidence or values, and
+excludes `script`, `style`, `template` and `noscript`; ambiguous/incomplete inert markup fails
+closed. Missing purpose is normalized as `unspecified_mortgage`, labeled "loan purpose not
+stated by the source", and can only appear in browse/detail, never rankings or `/compare`.
+Without the reviewed flag, unstated mortgage purpose still fails closed. Equity rows must
+state lien position. Group headers, prose dates, and all visibility/footnote/row guards apply
+equally to unspecified rows.
 
 Prose dates: `date: {template, format, timezone}` on `effective_at`, e.g. template
 `Rates accurate as of {value}.` with format `Month D, YYYY`. Surrounding text must match the
 whole node exactly, the date is parsed strictly (no impossible dates, no other spellings) and
 becomes the start of that day in the reviewed IANA timezone; medium confidence. Bodies over 2 MiB
 or nesting beyond 128 elements fail with `ValueError` and low extraction confidence.
-Tree traversals are iterative and each extraction parses the body once. Text excludes
+Tree traversals are iterative; field readers reuse the parsed trees during extraction.
+Unspecified-purpose rows additionally scan the full page for the absence veto. Text excludes
 `script`, `style`, `template`, and `noscript` subtrees. Trusted loading isolates any
 capture that raises during verification; other captures can still be checked. Review a
 new adapter version for unsupported variants rather than silently recovering the page structure.
@@ -87,17 +99,22 @@ verbatim fragments in pinned prose context. Any failed check is `low`; failed ex
 are recorded and never promoted. All rows are normalized and validated before any
 candidates, offers, fingerprints, or proofs are inserted. Any row exception makes the
 whole extraction failed/low with zero candidates; missing products and failed validation
-also fail closed. Contract records and schema versions are unchanged.
+also fail closed. T040c adds the unspecified purpose/kind under contract and taxonomy 1.1;
+old 1.0 records remain readable. Deploy 1.1 readers before producing new-shape records.
 Canonical dimensions may use exact source values or explicit ranges. This first adapter
-requires rate/APR, points, closed-end term and effective time; mortgages also require
-purpose, rate type and lock days. Unstated dates/assumptions are never filled in. HELOC
+requires rate/APR and closed-end term; rows without `browse_only` also require points and
+effective time. Mortgages require rate type, purpose (unless the reviewed absence flag is set),
+and lock days (unless browse-only). Unstated dates/assumptions are never filled in. HELOC
 formula/intro extraction and other vendor/browser/PDF variants remain separate work.
 
 The canonical JSON hash is bound into the approved adapter identity without changing
 `SourceApproval`: approve `ParserVersion(name="static-html",
-version=f"1.0.0+cfg.{config.sha256}")` (or use `configuration_parser(config)`). The same
+version=f"1.2.0+cfg.{config.sha256}")` (or use `configuration_parser(config)`). The same
 identity is carried in extraction provenance and source fingerprints. An unqualified
-`1.0.0` approval is insufficient. Every configuration edit (including selectors, columns,
+`1.2.0` approval is insufficient. Versions 1.0.0 and 1.1.0 are no longer dispatched: 1.2.0
+combines v2 with reviewed purpose absence. Canonical configuration hashes now include
+`allow_unspecified_purpose`, even when false, so all static approvals need renewal. Every
+configuration edit (including selectors, columns,
 labels, comparison targets, field paths, and excerpts) needs a new approval identity
 and re-extraction; old and newly generated offers both fail verification against a
 changed configuration until approved. Layout approval remains a separate required pin.

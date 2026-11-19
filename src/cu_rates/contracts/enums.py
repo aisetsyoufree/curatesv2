@@ -29,6 +29,7 @@ class LoanPurpose(StrEnum):
     PURCHASE = "purchase"
     RATE_TERM_REFINANCE = "rate_term_refinance"
     CASH_OUT_REFINANCE = "cash_out_refinance"
+    UNSPECIFIED = "unspecified"
 
 
 class RateType(StrEnum):

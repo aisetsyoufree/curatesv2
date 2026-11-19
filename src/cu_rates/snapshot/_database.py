@@ -11,6 +11,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from cu_rates.contracts.audit import PublishedSnapshot, SnapshotEntry
+from cu_rates.contracts.enums import LoanPurpose
 from cu_rates.contracts.publication import WITHDRAW_AFTER
 
 from ._files import SnapshotError, read_bytes, regular_file, require_directory
@@ -99,6 +100,8 @@ def verify_database(
                     or not offer.observed_at <= info.published_at < offer.valid_until
                 ):
                     raise SnapshotError("offer row does not match the manifest or release time")
+                if offer.purpose is LoanPurpose.UNSPECIFIED and info.schema_version == "1.0":
+                    raise SnapshotError("unspecified purpose requires snapshot schema 1.1")
                 admission = offer.require_protocol2()
                 if any(
                     not info.published_at - WITHDRAW_AFTER <= p.observed_at <= info.published_at

@@ -81,7 +81,7 @@ class PublicEvidencePath(PublicEvidence):
     observed_at: UtcDatetime
     source_id: Identifier
     product_id: Identifier
-    scenario_id: CanonicalScenarioId
+    scenario_id: CanonicalScenarioId | None
     source_class: Text
 
 
@@ -171,6 +171,7 @@ class PublicOffer(ContractModel):
 
     @model_validator(mode="after")
     def _coherent(self) -> Self:
+        self._require_purpose_placement()
         rates = {rate.path: rate.value for rate in self.rates}
         if (
             not rates
@@ -182,6 +183,21 @@ class PublicOffer(ContractModel):
         ):
             raise ValueError("invalid public offer or value fingerprint")
         return self
+
+    def _require_purpose_placement(self) -> None:
+        unspecified = (
+            self.purpose is LoanPurpose.UNSPECIFIED
+            or self.details.get("kind") == "unspecified_mortgage"
+        )
+        if unspecified and (
+            self.purpose is not LoanPurpose.UNSPECIFIED
+            or self.family is not ProductFamily.MORTGAGE
+            or self.scenario_id is not None
+            or self.assumptions
+            or self.placement not in {Placement.BROWSE_ONLY, Placement.INSTITUTION_DETAIL_ONLY}
+            or self.details.get("kind") != "unspecified_mortgage"
+        ):
+            raise ValueError("unspecified purpose is browse/detail only with no canonical scenario")
 
     def require_protocol2(self) -> PublicAdmission:
         """Enforce admission at the storage trust boundary, including retained versions.
@@ -220,6 +236,9 @@ class PublicOffer(ContractModel):
                 )
             if post_intro != expected:
                 raise ValueError("HELOC post-intro value does not match its sourced inputs")
+        self._require_purpose_placement()
+        if self.scenario_id is None and self.purpose is not LoanPurpose.UNSPECIFIED:
+            raise ValueError("only unspecified mortgage purpose admits evidence without a scenario")
         if self.placement is Placement.RANKED:
             # A ranked row must carry evidence for every canonical assumption. Absence,
             # a conflict or an untyped statement can never be re-admitted from storage.

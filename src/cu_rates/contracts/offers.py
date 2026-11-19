@@ -205,14 +205,24 @@ class PurchaseMortgageDetails(_MortgageDetails):
         return LoanPurpose.PURCHASE
 
 
+class UnspecifiedMortgageDetails(_MortgageDetails):
+    """The source does not state purpose; never a purchase/refinance classification."""
+
+    kind: Literal["unspecified_mortgage"] = "unspecified_mortgage"
+
+    @property
+    def purpose(self) -> LoanPurpose:
+        return LoanPurpose.UNSPECIFIED
+
+
 class RefinanceMortgageDetails(_MortgageDetails):
     kind: Literal["refinance_mortgage"] = "refinance_mortgage"
     purpose: LoanPurpose
 
     @model_validator(mode="after")
     def _refinance_purpose(self) -> Self:
-        if self.purpose is LoanPurpose.PURCHASE:
-            raise ValueError("a refinance offer cannot have purchase purpose")
+        if self.purpose not in {LoanPurpose.RATE_TERM_REFINANCE, LoanPurpose.CASH_OUT_REFINANCE}:
+            raise ValueError("a refinance offer cannot have purchase or unspecified purpose")
         return self
 
     def material_paths(self) -> frozenset[str]:
@@ -381,7 +391,11 @@ class HelocDetails(ContractModel):
 
 
 OfferDetails = Annotated[
-    PurchaseMortgageDetails | RefinanceMortgageDetails | FixedEquityDetails | HelocDetails,
+    PurchaseMortgageDetails
+    | RefinanceMortgageDetails
+    | UnspecifiedMortgageDetails
+    | FixedEquityDetails
+    | HelocDetails,
     Field(discriminator="kind"),
 ]
 
@@ -417,7 +431,10 @@ class NormalizedOffer(VersionedModel):
 
     @property
     def family(self) -> ProductFamily:
-        if isinstance(self.details, PurchaseMortgageDetails | RefinanceMortgageDetails):
+        if isinstance(
+            self.details,
+            PurchaseMortgageDetails | RefinanceMortgageDetails | UnspecifiedMortgageDetails,
+        ):
             return ProductFamily.MORTGAGE
         if isinstance(self.details, FixedEquityDetails):
             return ProductFamily.HOME_EQUITY_LOAN
@@ -425,12 +442,17 @@ class NormalizedOffer(VersionedModel):
 
     @property
     def purpose(self) -> LoanPurpose | None:
-        if isinstance(self.details, PurchaseMortgageDetails | RefinanceMortgageDetails):
+        if isinstance(
+            self.details,
+            PurchaseMortgageDetails | RefinanceMortgageDetails | UnspecifiedMortgageDetails,
+        ):
             return self.details.purpose
         return None
 
     @model_validator(mode="after")
     def _consistent(self) -> Self:
+        if isinstance(self.details, UnspecifiedMortgageDetails) and self.schema_version == "1.0":
+            raise ValueError("unspecified mortgage purpose requires contract 1.1")
         self._check_rates_and_times()
         self._check_scenario()
         self._check_collections()
