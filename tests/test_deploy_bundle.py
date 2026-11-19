@@ -1742,3 +1742,120 @@ def test_backup_scope_runbook() -> None:
     ):
         assert term in readme
     assert "0600" in readme and "0700" in readme
+
+
+def test_systemd_protect_kernel_logs_and_remove_ipc_all_units() -> None:
+    """Verify ProtectKernelLogs=true and RemoveIPC=true across all service units (A13)."""
+    service_files = [
+        SYSTEMD_DIR / "cu-rates-web.service",
+        SYSTEMD_DIR / "cu-rates-worker.service",
+        SYSTEMD_DIR / "cu-rates-backup.service",
+        SYSTEMD_DIR / "cu-rates-health.service",
+        SYSTEMD_DIR / "cu-rates-intake-purge.service",
+        SYSTEMD_DIR / "cu-rates-quality.service",
+    ]
+    for sf in service_files:
+        parsed = parse_systemd_unit(sf)
+        sec = parsed.get("Service", {})
+        assert sec.get("ProtectKernelLogs") == ["true"], (
+            f"{sf.name} is missing ProtectKernelLogs=true"
+        )
+        assert sec.get("RemoveIPC") == ["true"], f"{sf.name} is missing RemoveIPC=true"
+
+
+def test_web_unit_network_and_jit_hardening() -> None:
+    """Verify web unit allows only loopback IP traffic and denies JIT / W^X pages (A13)."""
+    parsed = parse_systemd_unit(SYSTEMD_DIR / "cu-rates-web.service")
+    sec = parsed.get("Service", {})
+
+    # Web unit talks strictly to Caddy on localhost
+    assert sec.get("IPAddressDeny") == ["any"], "cu-rates-web.service must have IPAddressDeny=any"
+    assert sec.get("IPAddressAllow") == ["localhost"], (
+        "cu-rates-web.service must have IPAddressAllow=localhost"
+    )
+    assert "PrivateNetwork" not in sec, (
+        "cu-rates-web.service must not set PrivateNetwork=true (needs loopback to Caddy)"
+    )
+
+    # Gunicorn/CPython does not require JIT
+    assert sec.get("MemoryDenyWriteExecute") == ["true"], (
+        "cu-rates-web.service must have MemoryDenyWriteExecute=true"
+    )
+
+
+def test_intake_inaccessible_paths_and_exceptions() -> None:
+    """Verify units that do not need intake isolate it, while preserving legitimate access (A13)."""
+    # Units that must NOT have access to the intake directory
+    isolated_services = [
+        SYSTEMD_DIR / "cu-rates-worker.service",
+        SYSTEMD_DIR / "cu-rates-health.service",
+        SYSTEMD_DIR / "cu-rates-quality.service",
+    ]
+    for sf in isolated_services:
+        parsed = parse_systemd_unit(sf)
+        sec = parsed.get("Service", {})
+        inaccessible = [
+            p.removeprefix("-") for entry in sec.get("InaccessiblePaths", []) for p in entry.split()
+        ]
+        assert "/var/lib/cu-rates/intake" in inaccessible, (
+            f"{sf.name} must isolate /var/lib/cu-rates/intake via InaccessiblePaths"
+        )
+        rw_paths = [p for entry in sec.get("ReadWritePaths", []) for p in entry.split()]
+        assert "/var/lib/cu-rates/intake" not in rw_paths, (
+            f"{sf.name} must not list /var/lib/cu-rates/intake in ReadWritePaths"
+        )
+
+    # Exceptions: backup unit, intake-purge unit, and web unit
+    # 1. Backup unit needs it for backing up intake.sqlite
+    backup_sec = parse_systemd_unit(SYSTEMD_DIR / "cu-rates-backup.service").get("Service", {})
+    backup_inaccessible = [
+        p.removeprefix("-")
+        for entry in backup_sec.get("InaccessiblePaths", [])
+        for p in entry.split()
+    ]
+    assert "/var/lib/cu-rates/intake" not in backup_inaccessible, (
+        "cu-rates-backup.service must NOT isolate intake (needs access to back up intake.sqlite)"
+    )
+    backup_rw = [p for entry in backup_sec.get("ReadWritePaths", []) for p in entry.split()]
+    assert "/var/lib/cu-rates/intake" in backup_rw, (
+        "cu-rates-backup.service must include /var/lib/cu-rates/intake in ReadWritePaths"
+    )
+
+    # 2. Intake-purge unit works on it
+    purge_sec = parse_systemd_unit(SYSTEMD_DIR / "cu-rates-intake-purge.service").get("Service", {})
+    purge_inaccessible = [
+        p.removeprefix("-")
+        for entry in purge_sec.get("InaccessiblePaths", [])
+        for p in entry.split()
+    ]
+    assert "/var/lib/cu-rates/intake" not in purge_inaccessible, (
+        "cu-rates-intake-purge.service must NOT isolate intake (it works on it)"
+    )
+    purge_rw = [p for entry in purge_sec.get("ReadWritePaths", []) for p in entry.split()]
+    assert "/var/lib/cu-rates/intake" in purge_rw, (
+        "cu-rates-intake-purge.service must include /var/lib/cu-rates/intake in ReadWritePaths"
+    )
+
+    # 3. Web unit writes incoming corrections to it
+    web_sec = parse_systemd_unit(SYSTEMD_DIR / "cu-rates-web.service").get("Service", {})
+    web_inaccessible = [
+        p.removeprefix("-") for entry in web_sec.get("InaccessiblePaths", []) for p in entry.split()
+    ]
+    assert "/var/lib/cu-rates/intake" not in web_inaccessible, (
+        "cu-rates-web.service must NOT isolate intake (writes incoming correction cases)"
+    )
+    web_rw = [p for entry in web_sec.get("ReadWritePaths", []) for p in entry.split()]
+    assert "/var/lib/cu-rates/intake" in web_rw, (
+        "cu-rates-web.service must include /var/lib/cu-rates/intake in ReadWritePaths"
+    )
+
+
+def test_readme_disk_layout_and_worker_paths_sync() -> None:
+    """Verify deploy/README.md layout accurately includes automatic/ and intake/ (A15)."""
+    readme = (DEPLOY_DIR / "README.md").read_text(encoding="utf-8")
+    assert "automatic/            # Worker-owned automatic suppression ledger" in readme
+    assert "intake/               # Correction inbox directory" in readme
+    assert (
+        "ReadWritePaths=/var/lib/cu-rates/data /var/lib/cu-rates/artifacts "
+        "/var/lib/cu-rates/snapshots /var/lib/cu-rates/automatic" in readme
+    )

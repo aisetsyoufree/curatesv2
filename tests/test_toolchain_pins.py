@@ -243,3 +243,23 @@ def test_fails_if_uv_build_unpinned_or_multi_minor(invalid_req: str) -> None:
     """
     with pytest.raises(AssertionError):
         validate_uv_build_pin(toml_str)
+
+
+def test_direct_runtime_dependency_httpcore_declared() -> None:
+    """Verify httpcore is a declared runtime dependency (finding A14).
+
+    cu_rates.fetch_dialer directly imports httpcore (ConnectionPool, NetworkStream,
+    timeouts/exceptions). It must be pinned in pyproject.toml rather than relied
+    upon as an undeclared transitive dependency of httpx.
+    """
+    pyproject_text = PYPROJECT_PATH.read_text(encoding="utf-8")
+    data = tomllib.loads(pyproject_text)
+    deps = data.get("project", {}).get("dependencies", [])
+    dep_dict = {}
+    for d in deps:
+        name = re.split(r"[>=<~]", d)[0].strip()
+        dep_dict[name] = d
+    assert "httpcore" in dep_dict, (
+        "httpcore is used directly in cu_rates.fetch_dialer but missing from pyproject.toml"
+    )
+    assert dep_dict["httpcore"] == "httpcore>=1.0.9,<2"

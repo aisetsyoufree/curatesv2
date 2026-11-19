@@ -27,11 +27,13 @@ ProtectSystem=strict
 ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
+ProtectKernelLogs=true
 ProtectControlGroups=true
 RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
+RemoveIPC=true
 PrivateDevices=true
 ProtectClock=true
 ProtectHostname=true
@@ -47,6 +49,7 @@ SystemCallFilter=@system-service
 # Independent withdrawal ledger (/var/lib/cu-rates/independent) is operator-owned and read-only.
 ReadWritePaths=/var/lib/cu-rates/data /var/lib/cu-rates/artifacts /var/lib/cu-rates/snapshots /var/lib/cu-rates/automatic
 ReadOnlyPaths=/var/lib/cu-rates/app /var/lib/cu-rates/independent
+InaccessiblePaths=-/var/lib/cu-rates/intake
 
 # Resource Limits (Raspberry Pi 5 with 16 GB RAM)
 MemoryMax=1G
