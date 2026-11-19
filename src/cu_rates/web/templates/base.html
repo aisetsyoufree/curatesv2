@@ -35,6 +35,7 @@
         <ul>
           <li><a href="{{ url_for('web.home') }}"{% if request.endpoint == 'web.home' %} aria-current="page"{% endif %}>Home</a></li>
           <li><a href="{{ url_for('web.compare') }}"{% if request.endpoint == 'web.compare' %} aria-current="page"{% endif %}>Compare</a></li>
+          <li><a href="{{ url_for('web.credit_unions') }}"{% if request.endpoint in ['web.credit_unions', 'web.credit_union_profile'] %} aria-current="page"{% endif %}>Credit Unions</a></li>
           <li><a href="{{ url_for('web.learn_index') }}"{% if request.endpoint == 'web.learn_index' %} aria-current="page"{% endif %}>Learn</a></li>
           <li><a href="{{ url_for('web.methodology') }}"{% if request.endpoint == 'web.methodology' %} aria-current="page"{% endif %}>Methodology</a></li>
           <li><a href="{{ url_for('web.privacy') }}"{% if request.endpoint == 'web.privacy' %} aria-current="page"{% endif %}>Privacy</a></li>
