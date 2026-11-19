@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+
+{% block content %}
+<article>
+  <h1>Massachusetts Credit Union Profiles and Coverage</h1>
+  <p class="lead-text">Credit unions that appear in the verified public snapshot. A credit union that is not listed here has not been verified, which says nothing about whether it offers home loans.</p>
+
+  {% if institutions %}
+  <div class="table-responsive card">
+    <table class="data-table">
+      <caption>Credit unions in the verified public snapshot</caption>
+      <thead>
+        <tr>
+          <th scope="col">Legal name</th>
+          <th scope="col">NCUA charter number</th>
+          <th scope="col">Verified offers shown</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for inst in institutions %}
+        <tr>
+          <th scope="row"><a href="{{ url_for('web.credit_union_profile', charter=inst.charter) }}">{{ inst.name }}</a></th>
+          <td>{{ inst.charter }}</td>
+          <td>{{ inst.offer_count }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <section class="empty-state-card card" aria-labelledby="no-profiles-heading">
+    <h2 id="no-profiles-heading">No Verified Credit Union Profiles Yet</h2>
+    <p>No credit union is present in a verified public snapshot at this time, so none is listed.</p>
+  </section>
+  {% endif %}
+
+  {% include '_coverage_notes.html' %}
+</article>
+{% endblock %}

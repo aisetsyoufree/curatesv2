@@ -35,6 +35,7 @@ from cu_rates.web.comparison import (
     sort_offers,
 )
 from cu_rates.web.consent import CONSENT_COOKIE, analytics_ready
+from cu_rates.web.profiles import request_directory, snapshot_clock
 
 web_bp = Blueprint("web", __name__)
 
@@ -164,6 +165,12 @@ _PAGE_META: dict[str, tuple[str, str, tuple[tuple[str, str], ...]]] = {
         "Unreviewed articles stay out of the search index.",
         (("Home", "/"), ("Learn", "/learn")),
     ),
+    "web.credit_unions": (
+        "Massachusetts Credit Union Profiles and Coverage",
+        "Credit unions found in the verified public snapshot, with the coverage state of each "
+        "home-lending product family. Coverage that cannot be verified is shown as unknown.",
+        (("Home", "/"), ("Credit Unions", "/credit-unions")),
+    ),
     "web.compare": (
         "Compare Residential Lending Terms",
         "Compare publicly advertised mortgage and home equity terms across Massachusetts "
@@ -232,6 +239,22 @@ def seo_for_request() -> Seo | None:
         description = str(article["summary"])
         path = f"/learn/{slug}"
         crumb_pairs = (("Home", "/"), ("Learn", "/learn"), (title, path))
+    elif endpoint == "web.credit_union_profile":
+        charter = (request.view_args or {}).get("charter")
+        institution = request_directory()[1].get(charter) if isinstance(charter, int) else None
+        if institution is None:
+            return None
+        title = f"{institution.name} (Charter {institution.charter}) Profile and Coverage"
+        description = (
+            f"Verified public snapshot coverage for charter {institution.charter}. "
+            "Anything not verified is shown as unknown, never as current fact."
+        )
+        path = f"/credit-unions/{institution.charter}"
+        crumb_pairs = (
+            ("Home", "/"),
+            ("Credit Unions", "/credit-unions"),
+            (institution.name, path),
+        )
     elif endpoint in _PAGE_META:
         title, description, crumb_pairs = _PAGE_META[endpoint]
     else:
@@ -610,6 +633,39 @@ def compare() -> Response:
     return Response(rendered, headers=headers)
 
 
+@web_bp.route("/credit-unions")
+def credit_unions() -> Response:
+    """List institutions present in the verified public snapshot."""
+    info, directory = request_directory()
+    institutions = sorted(directory.values(), key=lambda i: (i.name.lower(), i.charter))
+    noindex = not any(i.has_verified for i in institutions)
+    rendered = render_template(
+        "credit_unions.html",
+        institutions=institutions,
+        snapshot_info=info,
+        noindex=noindex,
+    )
+    return Response(rendered, headers={"X-Robots-Tag": "noindex, follow"} if noindex else {})
+
+
+@web_bp.route("/credit-unions/<int:charter>")
+def credit_union_profile(charter: int) -> Response:
+    """Profile and per-product coverage for one charter that exists in the snapshot."""
+    info, directory = request_directory()
+    institution = directory.get(charter)
+    if institution is None:
+        abort(404)
+    noindex = not institution.has_verified
+    rendered = render_template(
+        "credit_union.html",
+        institution=institution,
+        snapshot_info=info,
+        noindex=noindex,
+        now=snapshot_clock(),
+    )
+    return Response(rendered, headers={"X-Robots-Tag": "noindex, follow"} if noindex else {})
+
+
 @web_bp.route("/learn")
 def learn_index() -> Response:
     """Render educational content index."""
@@ -671,6 +727,12 @@ def sitemap_xml() -> Response:
     _info, raw_offers = read_snapshot_offers(at=now)
     if any(classify_and_format_offer(raw, now) is not None for raw in raw_offers):
         urls.append(f"{origin}/compare")
+
+    # Profiles enter the sitemap only with fresh verified offers; the list needs one profile.
+    verified = sorted(i.charter for i in request_directory()[1].values() if i.has_verified)
+    if verified:
+        urls.append(f"{origin}/credit-unions")
+        urls.extend(f"{origin}/credit-unions/{charter}" for charter in verified)
 
     # Unreviewed articles remain excluded from sitemap until verified
     for slug, meta in ARTICLES.items():
