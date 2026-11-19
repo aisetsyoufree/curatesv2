@@ -566,6 +566,73 @@ The root write retains mode `0640` and the parent directory's `cu-rates` group; 
 
 **Limits to know.** The form's rate limits are per web process (three Gunicorn workers), so roughly 6 reports per client and 45 in total per hour per host; one determined client can still fill the inbox, which is what `bulk-reject` is for. The client address used for those limits comes from `CF-Connecting-IP` and is trusted for that purpose only.
 
+## 7c. Private Operator Review Console
+
+SSH to the Pi, then run the console as the installation's service user (`cu-rates`
+by default; use the `APP_USER` chosen for a customized install). Pass the actual
+worker `OPERATIONAL_DB` as `--db`, and the public site's `INTAKE_DB` as
+`--intake-db` if correction intake is configured. These are explicit absolute paths;
+the console does not load `/etc/cu-rates/cu-rates.env` or guess a database. Keep
+both databases and their parent directories private to the service user (0700
+directories, 0600 files); allow SQLite WAL side files in those directories.
+
+After installing the reviewed code/venv, stop operational writers, take a verified
+backup, and migrate the operational DB to Alembic head from the installed checkout:
+
+```bash
+cd /var/lib/cu-rates/app
+sudo -u cu-rates /var/lib/cu-rates/venv/bin/python -c "from pathlib import Path; from cu_rates.db import upgrade_database; upgrade_database(Path('/var/lib/cu-rates/data/operational.sqlite'))"
+sudo -u cu-rates /var/lib/cu-rates/venv/bin/python -m cu_rates.review --db /var/lib/cu-rates/data/operational.sqlite --intake-db /var/lib/cu-rates/intake/intake.sqlite list
+sudo -u cu-rates /var/lib/cu-rates/venv/bin/python -m cu_rates.review --db /var/lib/cu-rates/data/operational.sqlite show product '<product-id>'
+sudo -u cu-rates /var/lib/cu-rates/venv/bin/python -m cu_rates.review --db /var/lib/cu-rates/data/operational.sqlite approve product '<product-id>' --sha256 '<sha256 from show>' --actor '<your name>' --note '<evidence and rationale>'
+```
+
+Omit `--intake-db` until intake exists. Use `show source '<request-id>'` and
+`approve source` or `reject source` with the same required flags for source requests;
+`reject product` records a content-bound rejection. Review the full evidence excerpts
+and the exact approval scope printed by `show`. Use its top-level `sha256` token,
+not `reviewed_product_sha256`. Changed content, stale source approvals and repeated
+decisions are refused. A rejection is final for that unchanged product/request;
+changed products require another review. Product age is the earliest stored offer
+observation, or explicitly unknown when there is no stored timestamp.
+
+Source uncertainty is routed by acquisition code using
+`cu_rates.review.store.enqueue_source_review(conn, proposal, charter=..., profile_id=...,
+reason=..., at=...)` in its transaction. It takes a validated `SourceApproval` template,
+discards its proposed verdict/actor/time/id/rationale, and appends an idempotent
+`source_review_requests` row with the proposed policy, profile/layout/parser/origins,
+evidence excerpts and a digest of the current source binding. **Enqueueing grants no
+approval.** No production uncertainty router exists yet; callers must use this helper
+when that routing is implemented. The CLI alone writes the owner's decision via the
+existing `insert_approval` path, using the request ID as the approval ID. A stale
+request remains visible: route a new proposal to approve current content; explicitly
+rejecting the old request records a source rejection and blocks publication. It does
+not merely dismiss a notification. Requests and decisions cannot be updated, deleted
+or replaced, and downgrade refuses to discard a populated queue.
+
+Quarantined offers show persisted validation/rejection reasons and a manual `rerun`
+guidance marker; the console cannot release quarantine or execute an adapter. If no
+reason was persisted it says so; confidence tiers are not yet persisted by production
+adapters. Corrections are read-only here and point to `python -m cu_rates.intake`
+`show`, `triage`, `resolve` and `withdraw`; reply contacts are never read or displayed.
+Approval does not publish a snapshot, bypass identity/robots/terms controls or lift a
+denylist entry. The collector's disabled/masked state remains governed by D-15/D-18.
+
+For the optional read-only page, keep this process running in an SSH session:
+
+```bash
+sudo -u cu-rates /var/lib/cu-rates/venv/bin/python -m cu_rates.review --db /var/lib/cu-rates/data/operational.sqlite --intake-db /var/lib/cu-rates/intake/intake.sqlite serve --port 8765
+# On your own computer, in another terminal:
+ssh -N -L 127.0.0.1:8765:127.0.0.1:8765 '<ssh-host>'
+```
+
+Open `http://127.0.0.1:8765/` locally. The server only accepts a `127.0.0.1` bind,
+uses no JavaScript or external resources, and offers no approval actions. All decisions
+stay in the CLI with an actor, note and hash. Stop it with Ctrl-C. It is for trusted
+host users and SSH tunnel users, with no separate web login. Never add this port or
+application to Caddy, Cloudflare Tunnel, a public service, or the public Flask app.
+The installer needs no additional service or public route.
+
 ## 8. Uninstall Runbook
 
 To cleanly decommission the deployment without affecting other host services:

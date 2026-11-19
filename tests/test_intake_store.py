@@ -378,7 +378,10 @@ def test_the_only_database_the_store_ever_opens_is_its_own_path() -> None:
     ]
     assert len(connects) == 2
     for call in connects:
-        assert ast.unparse(call.args[0]) == "self.path"
+        assert ast.unparse(call.args[0]) in {
+            "self.path",
+            "self.path.as_uri() + '?mode=ro' if read_only else self.path",
+        }
 
 
 def test_every_connection_the_store_hands_out_has_secure_delete_on(intake: IntakeStore) -> None:

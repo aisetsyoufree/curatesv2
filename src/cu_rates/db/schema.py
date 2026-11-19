@@ -67,6 +67,7 @@ metadata = MetaData()
 # unless recursive_triggers is enabled. Alternate unique keys are enumerated
 # below too: a conflict on any one of them can replace history.
 APPEND_ONLY_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
+    "source_review_requests": ("request_id",),
     "fetch_runs": ("run_id",),
     "not_modified_observations": ("run_id",),
     "review_decisions": ("review_id",),
@@ -488,6 +489,21 @@ source_approvals = Table(
         name="ck_source_approvals_adapter",
     ),
     _enum_check("source_approvals", "decision", ReviewVerdict),
+)
+
+source_review_requests = Table(
+    "source_review_requests",
+    metadata,
+    _id("request_id", primary_key=True),
+    Column("source_id", SqlText, ForeignKey("rate_sources.source_id"), nullable=False),
+    Column(
+        "institution_charter", Integer, ForeignKey("institutions.charter_number"), nullable=False
+    ),
+    Column("profile_id", SqlText, ForeignKey("fetch_profiles.profile_id"), nullable=False),
+    Column("requested_at", UtcDateTime, nullable=False),
+    Column("reason", SqlText, nullable=False),
+    Column("proposal_json", JsonDocument, nullable=False),
+    Column("content_sha256", SqlText, nullable=False),
 )
 
 source_approval_evidence = Table(

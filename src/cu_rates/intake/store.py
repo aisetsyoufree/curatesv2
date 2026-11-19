@@ -254,7 +254,7 @@ class IntakeStore:
         os.chmod(self.path, 0o600)
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
+    def _connect(self, *, read_only: bool = False) -> Iterator[sqlite3.Connection]:
         # The file must already exist and be a regular, private file: a missing or odd store
         # means "intake unavailable", never "create one on demand from a public request".
         try:
@@ -263,11 +263,20 @@ class IntakeStore:
             raise IntakeError("the intake database is not available") from exc
         if not self.path.is_file() or self.path.is_symlink() or info.st_mode & 0o077:
             raise IntakeError("the intake database is not a private regular file")
-        with closing(sqlite3.connect(self.path, timeout=5)) as raw:
+        with closing(
+            sqlite3.connect(
+                self.path.as_uri() + "?mode=ro" if read_only else self.path,
+                timeout=5,
+                uri=read_only,
+            )
+        ) as raw:
             raw.execute("PRAGMA foreign_keys=ON")
             # Redaction and contact deletion must really remove the bytes from the file (and
             # so from any copy or backup of it), not merely hide the rows.
-            raw.execute("PRAGMA secure_delete=ON")
+            if read_only:
+                raw.execute("PRAGMA query_only=ON")
+            else:
+                raw.execute("PRAGMA secure_delete=ON")
             raw.row_factory = sqlite3.Row
             yield raw
 
@@ -492,7 +501,7 @@ class IntakeStore:
             return self._view(raw, row, with_contact=True)
 
     def list_cases(self, *, only_open: bool = True) -> tuple[CaseView, ...]:
-        with self._connect() as raw:
+        with self._connect(read_only=True) as raw:
             rows = raw.execute("SELECT * FROM cases ORDER BY received_at, case_id").fetchall()
             views = tuple(self._view(raw, row, with_contact=False) for row in rows)
         return tuple(v for v in views if v.resolution is None) if only_open else views
