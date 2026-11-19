@@ -236,12 +236,18 @@ def test_deployed_upgrade_downgrade_restores_frozen_sql_and_data(
         kept = {
             table: _rows(raw, table)
             for table in s.APPEND_ONLY_TABLES
-            if not table.startswith("institution_identity")
+            if not table.startswith(("institution_identity", "source_review_requests"))
         }
     expected = {
         name: sql
         for name, sql in s.schema_triggers()
-        if not name.startswith(("institution_identity_reviews", "institution_identity_evidence"))
+        if not name.startswith(
+            (
+                "institution_identity_reviews",
+                "institution_identity_evidence",
+                "source_review_requests",
+            )
+        )
     }
 
     def no_live_builder(*args: object, **kwargs: object) -> None:

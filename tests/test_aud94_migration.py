@@ -28,7 +28,8 @@ def _tables(raw: sqlite3.Connection) -> set[str]:
 
 def test_head_chain_and_frozen_sql(tmp_path: Path) -> None:
     script = ScriptDirectory.from_config(_config(tmp_path / "unused.sqlite"))
-    assert script.get_heads() == [REVISION]
+    assert len(script.get_heads()) == 1
+    assert REVISION in {r.revision for r in script.walk_revisions()}
     revision = script.get_revision(REVISION)
     assert revision is not None and revision.down_revision == PREVIOUS
     source = (VERSIONS_DIR / f"{REVISION}.py").read_text(encoding="utf-8")
@@ -41,12 +42,16 @@ def test_upgrade_adds_guarded_tables_and_preserves_history(tmp_path: Path) -> No
     with closing(sqlite3.connect(path)) as raw:
         before_tables = _tables(raw)
         kept = {name: _rows(raw, name) for name in before_tables if name != "alembic_version"}
-    upgrade_database(path)
+    upgrade_database(path, REVISION)
     assert current_revision(path) == REVISION
     with closing(sqlite3.connect(path)) as raw:
         assert _tables(raw) - before_tables == set(NEW_TABLES)
         assert {name: _rows(raw, name) for name in kept} == kept
-        assert _triggers(raw) == dict(s.schema_triggers())
+        assert _triggers(raw) == {
+            name: sql
+            for name, sql in s.schema_triggers()
+            if not name.startswith("source_review_requests_")
+        }
         for table in NEW_TABLES:
             for action in ("update", "delete", "replace"):
                 assert f"{table}_no_{action}" in _triggers(raw)
@@ -58,20 +63,20 @@ def test_downgrade_removes_only_the_new_tables_and_is_repeatable(tmp_path: Path)
     with closing(sqlite3.connect(path)) as raw:
         before = _triggers(raw)
         before_tables = _tables(raw)
-    upgrade_database(path)
+    upgrade_database(path, REVISION)
     downgrade_database(path, PREVIOUS)
     assert current_revision(path) == PREVIOUS
     with closing(sqlite3.connect(path)) as raw:
         assert _tables(raw) == before_tables
         assert _triggers(raw) == before
-    upgrade_database(path)
+    upgrade_database(path, REVISION)
     assert current_revision(path) == REVISION
 
 
 def test_the_new_tables_enforce_their_checks_and_foreign_keys(tmp_path: Path) -> None:
     path = tmp_path / "history.sqlite"
     _deployed(path)
-    upgrade_database(path)
+    upgrade_database(path, REVISION)
     with closing(sqlite3.connect(path)) as raw:
         raw.execute("PRAGMA foreign_keys=ON")
         columns = "(review_id, schema_version, institution_charter, legal_name, identity_confirmed,"
@@ -104,7 +109,7 @@ def _insert_dummy_row(raw: sqlite3.Connection, table: str) -> None:
 def test_downgrade_refuses_while_identity_reviews_exist(tmp_path: Path, table: str) -> None:
     path = tmp_path / "history.sqlite"
     _deployed(path)
-    upgrade_database(path)
+    upgrade_database(path, REVISION)
     with closing(sqlite3.connect(path)) as raw:
         _insert_dummy_row(raw, table)
     with pytest.raises(RuntimeError, match="refusing downgrade of aud94"):
