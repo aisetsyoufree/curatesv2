@@ -36,8 +36,8 @@ All persistent data, code, virtual environments, and evidence artifacts reside u
 
 ```
 /var/lib/cu-rates/
-├── app/                  # Application code repository clone
-├── venv/                 # uv-managed Python 3.12 virtual environment (deploy group)
+├── app/                  # Application code repository clone (root:cu-rates, mode 0755)
+├── venv/                 # uv-managed Python 3.12 virtual environment (root:cu-rates, mode 0755, deploy group)
 ├── .cache/               # uv package cache directory (mode 0755)
 ├── snapshots/            # Public snapshot directory (read-only for web process)
 │   ├── current.json      # Atomic JSON pointer to current active snapshot version
@@ -54,7 +54,7 @@ All persistent data, code, virtual environments, and evidence artifacts reside u
 └── installed-commit      # Root-owned deployment commit record (mode 0644, D-17)
 
 /etc/cu-rates/
-└── cu-rates.env          # Externalized environment configuration (mode 0600)
+└── cu-rates.env          # Externalized environment configuration (root:cu-rates, mode 0640)
 
 /run/cu-rates-web/        # Ephemeral web runtime tmpfs directory (mode 0755)
 /run/cu-rates-worker/     # Ephemeral worker runtime tmpfs directory (mode 0750)
@@ -91,8 +91,8 @@ sudo bash deploy/install.sh --apply
 This step:
 - Creates the unprivileged `cu-rates` user and group.
 - Creates the layout under `/var/lib/cu-rates` (including `/var/lib/cu-rates/app`, `/var/lib/cu-rates/.cache`, and operator-owned `/var/lib/cu-rates/independent`) with safe ownership and permissions, chowning only what is created; it never runs `chown -R` on existing directories.
-- Copies `deploy/env.example` to `/etc/cu-rates/cu-rates.env` (mode 0600) if not present.
-- Installs `cu-rates-web.service`, `cu-rates-worker.service`, and `cu-rates-worker.timer` into `/etc/systemd/system/`.
+- Copies `deploy/env.example` to `/etc/cu-rates/cu-rates.env` (root:cu-rates, mode 0640) if not present.
+- Installs all 11 systemd units from `deploy/systemd/*` (`cu-rates-web.service`, `cu-rates-worker.service`, `cu-rates-worker.timer`, `cu-rates-backup.service`, `cu-rates-backup.timer`, `cu-rates-health.service`, `cu-rates-health.timer`, `cu-rates-quality.service`, `cu-rates-quality.timer`, `cu-rates-intake-purge.service`, and `cu-rates-intake-purge.timer`) into `/etc/systemd/system/`.
 - Enables `cu-rates-web.service` on boot.
 - **Explicitly ensures `cu-rates-worker.service` and `cu-rates-worker.timer` remain STOPPED, DISABLED, and MASKED (`ln -sf /dev/null /etc/systemd/system/<unit>`) per Decisions D-15 and D-17.**
 - **Records installed commit in root-owned state file `/var/lib/cu-rates/installed-commit` (mode 0644) per Decision D-17.**
@@ -138,10 +138,11 @@ This establishes version 1 with ownership `root:cu-rates` and mode `0640`, reada
 Review and edit `/etc/cu-rates/cu-rates.env`:
 ```bash
 sudo nano /etc/cu-rates/cu-rates.env
-# Ensure mode 0600 is retained:
-sudo chmod 0600 /etc/cu-rates/cu-rates.env
+# Ensure root:cu-rates ownership and mode 0640 are retained:
+sudo chown root:cu-rates /etc/cu-rates/cu-rates.env
+sudo chmod 0640 /etc/cu-rates/cu-rates.env
 ```
-> **Environment Variables (T055):** Gunicorn's `cu_rates.web:create_app()` entry point now reads `CANONICAL_ORIGIN`, `ENABLE_ANALYTICS`, `GA_MEASUREMENT_ID`, `ADS_ENABLED`, `SNAPSHOT_ROOT`, and `DENYLIST_PATH`. `create_app(config_dict)` remains isolated from the environment for tests and embedders. Gunicorn reads `GUNICORN_CMD_ARGS` directly. The legacy `CU_RATES_SNAPSHOT_DIR` and `CU_RATES_DENYLIST_PATH` names are not read; replace them with the names above.
+> **Environment Variables (T055):** Gunicorn's `cu_rates.web:create_app()` entry point now reads `CANONICAL_ORIGIN`, `ENABLE_ANALYTICS`, `GA_MEASUREMENT_ID`, `ADS_ENABLED`, `SNAPSHOT_ROOT`, `DENYLIST_PATH`, `AUTOMATIC_DENYLIST_PATH`, and `INTAKE_DB`. `create_app(config_dict)` remains isolated from the environment for tests and embedders. Gunicorn reads `GUNICORN_CMD_ARGS` directly. Optional worker paths for the read-only configuration check (`python -m cu_rates.worker_config check`) include `OPERATIONAL_DB`, `TERMS_LEDGER_PATH`, `WORKER_STATE_DIR`, and `ARTIFACT_ROOT`. The legacy `CU_RATES_SNAPSHOT_DIR` and `CU_RATES_DENYLIST_PATH` names are not read; replace them with the names above.
 
 Unset values default to canonical origin `https://cu-rates.org`, analytics and ad slots off, no measurement ID, and no configured snapshot paths (the reader defaults to local `data/snapshots` and `data/independent/withdrawals.json`). Invalid settings abort startup. Booleans accept only `0` or `1`. `GA_MEASUREMENT_ID` must be absent/empty or match `G-[A-Z0-9]{10}` exactly. Canonical origins must be bare HTTPS DNS origins (optional valid port, optional trailing slash), without credentials, paths, queries, or fragments. Paths must be absolute without whitespace, control characters, or `..`; configured files are still verified by `SnapshotReader` on every read. Empty origin/path/boolean values are rejected. No environment setting enables live collection.
 
@@ -639,8 +640,8 @@ To cleanly decommission the deployment without affecting other host services:
 
 1. **Stop and Disable Services:**
    ```bash
-   sudo systemctl stop cu-rates-web.service cu-rates-worker.timer cu-rates-worker.service cu-rates-backup.timer cu-rates-backup.service cu-rates-health.timer cu-rates-health.service cu-rates-quality.timer cu-rates-quality.service
-   sudo systemctl disable cu-rates-web.service cu-rates-worker.timer cu-rates-backup.timer cu-rates-health.timer cu-rates-quality.timer
+   sudo systemctl stop cu-rates-web.service cu-rates-worker.timer cu-rates-worker.service cu-rates-backup.timer cu-rates-backup.service cu-rates-health.timer cu-rates-health.service cu-rates-quality.timer cu-rates-quality.service cu-rates-intake-purge.timer cu-rates-intake-purge.service
+   sudo systemctl disable cu-rates-web.service cu-rates-worker.timer cu-rates-backup.timer cu-rates-health.timer cu-rates-quality.timer cu-rates-intake-purge.timer
    ```
 
 2. **Remove Systemd Units:**
