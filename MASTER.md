@@ -12,7 +12,7 @@
 | Repository | [aisetsyoufree/curatesv2](https://github.com/aisetsyoufree/curatesv2) |
 | Work tracker | [CU-Rates.org V2 GitHub Project](https://github.com/users/aisetsyoufree/projects/1) |
 | Authoritative local clone | `/Users/sid/Code/cu-rates.org-v2` |
-| Last updated | 2026-11-18 |
+| Last updated | 2026-11-19 |
 
 ## 1. Vision and objective
 
@@ -475,7 +475,7 @@ Model availability is verified immediately before assignment.
 
 | Role | Preferred model | Responsibility |
 |---|---|---|
-| Product manager / architect / integrator | GPT-6.1 Sol through Codex | Product decisions, architecture, issue specifications, disagreement resolution, integration, and final QA |
+| Product manager / architect / integrator | Claude (orchestrator), with Codex, Gemini and Claude subagents as workers and independent reviewers | Product decisions, architecture, issue specifications, disagreement resolution, integration, and final QA |
 | Primary implementation | Claude Sonnet 5.5 | Bounded features, migrations, tests, and fixes from one approved issue |
 | Implementation fallback | Claude Sonnet 4.6 Thinking | Same role when the preferred model is unavailable |
 | Scraper and long-running implementation | Grok Build | Adapters, collection debugging, and bounded implementation |
@@ -596,11 +596,11 @@ runs offline; no live collection has been approved or enabled.
   rate fields), and offer fingerprints (`fp1`, pinned to its original hashes, and `fp2`).
 - **Evidence (`artifact_store`):** private SHA-256 content-addressed store with immutable
   per-fetch observations and tamper detection.
-- **Fetch worker (`fetch_worker`, `fetch_robots`):** policy-gated collector covering robots
-  decisions, spacing, bounded retries with `Retry-After`, the 403/429 pause and block rules,
-  challenge detection, and refusal of non-global destinations and of redirects. Only a mock
-  transport can be dispatched; a live transport stays disabled until a gateway-owned pinned
-  dialer is built and independently reviewed.
+- **Fetch worker (`fetch_worker`, `fetch_robots`, `fetch_dialer`):** policy-gated collector
+  covering robots decisions, spacing, bounded retries with `Retry-After`, the 403/429 pause
+  and block rules, challenge detection, and refusal of non-global destinations and of redirects.
+  The fetch worker can dispatch a pinned transport (`fetch_dialer.py`), but live collection
+  remains disabled and the worker service and timer remain masked per D-15 and D-17.
 - **Publication gate (`contracts.publication`):** deterministic, fail-closed evaluator with
   stable reason codes: approved source and fetch-profile digest, current evidence, review and
   fingerprint binding, scenario evidence, corrections, source/offer/product/institution/
@@ -611,18 +611,26 @@ runs offline; no live collection has been approved or enabled.
   locators, and rule IDs and keep null, zero, unknown, and not-applicable distinct.
   Validation runs ten versioned rules and returns quarantine records with their evidence.
 - **Database (`db`, `alembic`):** SQLAlchemy 2 and Alembic over SQLite in WAL mode, frozen
-  migrations (`t012_initial`, `t020_roster_import`, `t014_trusted_records`), enforced foreign
-  keys, composite institution-bound references, and append-only history guarded by triggers
+  migrations in chain order (`t012_initial`, `t020_roster_import`, `t014_trusted_records`,
+  `aud4b_roster_guards`, `aud73_unique_guards`, `aud98_canonical_dimensions`,
+  `aud94_identity_reviews`, `t056a_source_review_requests`), enforced foreign keys,
+  composite institution-bound references, and append-only history guarded by triggers
   and an engine check.
 - **Roster import (`roster`):** repeatable, source-versioned import from a local CSV with the
   raw file kept as evidence; it never marks a charter verified.
-- **Offline vertical slice (`pipeline`):** one synthetic source from mock fetch to a reviewed
-  publication and a verified 304 republication, with a slice-only extractor; real adapters
-  do not exist yet.
+- **Offline vertical slice and adapters (`pipeline`, `adapters`):** synthetic pipeline from
+  mock fetch to a reviewed publication and a verified 304 republication; real static HTML
+  adapter v2 (`adapters.static_html`) with configuration registry and candidate normalization.
 - **Website foundation (`web`):** server-rendered Flask pages with strict headers and no
-  third-party requests, optional analytics disabled, and educational articles that are all
+  third-party requests, optional analytics disabled, educational articles that are all
   marked unreviewed (draft banner, `noindex`, excluded from the sitemap) until a human
-  reviews them. It shows no rates or institution data and never opens the worker database.
+  reviews them, comparison views reading sealed snapshots, and institution profile pages
+  (`/credit-unions`). It never opens the worker database.
+- **Public snapshots and denylists (`snapshot`):** atomic public snapshot builder and reader,
+  versioned publisher, and independent operator and automatic suppression denylists.
+- **Correction intake and operations (`intake`, `ops`, `review`):** private append-only
+  correction inbox database with triage CLI and contact purging; local verified backup/restore/prune;
+  periodic health and data quality checks; and private operator review console CLI and local server.
 
 Task status and next work are intentionally not duplicated here; use the GitHub Project and
 Issues.
