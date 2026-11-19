@@ -64,10 +64,12 @@ Mortgage rows still require a stated purpose unless explicitly reviewed under pa
 `allow_unspecified_purpose: true`. That flag requires no `details.purpose` field and no
 `comparison_target`; it may compose with `browse_only: true`, still without `scenario.*`
 fields. The adapter checks the **whole stored page**, including outside configured sections,
-for purchase/refinance/cash-out/home-buying mentions; even a negated mention refuses the row.
-This scan tolerates ordinary outside-section imbalance, supplies no evidence or values, and
-excludes `script`, `style`, `template` and `noscript`; ambiguous/incomplete inert markup fails
-closed. Missing purpose is normalized as `unspecified_mortgage`, labeled "loan purpose not
+for purchase/refinance/cash-out/home-buying and Spanish compra/refinanci stems; even a
+negated mention refuses the row. The full UTF-8 body is entity-decoded, NFKC-normalized,
+and stripped of soft hyphens and zero-width format characters. Attributes, comments and
+inert markup participate in this conservative veto, as does text joined across tags.
+This scan tolerates outside-section imbalance and supplies no evidence or values.
+Missing purpose is normalized as `unspecified_mortgage`, labeled "Loan purpose not
 stated by the source", and can only appear in browse/detail, never rankings or `/compare`.
 Without the reviewed flag, unstated mortgage purpose still fails closed. Equity rows must
 state lien position. Group headers, prose dates, and all visibility/footnote/row guards apply
@@ -79,8 +81,8 @@ whole node exactly, the date is parsed strictly (no impossible dates, no other s
 becomes the start of that day in the reviewed IANA timezone; medium confidence. Bodies over 2 MiB
 or nesting beyond 128 elements fail with `ValueError` and low extraction confidence.
 Tree traversals are iterative; field readers reuse the parsed trees during extraction.
-Unspecified-purpose rows additionally scan the full page for the absence veto. Text excludes
-`script`, `style`, `template`, and `noscript` subtrees. Trusted loading isolates any
+Unspecified-purpose rows additionally scan the full page for the absence veto. Field evidence
+still excludes `script`, `style`, `template`, and `noscript` subtrees. Trusted loading isolates any
 capture that raises during verification; other captures can still be checked. Review a
 new adapter version for unsupported variants rather than silently recovering the page structure.
 
@@ -118,7 +120,9 @@ configuration edit (including selectors, columns,
 labels, comparison targets, field paths, and excerpts) needs a new approval identity
 and re-extraction; old and newly generated offers both fail verification against a
 changed configuration until approved. Layout approval remains a separate required pin.
-Full re-normalized values, scenario proofs and provenance must also match.
+Full re-normalized values, scenario proofs and provenance must also match. Replay ignores
+only lifecycle fields and the compatible schema envelope version, so stored 1.0 offers
+can replay under the 1.1 normalizer without relaxing value or provenance equality.
 
 The `git_sha` used for re-extraction is self-attested: verification reuses the value
 in the stored offer's provenance while executing the currently deployed code. It does

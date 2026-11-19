@@ -181,7 +181,8 @@ def verify_offer_against_stored_bytes(
     ):
         raise ValueError("configuration layout is not approved")
     # Use the original extraction identity, then compare the entire offer including all
-    # locators, excerpts, parser/config/code provenance. Status/expiry are lifecycle policy.
+    # locators, excerpts, parser/config/code provenance. Status/expiry are lifecycle policy;
+    # schema_version is an envelope version (1.0 remains readable under the 1.1 normalizer).
     origins = {p.extraction.git_sha for p in offer.iter_provenance()}
     if len(origins) != 1:
         raise ValueError("mixed extraction code identities")
@@ -199,8 +200,8 @@ def verify_offer_against_stored_bytes(
         if result.confidence == "low":
             return Verification(row.candidates, False, "low")
         expected = normalize_row(row, config, artifact)
-        lifecycle = {"status", "published_at", "valid_until"}
-        if offer.model_dump(exclude=lifecycle) != expected.model_dump(exclude=lifecycle):
+        excluded = {"status", "published_at", "valid_until", "schema_version"}
+        if offer.model_dump(exclude=excluded) != expected.model_dump(exclude=excluded):
             raise ValueError("offer fields do not match the stored artifact row")
         return Verification(row.candidates, True, row.confidence)
     raise ValueError("offer is not configured for the approved source")

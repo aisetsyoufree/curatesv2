@@ -191,6 +191,8 @@ def _public_projection(row: SnapshotCandidate, placement: Placement, reviewed: b
         PublicEvidence(path=path, artifact_id=ref.artifact_id, locator=ref.locator)
         for path, ref in offer.iter_labeled_provenance()
     }
+    # This gate rejects scenario-less paths for stated-purpose offers, while allowing
+    # them for explicit unspecified-purpose mortgages. Do not filter by scenario here.
     paths = corroborated_paths(offer, ctx)
     evidence.update(
         PublicEvidence(path=p.path, artifact_id=p.artifact_id, locator=p.provenance.locator)

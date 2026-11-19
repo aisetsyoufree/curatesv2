@@ -12,8 +12,10 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
+from html import unescape
 from html.parser import HTMLParser
 from typing import Literal
 from zoneinfo import ZoneInfo
@@ -42,10 +44,8 @@ from cu_rates.contracts.sources import ExtractedCandidate, RateSource
 from cu_rates.normalize import FieldState, OfferContext, _family, normalize_offer
 from cu_rates.normalize._values import DateFormat, date_pattern, prose_rule_id
 from cu_rates.pipeline.extract import (
-    _NONVISIBLE,
     _SECTION_ID,
     MAX_BODY_BYTES,
-    MAX_NESTING_DEPTH,
     MAX_SECTIONS,
     ScopedDocument,
     _Node,
@@ -296,51 +296,39 @@ def offer_context(config: SourceConfiguration, row: Row, observed_at: datetime) 
 class _PurposeText(HTMLParser):
     """Whole-page absence veto, never evidence or a replacement for scoped parsing.
 
-    Tolerate outside-section imbalance without losing headings, navigation or footnotes.
-    Inert subtrees match the normal text reader's exclusions; ambiguous/incomplete inert
-    markup fails closed rather than hiding a possible purpose. No tree is built.
+    Collect text across tag boundaries, including inert content. This conservative
+    absence veto is independent of the field reader's visibility/scoping rules.
     """
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
-        self.inert: list[str] = []
         self.parts: list[str] = []
 
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag in _NONVISIBLE:
-            if len(self.inert) >= MAX_NESTING_DEPTH:
-                raise ValueError("HTML nesting depth limit exceeded")
-            self.inert.append(tag)
-
-    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag in _NONVISIBLE:
-            raise ValueError("self-closing non-visible HTML")
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag in _NONVISIBLE:
-            if not self.inert or self.inert[-1] != tag:
-                raise ValueError("ambiguous non-visible HTML")
-            self.inert.pop()
-
     def handle_data(self, data: str) -> None:
-        if not self.inert:
-            self.parts.append(data)
+        self.parts.append(data)
 
 
 def _page_mentions_purpose(body: bytes) -> bool:
     if len(body) > MAX_BODY_BYTES:
         raise ValueError("HTML body size limit exceeded")
+    # Raw markup includes attributes/comments and is independent of section scoping.
+    decoded = unescape(body.decode("utf-8"))
     parser = _PurposeText()
-    parser.feed(body.decode("utf-8"))
+    parser.feed(decoded)
     parser.close()
-    if parser.inert:
-        raise ValueError("incomplete non-visible HTML")
-    pattern = r"\b(?:purchas\w*|refi\w*|cash[\s_-]*out|home[\s_-]*buy\w*|buy\w*)\b"
+    pattern = r"(?:purchas|re-?fi|cash[\s_-]*out|home[\s_-]*buy|buy|compra|refinanci)"
     # Check both readings: inline splits must not conceal a word, and adjacent block
     # elements must not concatenate a purpose with unrelated text and conceal it.
     return any(
-        re.search(pattern, text, re.IGNORECASE) is not None
-        for text in ("".join(parser.parts), " ".join(parser.parts))
+        re.search(
+            pattern,
+            "".join(
+                c for c in unicodedata.normalize("NFKC", text) if unicodedata.category(c) != "Cf"
+            ),
+            re.IGNORECASE,
+        )
+        is not None
+        for text in (decoded, "".join(parser.parts), " ".join(parser.parts))
     )
 
 

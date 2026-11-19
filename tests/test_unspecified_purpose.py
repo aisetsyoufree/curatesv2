@@ -121,10 +121,33 @@ def test_adapter_requires_explicit_absence_flag_and_keeps_source_text() -> None:
         b"Cash-out refinancing",
         b"Not available for purchase",
         b"home purchase and refinance",
+        b"<b>30yr</b>Refinance",
+        b"Re&shy;finance",
+        b"Re-fi",
+        b"refi",
+        "Ｒｅｆｉｎａｎｃｅ".encode(),  # noqa: RUF001 - intentional NFKC regression case
+        b'<img alt="Refinance rates">',
+        b'<a title="Home purchase">Rates</a>',
+        b"<!-- Refinance rates -->",
+        b"Compra de vivienda",
+        "Refinanciación".encode(),
+        b"Buy a home",
+        b"pur<span>chase</span>",
+        b"home&#32;buying",
+        b"<script>purchase</script>",
+        b"<template>refinance</template>",
+        *(f"Re{char}finance".encode() for char in "\u00ad\u200b\u200c\u200d\u2060\ufeff"),
     ],
 )
-def test_adapter_refuses_unspecified_if_page_states_any_purpose(text: bytes) -> None:
-    config, source, body, artifact = absent_inputs(extra=b"<p>" + text + b"</p>")
+@pytest.mark.parametrize("scoped", [False, True])
+def test_adapter_refuses_unspecified_if_page_states_any_purpose(text: bytes, scoped: bool) -> None:
+    extra = b"<p>" + text + b"</p>"
+    config, source, body, artifact = (
+        scoped_absent_inputs(extra) if scoped else absent_inputs(extra=extra)
+    )
+    if scoped:
+        # The purpose mention is outside every addressed subtree and its structural pin.
+        assert config.layout_sha256 == scoped_absent_inputs()[0].layout_sha256
     result = extract(config, source, body, artifact, extraction_run_id="run", git_sha=GIT)
     assert result.confidence == "low"
     assert any("purpose" in d for d in result.diagnostics)
@@ -211,19 +234,14 @@ def test_unspecified_scoped_rows_still_scan_the_whole_page(extra: bytes) -> None
     assert any("loan purpose is stated or ambiguous" in d for d in result.diagnostics)
 
 
-@pytest.mark.parametrize("extra", [b"<script>purchase</script>", b"<template>refinance</template>"])
-def test_inert_markup_is_not_a_purpose_statement(extra: bytes) -> None:
-    config, source, body, artifact = scoped_absent_inputs(extra)
-    result = extract(config, source, body, artifact, extraction_run_id="run", git_sha=GIT)
-    assert result.confidence == "medium", result.diagnostics
-
-
-@pytest.mark.parametrize("extra", [b"<template>purchase", b"</template>", b"<template/>purchase"])
+@pytest.mark.parametrize(
+    "extra", [b"<template>purchase", b"</template>refinance", b"<template/>purchase"]
+)
 def test_uncertain_inert_markup_cannot_hide_a_page_purpose(extra: bytes) -> None:
     config, source, body, artifact = scoped_absent_inputs(extra)
     result = extract(config, source, body, artifact, extraction_run_id="run", git_sha=GIT)
     assert result.confidence == "low"
-    assert any("cannot verify absent loan purpose" in d for d in result.diagnostics)
+    assert any("loan purpose is stated or ambiguous" in d for d in result.diagnostics)
 
 
 @pytest.mark.parametrize("mutation", ["rate_type", "footnote", "hidden", "date", "row"])
@@ -430,9 +448,11 @@ def test_stored_page_to_snapshot_and_web_is_browse_only(
             response = client.get("/compare" + query)
             assert response.status_code == 200
             assert b"Synthetic Cedar CU" not in response.data
+            assert b"noindex" in response.data
+        assert "https://cu-rates.org/compare</loc>" not in client.get("/sitemap.xml").text
         detail = client.get("/credit-unions/8000401")
         assert detail.status_code == 200
-        assert b"loan purpose not stated by the source" in detail.data
+        assert b"Loan purpose not stated by the source" in detail.data
         # Re-seal a falsely labeled 1.0 snapshot: even an internally consistent file
         # digest must not permit the new shape under an old contract declaration.
         import json
@@ -484,6 +504,48 @@ def test_public_model_refuses_forged_ranked_unspecified_even_with_canonical_proo
     )
     with pytest.raises(ValueError, match="browse/detail"):
         forged.require_protocol2()
+
+
+@pytest.mark.parametrize("lien", [None, "first"])
+def test_unspecified_loan_type_uses_only_approved_purpose_wording(lien: str | None) -> None:
+    from cu_rates.snapshot.builder import SnapshotCandidate, _public_projection
+    from cu_rates.web.comparison import format_loan_type
+
+    offer = unspecified_offer()
+    public = _public_projection(
+        SnapshotCandidate(offer=offer, context=context(offer), candidates=()),
+        Placement.BROWSE_ONLY,
+        False,
+    )
+    public = public.model_copy(update={"details": {**public.details, "lien_position": lien}})
+    expected = "Loan purpose not stated by the source Fixed-Rate Mortgage"
+    if lien == "first":
+        expected += " (First Lien)"
+    assert format_loan_type(public) == expected
+
+
+def test_stated_purpose_cannot_project_scenario_less_evidence() -> None:
+    from cu_rates.contracts.publication import corroborated_paths
+    from cu_rates.snapshot.builder import SnapshotCandidate, _public_projection
+
+    offer = purchase_offer()
+    ctx = context(offer)
+    assert evaluate_publication(offer, ctx).publishable_now
+    assert len(corroborated_paths(offer, ctx)) == 6
+    # Keep the stated-purpose offer and every other proof intact; remove just the
+    # paths' scenario binding. Projection must not seal them into a public receipt.
+    paths = tuple(p.model_copy(update={"scenario_id": None}) for p in ctx.evidence_paths)
+    broken = ctx.model_copy(update={"evidence_paths": paths})
+    decision = evaluate_publication(offer, broken)
+    assert not decision.publishable_now
+    assert ReasonCode.EVIDENCE_PATH_SCENARIO_MISMATCH in decision.reasons
+    assert not corroborated_paths(offer, broken)
+    public = _public_projection(
+        SnapshotCandidate(offer=offer, context=broken, candidates=()), Placement.RANKED, False
+    )
+    assert not public.details["publication_evidence"]
+    with pytest.raises(ValueError):
+        public.require_protocol2()
 
 
 def test_gate_without_a_scenario_still_rejects_incomplete_arm() -> None:

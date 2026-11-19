@@ -280,6 +280,24 @@ def test_trusted_reextraction_refuses_forged_claims(change: str) -> None:
         verify_offer_against_stored_bytes(source, approval, offer, body, artifact)
 
 
+def test_schema_1_0_offer_replays_with_current_normalizer() -> None:
+    config, source, body, artifact, approval = inputs()
+    result = extract(config, source, body, artifact, extraction_run_id="run", git_sha=GIT)
+    current = normalize_row(result.rows[0], config, artifact)
+    legacy = NormalizedOffer.model_validate({**current.model_dump(), "schema_version": "1.0"})
+    assert current.schema_version == "1.1" and legacy.schema_version == "1.0"
+    assert offer_fingerprints(legacy) == offer_fingerprints(current)
+    verified = verify_offer_against_stored_bytes(source, approval, legacy, body, artifact)
+    assert verified.comparable and verified.confidence == "high"
+    # Compatibility cannot mask an actual financial change.
+    assert legacy.note_rate
+    forged = legacy.model_copy(
+        update={"note_rate": legacy.note_rate.model_copy(update={"value": Decimal("4.112")})}
+    )
+    with pytest.raises(ValueError, match="offer fields do not match"):
+        verify_offer_against_stored_bytes(source, approval, forged, body, artifact)
+
+
 def prepare(
     conn: Connection, store: ArtifactStore, name: str = "table", family: str = "mortgage"
 ) -> tuple[RateSource, FetchProfile]:
