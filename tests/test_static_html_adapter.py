@@ -1684,22 +1684,36 @@ def test_browse_only_capture_reaches_the_gate_as_browse_only_never_ranked(tmp_pa
 # ---- T040b review fixes ---------------------------------------------------------------
 
 
-def test_superscript_inside_a_value_is_kept_so_checks_fail_closed() -> None:
+def test_superscript_is_stripped_only_as_an_unambiguous_trailing_marker() -> None:
     from cu_rates.pipeline.extract import resolve_text
 
     def read(markup: bytes) -> str:
-        return resolve_text(b'<p id="n"><span>' + markup + b"</span></p>", "#n", tolerant=True)
+        return resolve_text(b'<p id="n">' + markup + b"</p>", "#n", tolerant=True)
 
-    assert read(b"6<sup>.125</sup>%") == "6.125%"  # never silently '6%'
-    assert read(b"6.125%<sup>1</sup>") == "6.125%"  # a trailing marker is a footnote
+    assert read(b"<span>6<sup>.125</sup>%</span>") == "6.125%"  # not a marker: ordinary text
+    assert read(b"6.125%<sup>1</sup>") == "6.125%"
     assert read(b"6.125% <sup>*</sup> ") == "6.125%"
-    assert read(b"6.125%<sup>123</sup>") == "6.125%123"  # not a 1-2 digit marker
+    assert read(b"<b>Rate</b><sup>12</sup>") == "Rate"
+    assert read(b"<span>6.125%<sup>1</sup></span>&nbsp;<!-- c -->") == "6.125%"
+    assert read(b"6.125%<sup>123</sup>") == "6.125%123"  # not a 1-2 digit marker: kept
     assert read(b"6.125%<sup>a</sup>") == "6.125%a"
-    assert read(b"6<sup>1</sup>.125%") == "61.125%"  # followed by more text: kept
+    for ambiguous in (
+        b"6.12<sup>5</sup>",
+        b"6.12<sup>5</sup>&nbsp;",
+        b"<span>6.12<sup>5</sup></span>%",
+        b"<b>6.12<sup>5</sup></b>",
+        b"6.125<sup>1</sup>%",
+        b"5<sup>1</sup>.5%",
+        b"6.<sup>1</sup>",
+        b"Rate<sup>1</sup> and more",
+        b"<sup>1</sup>5%",
+        b"<span>6.12</span><sup>5</sup>",
+    ):
+        with pytest.raises(ValueError, match="ambiguous footnote"):
+            read(ambiguous)
     _, _, body, _, _ = real_inputs()
-    _, result, _ = run(body.replace(b"<td>5.111%</td>", b"<td>5<sup>.111</sup>%</td>"))
-    values = {c.raw_value for r in result.rows for c in r.candidates}
-    assert "5%" not in values
+    _, result, _ = run(body.replace(b"<td>5.111%</td>", b"<td>5.11<sup>1</sup>%</td>"))
+    assert result.confidence == "low" and "ambiguous footnote" in diagnostics(result)
 
 
 @pytest.mark.parametrize(
@@ -1749,46 +1763,63 @@ def test_prose_date_claims_are_read_only_under_their_own_rule_and_zone() -> None
     from cu_rates.normalize._values import prose_rule_id
     from cu_rates.validation._rules import _claim_value
 
+    _, result, _ = run()
+    dated = next(c for c in result.rows[0].candidates if c.proposed_path == "effective_at")
+    adapter = dated.provenance.extraction
     text = "November 18, 2026"
+    assert adapter.rule_id == prose_rule_id("America/New_York")
     with pytest.raises(ValueError):
         _claim_value("effective_at", text)  # ordinary claim: no date-only reading
-    rule = prose_rule_id("America/New_York")
-    assert _claim_value("effective_at", text, rule) == datetime(2026, 11, 18, 5, tzinfo=UTC)
-    assert _claim_value("effective_at", text, prose_rule_id("UTC")) == datetime(
-        2026, 11, 18, tzinfo=UTC
-    )
-    assert _claim_value("effective_at", "November 19, 2026", rule) != datetime(
+    assert _claim_value("effective_at", text, adapter) == datetime(2026, 11, 18, 5, tzinfo=UTC)
+    utc = adapter.model_copy(update={"rule_id": prose_rule_id("UTC")})
+    assert _claim_value("effective_at", text, utc) == datetime(2026, 11, 18, tzinfo=UTC)
+    assert _claim_value("effective_at", "November 19, 2026", adapter) != datetime(
         2026, 11, 18, 5, tzinfo=UTC
     )
-    _, result, _ = run()
-    dated = [c for c in result.rows[0].candidates if c.proposed_path == "effective_at"]
-    assert dated[0].provenance.extraction.rule_id == rule
+    # Other evidence cannot claim the rule: it needs the static-html adapter and a digest.
+    other = adapter.model_copy(update={"parser": SLICE_PARSER})
+    with pytest.raises(ValueError):
+        _claim_value("effective_at", text, other)
+    unbound = adapter.model_copy(update={"configuration_sha256": ""})
+    with pytest.raises(ValueError):
+        _claim_value("effective_at", text, unbound)
 
 
 def test_label_and_value_must_share_the_table_row() -> None:
-    config = real_inputs()[0]
+    config, source, body, artifact, _ = real_inputs()
     field = config.rows[0].fields[2]  # note_rate, value in tbody row 3
-    moved = field.model_copy(
+    for label in (
+        "#loan-rates tbody tr:nth-child(4) > td:nth-child(2)",  # the next body row
+        "#loan-rates tbody tr:nth-of-type(4) > td:nth-of-type(2)",  # written differently
+        "#loan-rates tr:nth-child(4) td:nth-child(2)",  # descendant spelling
+    ):
+        moved = field.model_copy(
+            update={"label": field.label.model_copy(update={"selector": label, "text": "5.333%"})}
+        )
+        row = config.rows[0].model_copy(
+            update={"fields": tuple(moved if f is field else f for f in config.rows[0].fields)}
+        )
+        changed = config.model_copy(update={"rows": (row,)})
+        changed = changed.model_copy(update={"layout_sha256": changed.layout_of(body)})
+        result = extract(changed, source, body, artifact, extraction_run_id="r", git_sha=GIT)
+        assert result.confidence == "low" and "different table rows" in diagnostics(result)
+    same = field.model_copy(
         update={
             "label": field.label.model_copy(
-                update={"selector": "#loan-rates tbody tr:nth-child(4) > td:nth-child(2)"}
+                update={
+                    "selector": "#loan-rates tbody tr:nth-of-type(3) > td:nth-of-type(1)",
+                    "text": "10 Year",
+                }
             )
         }
     )
-    fields = tuple(moved if f is field else f for f in config.rows[0].fields)
-    row = config.rows[0].model_copy(update={"fields": fields})
-    payload = config.model_copy(update={"rows": (row,)}).model_dump(mode="json")
-    with pytest.raises(ValueError, match="same table row"):
-        SourceConfiguration.model_validate(payload)
-    aligned = moved.label.model_copy(
-        update={"selector": "#loan-rates tbody tr:nth-child(3) > td:nth-child(2)"}
-    )
-    ok = field.model_copy(update={"label": aligned})
     row = config.rows[0].model_copy(
-        update={"fields": tuple(ok if f is field else f for f in config.rows[0].fields)}
+        update={"fields": tuple(same if f is field else f for f in config.rows[0].fields)}
     )
-    SourceConfiguration.model_validate(
-        config.model_copy(update={"rows": (row,)}).model_dump(mode="json")
+    ok = config.model_copy(update={"rows": (row,)})
+    ok = ok.model_copy(update={"layout_sha256": ok.layout_of(body)})
+    assert extract(ok, source, body, artifact, extraction_run_id="r", git_sha=GIT).confidence == (
+        "medium"
     )
 
 
@@ -1812,3 +1843,103 @@ def test_verification_tokenizes_a_stored_body_once(monkeypatch: pytest.MonkeyPat
     for claim in claims * 3:
         verify_located_claim(body, claim, approval=approval)
     assert calls == 1  # all claims lie in the one loan-rates section
+
+
+# ---- T040b round 2 ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "markup",
+    [
+        b"<span hidden>9%</span>4.1%",
+        b'<span aria-hidden="TRUE">9%</span>4.1%',
+        b'<span style="color:red; Display : None">9%</span>4.1%',
+        b'<span style="visibility:hidden">9%</span>4.1%',
+        b"<details>9%</details>4.1%",
+    ],
+)
+def test_hidden_content_inside_a_selected_node_is_refused(markup: bytes) -> None:
+    from cu_rates.pipeline.extract import resolve_text
+
+    with pytest.raises(ValueError, match="hidden"):
+        resolve_text(b'<p id="n">' + markup + b"</p>", "#n", tolerant=True)
+    assert resolve_text(b'<p id="n"><span>4.1%</span></p>', "#n", tolerant=True) == "4.1%"
+
+
+@pytest.mark.parametrize(
+    "outer",
+    [
+        b'<p id="n" hidden>4.1%</p>',
+        b'<p id="n" aria-hidden="True">4.1%</p>',
+        b'<p id="n" style="DISPLAY:NONE">4.1%</p>',
+        b'<div style="display: none"><p id="n">4.1%</p></div>',
+    ],
+)
+def test_hidden_section_or_ancestor_is_refused(outer: bytes) -> None:
+    from cu_rates.pipeline.extract import resolve_text
+
+    with pytest.raises(ValueError, match="hidden"):
+        resolve_text(b"<body>" + outer + b"</body>", "#n", tolerant=True)
+
+
+def test_hidden_wrapper_inside_a_section_cannot_be_unhidden_by_a_stray_end_tag() -> None:
+    from cu_rates.pipeline.extract import resolve_text
+
+    for body in (
+        b'<div id="s"><div hidden><b>4.1%</div></b></div>',  # stray/misordered end tags inside
+        b'<div id="s"><div hidden>4.1%</div></span></div>',
+    ):
+        with pytest.raises(ValueError):
+            resolve_text(body, "#s div", tolerant=True)
+    with pytest.raises(ValueError, match="hidden"):
+        resolve_text(b'<div id="s"><div hidden><p>4.1%</p></div></div>', "#s div p", tolerant=True)
+    with pytest.raises(ValueError, match="balanced"):  # a stray end tag is itself an error
+        resolve_text(b'<div id="s"><div hidden></span><p>4.1%</p></div></div>', "#s", tolerant=True)
+    # Outside: an end tag that skips open tags may be ignored by a browser, so it never unhides.
+    outside = b'<div hidden><table><tr><td></div><p id="n">4.1%</p></td></tr></table></div>'
+    with pytest.raises(ValueError, match="non-visible or hidden"):
+        resolve_text(outside, "#n", tolerant=True)
+
+
+def test_documents_cache_is_thread_safe() -> None:
+    import threading
+
+    from cu_rates.pipeline import extract as html
+
+    errors: list[BaseException] = []
+
+    def work(index: int) -> None:
+        try:
+            for turn in range(40):
+                body = b'<p id="n">v%d</p>' % ((index + turn) % 5)
+                assert html.resolve_text(body, "#n", tolerant=True).startswith("v")
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=work, args=(i,)) for i in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert not errors
+
+
+def test_approved_sections_reads_the_configuration_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, _, _, _, approval = real_inputs()
+    registry._sections_for.cache_clear()
+    reads = 0
+    original = SourceConfiguration.model_validate_json
+
+    def counted(*args: object, **kwargs: object) -> SourceConfiguration:
+        nonlocal reads
+        reads += 1
+        return original(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        SourceConfiguration,
+        "model_validate_json",
+        classmethod(lambda cls, *a, **k: counted(*a, **k)),
+    )
+    for _ in range(5):
+        assert registry.approved_sections(approval)
+    assert reads == 1

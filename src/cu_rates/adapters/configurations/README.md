@@ -33,16 +33,22 @@ Imbalance, duplicate attributes or excessive depth inside a section still fail t
 section id must occur once in the page, and every selector must start with a listed id.
 `<sup>` footnote markers are removed from text in this mode, by tag only; `*` or `(1)` are not.
 Without `sections` the whole document must be balanced as before.
-`<sup>` is dropped only when it is a trailing 1-2 digit or `*` marker; a superscript inside a
-value (`6<sup>.125</sup>%`) is kept, so the exact-text checks fail closed. A section's ancestor
-tags and attributes are pinned in the layout hash, and a section inside `noscript`, `template`,
-`details`, `dialog` or a `hidden` element is refused.
+A `<sup>` is stripped only as an unambiguous footnote marker: 1-2 digits or `* † ‡ §`, with
+visible text before it (across element boundaries) not ending in a digit or `.`, and nothing
+visible after it up to the end of the selected node. Any marker that fails this (for example
+`6.12<sup>5</sup>` or `5<sup>1</sup>.5%`) fails the capture. A non-marker superscript is ordinary
+text. Hidden content (`hidden`, `aria-hidden="true"` in any case, inline `display:none` or
+`visibility:hidden`, `details`, `dialog`) on or under a section or inside/above a selected node is
+refused, as is a section inside `noscript` or `template`. A section's ancestor tags and
+attributes are pinned in the layout hash. Availability note: per-session CMS classes, nonces or
+ids on those ancestors change the pin and will make captures fail low until the configuration is
+re-reviewed; pick sections whose ancestors are stable.
 
 **Sections MUST include every qualifying heading, caption, note and disclosure that gives the
 rates their meaning** (which product, rate type, conditions, footnote text). Text outside the
 listed sections is neither read nor pinned, so a change there cannot be detected. A label and its
-value selector must lie in the same table row (`tr:nth-child(N)`) unless the field is a
-`group_header`.
+value must resolve to the same table row (`tr`) unless the label is in `thead`/`tfoot` or the
+field is a `group_header`; this is checked on the resolved elements at extraction.
 
 Group sub-header rows: point a field at the sub-header cell and set `group_header: true`
 (optionally with `excerpt` plus `context_text`). The value is stated by the page, but the

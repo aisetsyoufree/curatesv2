@@ -12,6 +12,7 @@ from pydantic import TypeAdapter
 
 from cu_rates.contracts.base import CreditScore, Days, Money, Months, Percent, Points, SignedPercent
 from cu_rates.contracts.enums import LienPosition, RateType, ScenarioDimension
+from cu_rates.contracts.evidence import ExtractionProvenance
 
 _NUMBER = r"[0-9]+(?:\.[0-9]+)?"
 _MONEY = r"\$?(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\.[0-9]+)?"
@@ -115,13 +116,21 @@ def _zones() -> dict[str, str]:
     return {zone.lower().replace("/", ":"): zone for zone in available_timezones()}
 
 
-def prose_instant(text: str, rule_id: str | None) -> datetime | None:
+def prose_instant(text: str, extraction: ExtractionProvenance | None) -> datetime | None:
     """The exact instant a prose-date candidate stands for, from its own recorded zone.
 
-    Only a candidate whose rule id is the prose-date rule is read this way; any other
-    claim returns None and keeps strict timestamp parsing.
+    Only a candidate made by the static-html adapter (a parser name plus a configuration
+    digest) under the prose-date rule is read this way; any other claim returns None and keeps
+    strict timestamp parsing, so other evidence cannot choose its own offset.
     """
-    if rule_id is None or not rule_id.startswith(PROSE_RULE + ":"):
+    rule_id = None if extraction is None else extraction.rule_id
+    if (
+        extraction is None
+        or extraction.parser.name != "static-html"
+        or not extraction.configuration_sha256
+        or rule_id is None
+        or not rule_id.startswith(PROSE_RULE + ":")
+    ):
         return None
     zone = _zones().get(rule_id.removeprefix(PROSE_RULE + ":"))
     if zone is None:

@@ -5,8 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
 from collections import OrderedDict
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
@@ -74,15 +75,21 @@ class _Node:
         return [part for part in self.parts if isinstance(part, _Node)]
 
     def raw(self) -> str:
-        chunks: list[str] = []
+        items: list[str | _Node] = []  # visible strings and footnote candidates, in order
         pending: list[str | _Node] = [self]
         while pending:
             item = pending.pop()
             if isinstance(item, str):
-                chunks.append(item)
-            elif item.tag not in _NONVISIBLE and not (item.hidden and _is_footnote(item)):
+                items.append(item)
+            elif item.tag in _NONVISIBLE:
+                continue
+            elif item.hidden and item is not self:
+                items.append(item)
+            else:
                 pending.extend(reversed(item.parts))
-        return "".join(chunks)
+        if all(isinstance(item, str) for item in items):
+            return "".join(str(item) for item in items)
+        return _with_footnotes(items)
 
     def text(self) -> str:
         return " ".join(self.raw().split())
@@ -98,19 +105,28 @@ class _Node:
 _MARKER = re.compile(r"[0-9]{1,2}|[*\u2020\u2021\u00a7]")
 
 
-def _is_footnote(node: _Node) -> bool:
-    """A trailing superscript that is only a footnote marker; mid-value text is never dropped."""
-    parent = node.parent
-    if parent is None or not all(isinstance(part, str) for part in node.parts):
-        return False
-    if _MARKER.fullmatch("".join(str(part) for part in node.parts).strip()) is None:
-        return False
-    for part in reversed(parent.parts):
-        if part is node:
-            return True
-        if not isinstance(part, str) or part.strip():
-            return False
-    return False
+def _with_footnotes(items: list[str | _Node]) -> str:
+    """Strip a superscript only when it is unambiguously a trailing footnote marker.
+
+    Its text must be a marker; the visible text before it must not end in a digit or '.',
+    and nothing visible may follow it (across element boundaries) up to the selected node's
+    end. A marker that fails any of this could be part of a number (6.12<sup>5</sup>), so the
+    whole text is refused. A superscript that is not a marker is ordinary text and is kept.
+    """
+    out: list[str] = []
+    for index, item in enumerate(items):
+        if isinstance(item, str):
+            out.append(item)
+            continue
+        inner = item.raw()
+        if _MARKER.fullmatch(inner.strip()) is None:
+            out.append(inner)
+            continue
+        before = "".join(out).rstrip()
+        after = "".join(x if isinstance(x, str) else x.raw() for x in items[index + 1 :])
+        if (before and (before[-1].isdigit() or before[-1] == ".")) or after.strip():
+            raise ValueError("ambiguous footnote marker next to a value")
+    return "".join(out)
 
 
 class _Tree(HTMLParser):
@@ -176,6 +192,7 @@ class _ScopedTree(HTMLParser):
         self.depth = 0
         self.closed = False
         self.open_tags: list[tuple[str, tuple[tuple[str, str], ...]]] = []
+        self.poisoned = False  # an end tag skipped over open tags that hid content
 
     def _open(self, tag: str, attrs: list[tuple[str, str | None]], *, selfclosing: bool) -> None:
         is_target = any(key == "id" and value == self.section_id for key, value in attrs)
@@ -216,6 +233,13 @@ class _ScopedTree(HTMLParser):
             # Outside the section: tolerated. Track only what encloses it, leniently.
             for index in range(len(self.open_tags) - 1, -1, -1):
                 if self.open_tags[index][0] == tag:
+                    skipped = self.open_tags[index:]
+                    if len(skipped) > 1 and any(
+                        t in _HIDING_TAGS or _attr_hidden(dict(a)) for t, a in skipped
+                    ):
+                        # Browsers may ignore such an end tag, so the hidden element could
+                        # still enclose what follows: never un-hide on our own reading.
+                        self.poisoned = True
                     del self.open_tags[index:]
                     break
             return
@@ -240,6 +264,28 @@ def _attr_pairs(attrs: list[tuple[str, str | None]]) -> tuple[tuple[str, str], .
 _HIDING_TAGS = _NONVISIBLE | {"details", "dialog"}
 
 
+def _attr_hidden(attrs: Mapping[str, str]) -> bool:
+    style = re.sub(r"\s+", "", attrs.get("style", "").lower())
+    return (
+        "hidden" in attrs
+        or attrs.get("aria-hidden", "").strip().lower() == "true"
+        or "display:none" in style
+        or "visibility:hidden" in style
+    )
+
+
+def _require_visible(node: _Node) -> None:
+    """Refuse text that a browser would not show: hidden above or inside the selected node."""
+    parent: _Node | None = node
+    while parent is not None:
+        if _attr_hidden(parent.attrs) or parent.tag in _HIDING_TAGS:
+            raise ValueError("selected text lies in hidden content")
+        parent = parent.parent
+    for item in node.walk():
+        if _attr_hidden(item.attrs) or item.tag in {"details", "dialog"}:
+            raise ValueError("selected text contains hidden content")
+
+
 def _parse_section(body: bytes, section_id: str) -> _Node:
     if len(body) > MAX_BODY_BYTES:
         raise ValueError("HTML body size limit exceeded")
@@ -252,9 +298,10 @@ def _parse_section(body: bytes, section_id: str) -> _Node:
         raise ValueError(f"section {section_id} does not resolve uniquely")
     if not parser.closed:
         raise ValueError("section HTML is incomplete")
+    if parser.poisoned:
+        raise ValueError("section lies inside non-visible or hidden content")
     for tag, attrs in parser.section.ancestors:
-        keys = {key for key, _ in attrs}
-        if tag in _HIDING_TAGS or "hidden" in keys or ("aria-hidden", "true") in attrs:
+        if tag in _HIDING_TAGS or _attr_hidden(dict(attrs)):
             raise ValueError("section lies inside non-visible or hidden content")
     return parser.section
 
@@ -279,16 +326,20 @@ class ScopedDocument:
 _DOCUMENTS: OrderedDict[bytes, ScopedDocument] = OrderedDict()
 
 
+_LOCK = threading.Lock()
+
+
 def _cached_document(body: bytes) -> ScopedDocument:
     """One lazily parsed document per distinct body, so many claims do not re-tokenize it."""
     key = hashlib.sha256(body).digest()
-    document = _DOCUMENTS.get(key)
-    if document is None:
-        document = _DOCUMENTS[key] = ScopedDocument(body)
-        while len(_DOCUMENTS) > 2:
-            _DOCUMENTS.popitem(last=False)
-    else:
-        _DOCUMENTS.move_to_end(key)
+    with _LOCK:
+        document = _DOCUMENTS.get(key)
+        if document is None:
+            document = _DOCUMENTS[key] = ScopedDocument(body)
+            while len(_DOCUMENTS) > 2:
+                _DOCUMENTS.popitem(last=False)
+        else:
+            _DOCUMENTS.move_to_end(key)
     return document
 
 
@@ -346,7 +397,9 @@ def _structural(start: _Node, rest: str, selector: str) -> _Node:
                         continue
                 found[id(item)] = item
         current = list(found.values())
-    return _only(iter(current), selector)
+    found_node = _only(iter(current), selector)
+    _require_visible(found_node)
+    return found_node
 
 
 def _only(nodes: Iterator[_Node], description: str) -> _Node:
@@ -358,6 +411,26 @@ def _only(nodes: Iterator[_Node], description: str) -> _Node:
 
 def _by_id(root: _Node, element_id: str) -> _Node:
     return _only((node for node in root.walk() if node.attrs.get("id") == element_id), element_id)
+
+
+def resolve_node(body: _Node | ScopedDocument, selector: str) -> _Node:
+    """The one element a structural css selector addresses (same rules as resolve_text)."""
+    structural = _STRUCTURAL.fullmatch(selector)
+    if structural is None:
+        raise ValueError(f"unsupported selector {selector}")
+    start = (
+        body.section(structural["id"])
+        if isinstance(body, ScopedDocument)
+        else _by_id(body, structural["id"])
+    )
+    return _structural(start, structural["rest"], selector)
+
+
+def nearest_row(node: _Node) -> _Node | None:
+    current: _Node | None = node
+    while current is not None and current.tag != "tr":
+        current = current.parent
+    return current
 
 
 def resolve_text(

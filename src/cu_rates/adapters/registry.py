@@ -8,6 +8,7 @@ real-source approvals or rate fixtures shipped here. Unknown sources/versions fa
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from hashlib import sha256
 from pathlib import Path
 from types import MappingProxyType
@@ -87,15 +88,26 @@ def load_configuration(source: RateSource) -> SourceConfiguration:
     return config
 
 
+@lru_cache(maxsize=64)
+def _sections_for(path: str, mtime_ns: int, size: int, adapter_version: str) -> tuple[str, ...]:
+    config = SourceConfiguration.model_validate_json(Path(path).read_bytes())
+    identity = configuration_parser(config)
+    return config.sections if identity.version == adapter_version else ()
+
+
 def approved_sections(approval: SourceApproval | None) -> tuple[str, ...]:
-    """Sections of the configuration the approval identity binds (empty: whole-document mode)."""
+    """Sections of the configuration the approval identity binds (empty: whole-document mode).
+
+    Cached per (file, its mtime and size, approved adapter version) so verifying many
+    claims does not re-read and re-validate the configuration JSON.
+    """
     if approval is None or approval.adapter is None or approval.adapter.name != PARSER.name:
         return ()
     matches = [p for p in CONFIGURATIONS.glob("*.json") if p.stem == approval.source_id]
     if len(matches) != 1:
         return ()
-    config = SourceConfiguration.model_validate_json(matches[0].read_bytes())
-    return config.sections if configuration_parser(config) == approval.adapter else ()
+    info = matches[0].stat()
+    return _sections_for(str(matches[0]), info.st_mtime_ns, info.st_size, approval.adapter.version)
 
 
 def body_layout_sha256(

@@ -47,6 +47,8 @@ from cu_rates.pipeline.extract import (
     _Node,
     _parse,
     layout_sha256,
+    nearest_row,
+    resolve_node,
     resolve_text,
     scoped_layout_sha256,
     selector_section,
@@ -143,15 +145,6 @@ class Row(ConfigurationData):
         return self
 
 
-_ROW = re.compile(r"(.*?)\btr:nth-child\(([0-9]+)\)")
-
-
-def _same_row(value: str, label: str) -> bool:
-    """Within one table body, a label cell must sit in the same row as its value."""
-    a, b = _ROW.match(value), _ROW.match(label)
-    return a is None or b is None or a[1] != b[1] or a[2] == b[2]
-
-
 class SourceConfiguration(ConfigurationData):
     source_id: Identifier
     source_url: HttpUrlText
@@ -172,10 +165,6 @@ class SourceConfiguration(ConfigurationData):
             raise ValueError("sections must be unique and few")
         if any(not re.fullmatch(_SECTION_ID, section) for section in self.sections):
             raise ValueError("invalid section id")
-        for row in self.rows:
-            for rule in row.fields:
-                if not rule.group_header and not _same_row(rule.selector, rule.label.selector):
-                    raise ValueError("a label and its value must lie in the same table row")
         if self.sections:
             for row in self.rows:
                 for rule in row.fields:
@@ -262,6 +251,19 @@ def required_paths(row: Row, candidates: tuple[ExtractedCandidate, ...]) -> set[
     return core
 
 
+def _check_same_row(root: _Node | ScopedDocument, rule: Field) -> None:
+    """A body-row label must sit in the very row of its value; header rows are exempt."""
+    value_row = nearest_row(resolve_node(root, rule.selector))
+    label_row = nearest_row(resolve_node(root, rule.label.selector))
+    if (
+        value_row is not None
+        and label_row is not None
+        and value_row is not label_row
+        and not (label_row.parent is not None and label_row.parent.tag in {"thead", "tfoot"})
+    ):
+        raise ValueError("label and value lie in different table rows")
+
+
 def offer_context(config: SourceConfiguration, row: Row, observed_at: datetime) -> OfferContext:
     """The one place a row's normalization context is built (extraction and re-extraction)."""
     rule = next((f.date for f in row.fields if f.path == "effective_at"), None)
@@ -319,6 +321,8 @@ def extract(
             try:
                 if resolve_text(root, rule.label.selector) != rule.label.text:
                     raise ValueError("ambiguous or changed label")
+                if not rule.group_header:
+                    _check_same_row(root, rule)
                 node = resolve_text(root, rule.selector)
                 if rule.path in {"note_rate", "apr"} and (
                     rule.excerpt is not None or rule.context_text is not None
