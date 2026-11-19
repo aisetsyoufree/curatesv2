@@ -19,6 +19,8 @@ jobs:
       - name: Install locked dependencies
         run: uv sync --locked
       - name: Quality gate
+        env:
+          REQUIRE_NODE: "1"
         run: scripts/check
       - name: Format check
         run: uv run ruff format --check .

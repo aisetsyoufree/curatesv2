@@ -115,6 +115,7 @@ from cu_rates.pipeline.extract import excerpt_is_located, resolve_text, selector
 from cu_rates.snapshot import Denylist
 
 _FRESHNESS = timedelta(hours=71)
+AUTOMATIC_PUBLISHER = "cu-rates-automatic-publisher"
 
 
 @dataclass(frozen=True)
@@ -643,13 +644,7 @@ def publish(
         schema_version=CONTRACT_VERSION,
         snapshot_id=snapshot_id,
         published_at=evaluated_at,
-        published_by=(
-            review.actor
-            if reviewed and review is not None
-            else "t014-fixture-publisher"
-            if allow_fixture
-            else "cu-rates-publisher"
-        ),
+        published_by=(review.actor if reviewed and review is not None else AUTOMATIC_PUBLISHER),
         entries=(entry,),
         manifest_sha256=snapshot_manifest_sha256((entry,)),
         supersedes=prior.published.snapshot_id if prior else None,
