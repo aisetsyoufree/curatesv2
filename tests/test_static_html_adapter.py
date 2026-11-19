@@ -967,7 +967,9 @@ def test_located_claim_uses_approved_adapter() -> None:
     forged = claim.model_copy(
         update={"extraction": claim.extraction.model_copy(update={"parser": SLICE_PARSER})}
     )
-    assert verify_located_claim(body, forged, approval=approval) == "4.111%"
+    assert verify_located_claim(body, claim, approval=approval) == "4.111%"
+    with pytest.raises(ValueError):  # a claim from another parser keeps the strict check
+        verify_located_claim(body, forged, approval=approval)
     slice_approval = approval.model_copy(update={"adapter": SLICE_PARSER})
     with pytest.raises(ValueError):
         verify_located_claim(body, claim, approval=slice_approval)

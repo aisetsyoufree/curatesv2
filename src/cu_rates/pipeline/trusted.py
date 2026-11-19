@@ -577,6 +577,10 @@ def verify_located_claim(
         and approval.approved
         and approval.adapter is not None
         and approval.adapter.name == "static-html"
+        # Lenient token matching only for claims made by this exact approved adapter identity
+        # (name, version and configuration digest); identity or correction evidence keeps the
+        # strict excerpt check.
+        and provenance.extraction.parser == approval.adapter
     ):
         located = fragment_is_located(node, provenance.source_text)
     if sha256(node.encode()).hexdigest() != locator.normalized_text_sha256 or not located:
