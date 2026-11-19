@@ -1679,3 +1679,136 @@ def test_browse_only_capture_reaches_the_gate_as_browse_only_never_ranked(tmp_pa
         assert ReasonCode.SCENARIO_UNSTATED in decision.reasons, decision
         assert decision.placement.value == "browse_only", decision
     engine.dispose()
+
+
+# ---- T040b review fixes ---------------------------------------------------------------
+
+
+def test_superscript_inside_a_value_is_kept_so_checks_fail_closed() -> None:
+    from cu_rates.pipeline.extract import resolve_text
+
+    def read(markup: bytes) -> str:
+        return resolve_text(b'<p id="n"><span>' + markup + b"</span></p>", "#n", tolerant=True)
+
+    assert read(b"6<sup>.125</sup>%") == "6.125%"  # never silently '6%'
+    assert read(b"6.125%<sup>1</sup>") == "6.125%"  # a trailing marker is a footnote
+    assert read(b"6.125% <sup>*</sup> ") == "6.125%"
+    assert read(b"6.125%<sup>123</sup>") == "6.125%123"  # not a 1-2 digit marker
+    assert read(b"6.125%<sup>a</sup>") == "6.125%a"
+    assert read(b"6<sup>1</sup>.125%") == "61.125%"  # followed by more text: kept
+    _, _, body, _, _ = real_inputs()
+    _, result, _ = run(body.replace(b"<td>5.111%</td>", b"<td>5<sup>.111</sup>%</td>"))
+    values = {c.raw_value for r in result.rows for c in r.candidates}
+    assert "5%" not in values
+
+
+@pytest.mark.parametrize(
+    "wrapper",
+    [b"noscript", b"template", b"details", b'div hidden=""', b'div aria-hidden="true"'],
+)
+def test_sections_inside_hidden_or_nonvisible_ancestors_are_refused(wrapper: bytes) -> None:
+    from cu_rates.pipeline.extract import resolve_text
+
+    close = wrapper.split()[0]
+    body = b"<html><body><" + wrapper + b'><p id="n">4.1%</p></' + close + b"></body></html>"
+    with pytest.raises(ValueError, match="non-visible or hidden"):
+        resolve_text(body, "#n", tolerant=True)
+    assert resolve_text(b'<div><p id="n">4.1%</p></div>', "#n", tolerant=True) == "4.1%"
+
+
+def test_section_ancestors_are_pinned_by_the_layout_hash() -> None:
+    config, _, body, _, _ = real_inputs()
+    other = body.replace(b'<div class="wrap">', b'<div class="other">')
+    assert config.layout_of(other) != config.layout_of(body)  # only an ancestor differs
+    _, result, _ = run(other)
+    assert result.confidence == "low" and "layout drift" in diagnostics(result)
+    _, result, _ = run(body.replace(b'<div class="wrap">', b'<div class="wrap" hidden="">'))
+    assert result.confidence == "low"
+
+
+def test_scoped_resolution_follows_the_approved_configuration() -> None:
+    from cu_rates.pipeline.trusted import verify_located_claim
+
+    config, source, body, artifact, approval = inputs("table")
+    claim = (
+        extract(config, source, body, artifact, extraction_run_id="c", git_sha=GIT)
+        .rows[0]
+        .candidates[0]
+        .provenance
+    )
+    assert registry.approved_sections(approval) == ()
+    assert verify_located_claim(body, claim, approval=approval)
+    # Whole-document configuration: an unbalanced page is not re-resolved tolerantly.
+    broken = body.replace(b"</head>", b"</link></head>")
+    with pytest.raises(ValueError):
+        verify_located_claim(broken, claim, approval=approval)
+    assert registry.approved_sections(real_inputs()[4]) == real_inputs()[0].sections
+
+
+def test_prose_date_claims_are_read_only_under_their_own_rule_and_zone() -> None:
+    from cu_rates.normalize._values import prose_rule_id
+    from cu_rates.validation._rules import _claim_value
+
+    text = "November 18, 2026"
+    with pytest.raises(ValueError):
+        _claim_value("effective_at", text)  # ordinary claim: no date-only reading
+    rule = prose_rule_id("America/New_York")
+    assert _claim_value("effective_at", text, rule) == datetime(2026, 11, 18, 5, tzinfo=UTC)
+    assert _claim_value("effective_at", text, prose_rule_id("UTC")) == datetime(
+        2026, 11, 18, tzinfo=UTC
+    )
+    assert _claim_value("effective_at", "November 19, 2026", rule) != datetime(
+        2026, 11, 18, 5, tzinfo=UTC
+    )
+    _, result, _ = run()
+    dated = [c for c in result.rows[0].candidates if c.proposed_path == "effective_at"]
+    assert dated[0].provenance.extraction.rule_id == rule
+
+
+def test_label_and_value_must_share_the_table_row() -> None:
+    config = real_inputs()[0]
+    field = config.rows[0].fields[2]  # note_rate, value in tbody row 3
+    moved = field.model_copy(
+        update={
+            "label": field.label.model_copy(
+                update={"selector": "#loan-rates tbody tr:nth-child(4) > td:nth-child(2)"}
+            )
+        }
+    )
+    fields = tuple(moved if f is field else f for f in config.rows[0].fields)
+    row = config.rows[0].model_copy(update={"fields": fields})
+    payload = config.model_copy(update={"rows": (row,)}).model_dump(mode="json")
+    with pytest.raises(ValueError, match="same table row"):
+        SourceConfiguration.model_validate(payload)
+    aligned = moved.label.model_copy(
+        update={"selector": "#loan-rates tbody tr:nth-child(3) > td:nth-child(2)"}
+    )
+    ok = field.model_copy(update={"label": aligned})
+    row = config.rows[0].model_copy(
+        update={"fields": tuple(ok if f is field else f for f in config.rows[0].fields)}
+    )
+    SourceConfiguration.model_validate(
+        config.model_copy(update={"rows": (row,)}).model_dump(mode="json")
+    )
+
+
+def test_verification_tokenizes_a_stored_body_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    from cu_rates.pipeline import extract as html
+    from cu_rates.pipeline.trusted import verify_located_claim
+
+    _, result, _ = run()
+    _, _, body, _, approval = real_inputs()
+    html._DOCUMENTS.clear()
+    calls = 0
+    original = html._ScopedTree.feed
+
+    def counted(parser: html._ScopedTree, data: str) -> None:
+        nonlocal calls
+        calls += 1
+        original(parser, data)
+
+    monkeypatch.setattr(html._ScopedTree, "feed", counted)
+    claims = [c.provenance for c in result.rows[0].candidates if c.proposed_path != "effective_at"]
+    for claim in claims * 3:
+        verify_located_claim(body, claim, approval=approval)
+    assert calls == 1  # all claims lie in the one loan-rates section

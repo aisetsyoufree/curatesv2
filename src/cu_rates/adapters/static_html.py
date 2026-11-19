@@ -39,7 +39,7 @@ from cu_rates.contracts.evidence import (
 from cu_rates.contracts.scenarios import evaluate_scenario_match
 from cu_rates.contracts.sources import ExtractedCandidate, RateSource
 from cu_rates.normalize import FieldState, OfferContext, _family, normalize_offer
-from cu_rates.normalize._values import DateFormat, date_pattern
+from cu_rates.normalize._values import DateFormat, date_pattern, prose_rule_id
 from cu_rates.pipeline.extract import (
     _SECTION_ID,
     MAX_SECTIONS,
@@ -143,6 +143,15 @@ class Row(ConfigurationData):
         return self
 
 
+_ROW = re.compile(r"(.*?)\btr:nth-child\(([0-9]+)\)")
+
+
+def _same_row(value: str, label: str) -> bool:
+    """Within one table body, a label cell must sit in the same row as its value."""
+    a, b = _ROW.match(value), _ROW.match(label)
+    return a is None or b is None or a[1] != b[1] or a[2] == b[2]
+
+
 class SourceConfiguration(ConfigurationData):
     source_id: Identifier
     source_url: HttpUrlText
@@ -163,6 +172,10 @@ class SourceConfiguration(ConfigurationData):
             raise ValueError("sections must be unique and few")
         if any(not re.fullmatch(_SECTION_ID, section) for section in self.sections):
             raise ValueError("invalid section id")
+        for row in self.rows:
+            for rule in row.fields:
+                if not rule.group_header and not _same_row(rule.selector, rule.label.selector):
+                    raise ValueError("a label and its value must lie in the same table row")
         if self.sections:
             for row in self.rows:
                 for rule in row.fields:
@@ -359,7 +372,9 @@ def extract(
                                 parser=configuration_parser(config),
                                 configuration_sha256=config.sha256,
                                 normalization_version="t040.static-html.v1",
-                                rule_id="t040.literal.v1",
+                                rule_id="t040.literal.v1"
+                                if rule.date is None
+                                else prose_rule_id(rule.date.timezone),
                             ),
                         ),
                     )

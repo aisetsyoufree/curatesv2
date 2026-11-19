@@ -2,7 +2,7 @@
   "source_id": "real.rates",
   "source_url": "https://real.example/rates",
   "institution_charter": 8000401,
-  "layout_sha256": "ed2533a9dd569209b87c9565ef4e1c23abe8eee1345c228e7f21954530756d90",
+  "layout_sha256": "d596db5a6bc80c0e75eea366d2188d965f353aad38f76482c98460c6a608071b",
   "sections": [
     "loan-rates",
     "rates-heading",

@@ -2,10 +2,11 @@
 
 import re
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from decimal import Decimal
+from functools import cache
 from typing import Literal
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, available_timezones
 
 from pydantic import TypeAdapter
 
@@ -101,36 +102,36 @@ def prose_date(text: str, fmt: str, timezone: str) -> datetime:
     return datetime(day.year, day.month, day.day, tzinfo=ZoneInfo(timezone)).astimezone(UTC)
 
 
-@dataclass(frozen=True)
-class ProseDate:
-    """A claim that states only a calendar day, as evidence for an effective instant.
+PROSE_RULE = "t040.prose-date.v1"
 
-    It equals an instant that begins that day in some real-world UTC offset (-12h..+14h).
-    The zone is reviewed adapter configuration the validator does not see, so it can only
-    refuse a claim whose day cannot be the one that was normalized.
+
+def prose_rule_id(timezone: str) -> str:
+    """Candidate rule id that records the reviewed zone (identifiers are lowercase, no '/')."""
+    return f"{PROSE_RULE}:{timezone.lower().replace('/', ':')}"
+
+
+@cache
+def _zones() -> dict[str, str]:
+    return {zone.lower().replace("/", ":"): zone for zone in available_timezones()}
+
+
+def prose_instant(text: str, rule_id: str | None) -> datetime | None:
+    """The exact instant a prose-date candidate stands for, from its own recorded zone.
+
+    Only a candidate whose rule id is the prose-date rule is read this way; any other
+    claim returns None and keeps strict timestamp parsing.
     """
-
-    day: date
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, ProseDate):
-            return self.day == other.day
-        if isinstance(other, datetime) and other.utcoffset() is not None:
-            start = datetime(self.day.year, self.day.month, self.day.day, tzinfo=UTC)
-            return start - timedelta(hours=14) <= other <= start + timedelta(hours=12)
-        return False
-
-    def __hash__(self) -> int:
-        return hash(self.day)
-
-
-def prose_day(text: str) -> ProseDate | None:
+    if rule_id is None or not rule_id.startswith(PROSE_RULE + ":"):
+        return None
+    zone = _zones().get(rule_id.removeprefix(PROSE_RULE + ":"))
+    if zone is None:
+        raise ValueError("unknown timezone in prose-date rule")
     for fmt in _DATE_PATTERNS:
         try:
-            return ProseDate(_day(text, fmt))
+            return prose_date(text, fmt, zone)
         except ValueError:
             continue
-    return None
+    raise ValueError("not a recognised prose date")
 
 
 def percent(text: str) -> Decimal:

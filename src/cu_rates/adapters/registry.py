@@ -87,6 +87,17 @@ def load_configuration(source: RateSource) -> SourceConfiguration:
     return config
 
 
+def approved_sections(approval: SourceApproval | None) -> tuple[str, ...]:
+    """Sections of the configuration the approval identity binds (empty: whole-document mode)."""
+    if approval is None or approval.adapter is None or approval.adapter.name != PARSER.name:
+        return ()
+    matches = [p for p in CONFIGURATIONS.glob("*.json") if p.stem == approval.source_id]
+    if len(matches) != 1:
+        return ()
+    config = SourceConfiguration.model_validate_json(matches[0].read_bytes())
+    return config.sections if configuration_parser(config) == approval.adapter else ()
+
+
 def body_layout_sha256(
     source: RateSource,
     approval: SourceApproval | None,

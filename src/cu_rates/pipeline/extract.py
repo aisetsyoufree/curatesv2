@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections import OrderedDict
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
@@ -65,7 +66,8 @@ class _Node:
     attrs: dict[str, str]
     parent: _Node | None = None
     parts: list[str | _Node] = field(default_factory=list)
-    hidden: bool = False  # footnote markers: structural, but never visible text
+    hidden: bool = False  # footnote candidate (sup): dropped from text only if it is a marker
+    ancestors: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = ()  # section root only
 
     @property
     def children(self) -> list[_Node]:
@@ -78,7 +80,7 @@ class _Node:
             item = pending.pop()
             if isinstance(item, str):
                 chunks.append(item)
-            elif item.tag not in _NONVISIBLE and not item.hidden:
+            elif item.tag not in _NONVISIBLE and not (item.hidden and _is_footnote(item)):
                 pending.extend(reversed(item.parts))
         return "".join(chunks)
 
@@ -91,6 +93,24 @@ class _Node:
             node = pending.pop()
             yield node
             pending.extend(reversed(node.children))
+
+
+_MARKER = re.compile(r"[0-9]{1,2}|[*\u2020\u2021\u00a7]")
+
+
+def _is_footnote(node: _Node) -> bool:
+    """A trailing superscript that is only a footnote marker; mid-value text is never dropped."""
+    parent = node.parent
+    if parent is None or not all(isinstance(part, str) for part in node.parts):
+        return False
+    if _MARKER.fullmatch("".join(str(part) for part in node.parts).strip()) is None:
+        return False
+    for part in reversed(parent.parts):
+        if part is node:
+            return True
+        if not isinstance(part, str) or part.strip():
+            return False
+    return False
 
 
 class _Tree(HTMLParser):
@@ -155,11 +175,16 @@ class _ScopedTree(HTMLParser):
         self.current: _Node | None = None
         self.depth = 0
         self.closed = False
+        self.open_tags: list[tuple[str, tuple[tuple[str, str], ...]]] = []
 
     def _open(self, tag: str, attrs: list[tuple[str, str | None]], *, selfclosing: bool) -> None:
         is_target = any(key == "id" and value == self.section_id for key, value in attrs)
         self.matches += is_target
-        if self.closed or (self.current is None and not (is_target and self.matches == 1)):
+        if self.current is None and not (is_target and self.matches == 1):
+            if not self.closed and tag not in _VOID and not selfclosing:
+                self.open_tags.append((tag, _attr_pairs(attrs)))
+            return
+        if self.closed:
             return
         values = {key: value or "" for key, value in attrs}
         if len(values) != len(attrs):
@@ -171,6 +196,7 @@ class _ScopedTree(HTMLParser):
         node = _Node(tag, values, self.current, hidden=tag in _FOOTNOTE)
         if self.current is None:
             self.section = node
+            node.ancestors = tuple(self.open_tags)
         else:
             self.current.parts.append(node)
         if tag in _VOID:
@@ -187,7 +213,12 @@ class _ScopedTree(HTMLParser):
 
     def handle_endtag(self, tag: str) -> None:
         if self.current is None:
-            return  # outside the addressed section: tolerated
+            # Outside the section: tolerated. Track only what encloses it, leniently.
+            for index in range(len(self.open_tags) - 1, -1, -1):
+                if self.open_tags[index][0] == tag:
+                    del self.open_tags[index:]
+                    break
+            return
         if self.current.tag != tag:
             raise ValueError("section HTML is not explicitly balanced")
         self.depth -= 1
@@ -202,6 +233,13 @@ class _ScopedTree(HTMLParser):
             self.current.parts.append(data)
 
 
+def _attr_pairs(attrs: list[tuple[str, str | None]]) -> tuple[tuple[str, str], ...]:
+    return tuple(sorted((key, value or "") for key, value in attrs))
+
+
+_HIDING_TAGS = _NONVISIBLE | {"details", "dialog"}
+
+
 def _parse_section(body: bytes, section_id: str) -> _Node:
     if len(body) > MAX_BODY_BYTES:
         raise ValueError("HTML body size limit exceeded")
@@ -214,6 +252,10 @@ def _parse_section(body: bytes, section_id: str) -> _Node:
         raise ValueError(f"section {section_id} does not resolve uniquely")
     if not parser.closed:
         raise ValueError("section HTML is incomplete")
+    for tag, attrs in parser.section.ancestors:
+        keys = {key for key, _ in attrs}
+        if tag in _HIDING_TAGS or "hidden" in keys or ("aria-hidden", "true") in attrs:
+            raise ValueError("section lies inside non-visible or hidden content")
     return parser.section
 
 
@@ -232,6 +274,22 @@ class ScopedDocument:
         if section_id not in self._sections:
             self._sections[section_id] = _parse_section(self.body, section_id)
         return self._sections[section_id]
+
+
+_DOCUMENTS: OrderedDict[bytes, ScopedDocument] = OrderedDict()
+
+
+def _cached_document(body: bytes) -> ScopedDocument:
+    """One lazily parsed document per distinct body, so many claims do not re-tokenize it."""
+    key = hashlib.sha256(body).digest()
+    document = _DOCUMENTS.get(key)
+    if document is None:
+        document = _DOCUMENTS[key] = ScopedDocument(body)
+        while len(_DOCUMENTS) > 2:
+            _DOCUMENTS.popitem(last=False)
+    else:
+        _DOCUMENTS.move_to_end(key)
+    return document
 
 
 _NTH = r"(?::nth-(?:child|of-type)\([1-9][0-9]*\))?"
@@ -320,7 +378,7 @@ def resolve_text(
             if isinstance(body, ScopedDocument):
                 document = body
             elif isinstance(body, bytes):
-                document = ScopedDocument(body)
+                document = _cached_document(body)
             else:
                 raise ValueError("tolerant resolution requires stored bytes")
             return _structural(
@@ -382,7 +440,13 @@ def layout_sha256(body: bytes | _Node) -> str:
 def scoped_layout_sha256(document: ScopedDocument, section_ids: Sequence[str]) -> str:
     """Bind the structure of exactly the configured sections; the rest of the page is free."""
     payload = json.dumps(
-        {section_id: _shape(document.section(section_id)) for section_id in section_ids},
+        {
+            section_id: {
+                "ancestors": document.section(section_id).ancestors,
+                "shape": _shape(document.section(section_id)),
+            }
+            for section_id in section_ids
+        },
         sort_keys=True,
         separators=(",", ":"),
     )

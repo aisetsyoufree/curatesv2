@@ -10,7 +10,11 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.engine import Connection
 
-from cu_rates.adapters.registry import body_layout_sha256, verify_offer_against_stored_bytes
+from cu_rates.adapters.registry import (
+    approved_sections,
+    body_layout_sha256,
+    verify_offer_against_stored_bytes,
+)
 from cu_rates.adapters.static_html import fragment_is_located
 from cu_rates.artifact_store import ArtifactStore, ArtifactStoreError
 from cu_rates.contracts.audit import (
@@ -107,7 +111,7 @@ from cu_rates.db.schema import (
     withdrawal_entries,
     withdrawal_lifts,
 )
-from cu_rates.pipeline.extract import excerpt_is_located, resolve_text
+from cu_rates.pipeline.extract import excerpt_is_located, resolve_text, selector_section
 from cu_rates.snapshot import Denylist
 
 _FRESHNESS = timedelta(hours=71)
@@ -580,7 +584,12 @@ def verify_located_claim(
         # correction evidence keeps the strict whole-document parse and excerpt check.
         and provenance.extraction.parser == approval.adapter
     )
-    node = resolve_text(body, locator.selector, locator.selector_type, tolerant=approved_claim)
+    # Tolerant (section-scoped) resolution only when the approved configuration declares sections
+    # and the selector lies in one of them; whole-document configurations stay strict.
+    tolerant = bool(approved_claim) and (
+        selector_section(locator.selector) in approved_sections(approval)
+    )
+    node = resolve_text(body, locator.selector, locator.selector_type, tolerant=tolerant)
     located = excerpt_is_located(node, provenance.source_text)
     if approved_claim:
         located = fragment_is_located(node, provenance.source_text)

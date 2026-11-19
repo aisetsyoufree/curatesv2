@@ -33,6 +33,16 @@ Imbalance, duplicate attributes or excessive depth inside a section still fail t
 section id must occur once in the page, and every selector must start with a listed id.
 `<sup>` footnote markers are removed from text in this mode, by tag only; `*` or `(1)` are not.
 Without `sections` the whole document must be balanced as before.
+`<sup>` is dropped only when it is a trailing 1-2 digit or `*` marker; a superscript inside a
+value (`6<sup>.125</sup>%`) is kept, so the exact-text checks fail closed. A section's ancestor
+tags and attributes are pinned in the layout hash, and a section inside `noscript`, `template`,
+`details`, `dialog` or a `hidden` element is refused.
+
+**Sections MUST include every qualifying heading, caption, note and disclosure that gives the
+rates their meaning** (which product, rate type, conditions, footnote text). Text outside the
+listed sections is neither read nor pinned, so a change there cannot be detected. A label and its
+value selector must lie in the same table row (`tr:nth-child(N)`) unless the field is a
+`group_header`.
 
 Group sub-header rows: point a field at the sub-header cell and set `group_header: true`
 (optionally with `excerpt` plus `context_text`). The value is stated by the page, but the

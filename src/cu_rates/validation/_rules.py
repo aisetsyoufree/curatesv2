@@ -473,7 +473,9 @@ class Checks:
         problems = []
         for path, actual in fields.items():
             for provenance in self.evidence.get(path, ()):
-                if _has_contradiction(path, provenance.source_text, actual):
+                if _has_contradiction(
+                    path, provenance.source_text, actual, provenance.extraction.rule_id
+                ):
                     problems.append((path, "normalized value disagrees with its stated evidence"))
         for path, claims in self.claims.items():
             values: set[object] = set()
@@ -482,7 +484,7 @@ class Checks:
                     problems.append((path, "candidate lacks matching source-bound raw evidence"))
                     continue
                 try:
-                    value = _claim_value(path, raw)
+                    value = _claim_value(path, raw, evidence.extraction.rule_id)
                 except ValueError:
                     problems.append(
                         (path, "candidate contains malformed or unverifiable field text")
@@ -508,7 +510,7 @@ class Checks:
             if not any(
                 not self._capture_problem(item)
                 and raw == item.source_text
-                and not _has_contradiction("effective_at", raw, effective)
+                and not _has_contradiction("effective_at", raw, effective, item.extraction.rule_id)
                 and any(
                     original.artifact_id == item.artifact_id
                     and original.locator == item.locator
@@ -624,11 +626,11 @@ def _tier_bounds_match(bounds: tuple[TierBound, ...], text: str) -> bool:
     return True
 
 
-def _claim_value(path: str, text: str) -> object:
+def _claim_value(path: str, text: str, rule_id: str | None = None) -> object:
     if text.lower() in _EMPTY:
         return _EMPTY[text.lower()]
-    if path == "effective_at" and (day := _values.prose_day(text)) is not None:
-        return day  # a date written in prose: evidence for the day, not for a clock time
+    if path == "effective_at" and (instant := _values.prose_instant(text, rule_id)) is not None:
+        return instant  # prose date: exact start of day in the zone its own rule recorded
     if path.startswith("scenario_matches."):
         path = "scenario." + path.removeprefix("scenario_matches.")
     if path.startswith("conditions.") or path.endswith(".bounds"):
@@ -638,9 +640,9 @@ def _claim_value(path: str, text: str) -> object:
     return _parse(path, text)[0]
 
 
-def _has_contradiction(path: str, excerpt: str, actual: object) -> bool:
+def _has_contradiction(path: str, excerpt: str, actual: object, rule_id: str | None = None) -> bool:
     try:
-        return _claim_value(path, excerpt) != actual
+        return _claim_value(path, excerpt, rule_id) != actual
     except ValueError:
         # No heuristic interpretation of arbitrary headings.
         return True
