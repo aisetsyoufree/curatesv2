@@ -59,13 +59,17 @@ uv run ruff format --check .
 |---|---|
 | `src/cu_rates/contracts/` | Versioned domain contracts, taxonomy, fingerprints, and the publication gate |
 | `src/cu_rates/artifact_store.py` | Immutable, content-addressed raw evidence store |
-| `src/cu_rates/fetch_worker.py`, `fetch_robots.py` | Policy-gated collector (live transport disabled) |
+| `src/cu_rates/fetch_worker.py`, `fetch_robots.py`, `fetch_dialer.py` | Policy-gated collector and pinned dialer (live collection disabled) |
+| `src/cu_rates/adapters/` | Rate source adapters (static HTML v2, registry, normalization) |
 | `src/cu_rates/normalize/`, `validation/` | Deterministic normalization and validation/quarantine |
 | `src/cu_rates/db/`, `alembic/` | Operational SQLite schema and frozen migrations |
 | `src/cu_rates/roster/` | Source-versioned institution roster import |
 | `src/cu_rates/pipeline/` | Offline vertical slice (slice-only extractor) |
-| `src/cu_rates/snapshot/` | Atomic public snapshot builder and reader |
-| `src/cu_rates/web/` | Server-rendered website foundation and draft educational articles |
+| `src/cu_rates/snapshot/` | Atomic public snapshot builder, reader, publisher, and denylists |
+| `src/cu_rates/web/` | Server-rendered website (comparison views reading sealed snapshots, `/credit-unions` profile pages, draft articles) |
+| `src/cu_rates/intake/` | Private correction inbox database, triage CLI, and contact purging |
+| `src/cu_rates/ops/` | Operational backup/restore, health inspection, and data quality checks |
+| `src/cu_rates/review/` | Private operator review console CLI and local review server |
 | `tests/` | Offline tests and synthetic fixtures (no live requests) |
 | `scripts/check` | The quality gate |
 
