@@ -8,6 +8,7 @@ real-source approvals or rate fixtures shipped here. Unknown sources/versions fa
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from hashlib import sha256
 from pathlib import Path
 from types import MappingProxyType
@@ -20,13 +21,14 @@ from cu_rates.adapters.static_html import (
     SourceConfiguration,
     configuration_parser,
     extract,
+    offer_context,
 )
 from cu_rates.contracts.enums import OfferStatus
 from cu_rates.contracts.evidence import ParserVersion, RawArtifact
 from cu_rates.contracts.offers import NormalizedOffer
 from cu_rates.contracts.sources import ExtractedCandidate, RateSource, SourceApproval
-from cu_rates.normalize import OfferContext, normalize_offer
-from cu_rates.pipeline.extract import SLICE_PARSER
+from cu_rates.normalize import normalize_offer
+from cu_rates.pipeline.extract import SLICE_PARSER, layout_sha256
 
 CONFIGURATIONS = Path(__file__).with_name("configurations")
 
@@ -86,20 +88,46 @@ def load_configuration(source: RateSource) -> SourceConfiguration:
     return config
 
 
+@lru_cache(maxsize=64)
+def _sections_for(path: str, mtime_ns: int, size: int, adapter_version: str) -> tuple[str, ...]:
+    config = SourceConfiguration.model_validate_json(Path(path).read_bytes())
+    identity = configuration_parser(config)
+    return config.sections if identity.version == adapter_version else ()
+
+
+def approved_sections(approval: SourceApproval | None) -> tuple[str, ...]:
+    """Sections of the configuration the approval identity binds (empty: whole-document mode).
+
+    Cached per (file, its mtime and size, approved adapter version) so verifying many
+    claims does not re-read and re-validate the configuration JSON.
+    """
+    if approval is None or approval.adapter is None or approval.adapter.name != PARSER.name:
+        return ()
+    matches = [p for p in CONFIGURATIONS.glob("*.json") if p.stem == approval.source_id]
+    if len(matches) != 1:
+        return ()
+    info = matches[0].stat()
+    return _sections_for(str(matches[0]), info.st_mtime_ns, info.st_size, approval.adapter.version)
+
+
+def body_layout_sha256(
+    source: RateSource,
+    approval: SourceApproval | None,
+    body: bytes,
+    *,
+    allow_fixture: bool = False,
+) -> str:
+    """The structural pin of stored bytes as the approved adapter reads them."""
+    adapter = approved_adapter(source, approval, allow_fixture=allow_fixture)
+    if adapter.fixture:
+        return layout_sha256(body)
+    return load_configuration(source).layout_of(body)
+
+
 def normalize_row(
     row: RowExtraction, config: SourceConfiguration, artifact: RawArtifact
 ) -> NormalizedOffer:
-    result = normalize_offer(
-        row.candidates,
-        OfferContext(
-            offer_id=row.row.offer_id,
-            institution_charter=config.institution_charter,
-            product_id=row.row.product_id,
-            source_id=config.source_id,
-            observed_at=artifact.fetched_at,
-            comparison_target=row.row.comparison_target,
-        ),
-    )
+    result = normalize_offer(row.candidates, offer_context(config, row.row, artifact.fetched_at))
     if result.offer is None:
         raise ValueError(f"normalization yielded {result.no_offer_reason}")
     offer = with_statements(result.offer, result.scenario_checks, artifact.fetched_at)

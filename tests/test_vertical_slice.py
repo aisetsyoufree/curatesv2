@@ -293,7 +293,7 @@ def test_locators_obey_sibling_element_and_attribute_semantics() -> None:
         )
     with pytest.raises(ValueError, match="uniquely"):
         resolve_text(b'<a href="x">One</a><a href="y">Two</a>', "a[href]")
-    with pytest.raises(ValueError, match="unresolvable"):
+    with pytest.raises(ValueError, match="does not resolve"):
         resolve_text(b'<tr id="t"><th>A</th><td>B</td></tr>', "#t > td:nth-child(1)")
 
 

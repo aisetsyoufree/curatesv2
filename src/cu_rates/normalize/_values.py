@@ -2,12 +2,17 @@
 
 import re
 from dataclasses import dataclass
+from datetime import UTC, date, datetime
 from decimal import Decimal
+from functools import cache
+from typing import Literal
+from zoneinfo import ZoneInfo, available_timezones
 
 from pydantic import TypeAdapter
 
 from cu_rates.contracts.base import CreditScore, Days, Money, Months, Percent, Points, SignedPercent
 from cu_rates.contracts.enums import LienPosition, RateType, ScenarioDimension
+from cu_rates.contracts.evidence import ExtractionProvenance
 
 _NUMBER = r"[0-9]+(?:\.[0-9]+)?"
 _MONEY = r"\$?(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\.[0-9]+)?"
@@ -47,6 +52,95 @@ _TERM = re.compile(
     r"([0-9]{1,3}|[a-z]+(?:-[a-z]+)?)[ -](years?|months?)"
     r"(?: fixed term)?(?: \(([0-9]{1,3}) months?\))?\.?"
 )
+
+
+_MONTHS_EN = (
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+)
+DateFormat = Literal["Month D, YYYY", "YYYY-MM-DD", "M/D/YYYY"]
+_DAY = r"(?:[1-9]|[12][0-9]|3[01])"
+_DATE_PATTERNS: dict[str, tuple[str, tuple[str, str, str]]] = {
+    "Month D, YYYY": (rf"({'|'.join(_MONTHS_EN)}) ({_DAY}), (20[0-9]{{2}})", ("m", "d", "y")),
+    "YYYY-MM-DD": (r"(20[0-9]{2})-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])", ("y", "m", "d")),
+    "M/D/YYYY": (rf"(1[0-2]|[1-9])/({_DAY})/(20[0-9]{{2}})", ("m", "d", "y")),
+}
+
+
+def date_pattern(fmt: str) -> str:
+    """One strict, unanchored pattern (a single capture group wraps the whole date)."""
+    return f"({_DATE_PATTERNS[fmt][0]})"
+
+
+def _day(text: str, fmt: str) -> date:
+    pattern, order = _DATE_PATTERNS[fmt]
+    match = re.fullmatch(pattern, text)
+    if match is None:
+        raise ValueError(f"date does not match the configured format {fmt}")
+    parts = dict(zip(order, match.groups(), strict=True))
+    month = _MONTHS_EN.index(parts["m"]) + 1 if fmt == "Month D, YYYY" else int(parts["m"])
+    return date(int(parts["y"]), month, int(parts["d"]))  # impossible dates raise, never clamp
+
+
+def prose_date(text: str, fmt: str, timezone: str) -> datetime:
+    """A calendar date exactly as written, as the start of that day in the configured zone.
+
+    The source gives no clock time, so none is invented: the earliest instant of the
+    stated day is the conservative reading and can never lie in the future of a capture
+    taken that day. Impossible dates (February 30) are errors, not corrections.
+    """
+    day = _day(text, fmt)
+    return datetime(day.year, day.month, day.day, tzinfo=ZoneInfo(timezone)).astimezone(UTC)
+
+
+PROSE_RULE = "t040.prose-date.v1"
+
+
+def prose_rule_id(timezone: str) -> str:
+    """Candidate rule id that records the reviewed zone (identifiers are lowercase, no '/')."""
+    return f"{PROSE_RULE}:{timezone.lower().replace('/', ':')}"
+
+
+@cache
+def _zones() -> dict[str, str]:
+    return {zone.lower().replace("/", ":"): zone for zone in available_timezones()}
+
+
+def prose_instant(text: str, extraction: ExtractionProvenance | None) -> datetime | None:
+    """The exact instant a prose-date candidate stands for, from its own recorded zone.
+
+    Only a candidate made by the static-html adapter (a parser name plus a configuration
+    digest) under the prose-date rule is read this way; any other claim returns None and keeps
+    strict timestamp parsing, so other evidence cannot choose its own offset.
+    """
+    rule_id = None if extraction is None else extraction.rule_id
+    if (
+        extraction is None
+        or extraction.parser.name != "static-html"
+        or not extraction.configuration_sha256
+        or rule_id is None
+        or not rule_id.startswith(PROSE_RULE + ":")
+    ):
+        return None
+    zone = _zones().get(rule_id.removeprefix(PROSE_RULE + ":"))
+    if zone is None:
+        raise ValueError("unknown timezone in prose-date rule")
+    for fmt in _DATE_PATTERNS:
+        try:
+            return prose_date(text, fmt, zone)
+        except ValueError:
+            continue
+    raise ValueError("not a recognised prose date")
 
 
 def percent(text: str) -> Decimal:

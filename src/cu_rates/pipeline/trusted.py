@@ -10,7 +10,11 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.engine import Connection
 
-from cu_rates.adapters.registry import verify_offer_against_stored_bytes
+from cu_rates.adapters.registry import (
+    approved_sections,
+    body_layout_sha256,
+    verify_offer_against_stored_bytes,
+)
 from cu_rates.adapters.static_html import fragment_is_located
 from cu_rates.artifact_store import ArtifactStore, ArtifactStoreError
 from cu_rates.contracts.audit import (
@@ -107,7 +111,7 @@ from cu_rates.db.schema import (
     withdrawal_entries,
     withdrawal_lifts,
 )
-from cu_rates.pipeline.extract import excerpt_is_located, layout_sha256, resolve_text
+from cu_rates.pipeline.extract import excerpt_is_located, resolve_text, selector_section
 from cu_rates.snapshot import Denylist
 
 _FRESHNESS = timedelta(hours=71)
@@ -570,18 +574,24 @@ def verify_located_claim(
     locator = provenance.locator
     if not isinstance(locator, HtmlLocator):
         raise ValueError("stored claims require HTML locators")
-    node = resolve_text(body, locator.selector, locator.selector_type)
-    located = excerpt_is_located(node, provenance.source_text)
-    if (
+    approved_claim = (
         approval is not None
         and approval.approved
         and approval.adapter is not None
         and approval.adapter.name == "static-html"
-        # Lenient token matching only for claims made by this exact approved adapter identity
-        # (name, version and configuration digest); identity or correction evidence keeps the
-        # strict excerpt check.
+        # Lenient token matching and section-scoped parsing only for claims made by this exact
+        # approved adapter identity (name, version and configuration digest); identity or
+        # correction evidence keeps the strict whole-document parse and excerpt check.
         and provenance.extraction.parser == approval.adapter
-    ):
+    )
+    # Tolerant (section-scoped) resolution only when the approved configuration declares sections
+    # and the selector lies in one of them; whole-document configurations stay strict.
+    tolerant = bool(approved_claim) and (
+        selector_section(locator.selector) in approved_sections(approval)
+    )
+    node = resolve_text(body, locator.selector, locator.selector_type, tolerant=tolerant)
+    located = excerpt_is_located(node, provenance.source_text)
+    if approved_claim:
         located = fragment_is_located(node, provenance.source_text)
     if sha256(node.encode()).hexdigest() != locator.normalized_text_sha256 or not located:
         raise ValueError("stored locator or excerpt differs from source")
@@ -995,7 +1005,7 @@ def load_publication_context(
     conditions: tuple[VerifiedScenarioCondition, ...] = ()
     if basis is not None and verified and body is not None:
         artifact = verified[0]
-        layout = layout_sha256(body)
+        layout = body_layout_sha256(source, approval, body, allow_fixture=allow_fixture)
         layouts = {
             _fingerprint(row)
             for row in conn.execute(
