@@ -20,9 +20,36 @@ Each row declares a comparison target (or null) and field paths with:
   definition lists use the same explicit child selection. There is no heuristic search,
   fallback column matching, institution-specific scraper branch, or external parser.
 
-Supported CSS is deliberately bounded: `#id`, `#id > tag:nth-child(N)`, and the existing
-fixture selectors. IDs must resolve uniquely. HTML must be UTF-8 and explicitly balanced;
-unsupported layouts (including omitted closing tags) fail closed. Bodies over 2 MiB
+Supported CSS is deliberately bounded: `#id`, then child (` > `) or descendant (` `) steps
+`tag` with optional `:nth-child(N)` / `:nth-of-type(N)`, for example
+`#rates tbody tr:nth-child(3) > td:nth-child(2)`, plus the existing fixture selectors. Every
+selector must resolve to exactly one element. HTML must be UTF-8; unsupported layouts
+(including omitted closing tags) fail closed.
+
+Tolerant mode (`sections`, parser 1.1.0): list the ids of the subtrees the configuration
+reads. Only those elements are parsed; the rest of the page (stray `</link>`, unclosed body,
+menus) may be imbalanced and is never read, and the layout pin covers only those sections.
+Imbalance, duplicate attributes or excessive depth inside a section still fail the capture, a
+section id must occur once in the page, and every selector must start with a listed id.
+`<sup>` footnote markers are removed from text in this mode, by tag only; `*` or `(1)` are not.
+Without `sections` the whole document must be balanced as before.
+
+Group sub-header rows: point a field at the sub-header cell and set `group_header: true`
+(optionally with `excerpt` plus `context_text`). The value is stated by the page, but the
+row/group association is structural, so such rows are at most medium confidence.
+
+Rows whose source does not state scenario assumptions: set `browse_only: true` with the
+canonical `comparison_target` and no `scenario.*` fields. Lock days, points, loan amount,
+credit score and the rest stay "unstated" in `scenario_matches` (never configured as if
+stated), the gate reports `scenario_unstated` and the row can only be browse-only. Points and
+effective time are optional for such rows (gate: `points_unknown`, `effective_date_missing`).
+Contract limit: a mortgage offer requires a stated purpose (it selects the offer kind), so a
+mortgage row whose page does not state one fails closed. Equity rows must state lien position.
+
+Prose dates: `date: {template, format, timezone}` on `effective_at`, e.g. template
+`Rates accurate as of {value}.` with format `Month D, YYYY`. Surrounding text must match the
+whole node exactly, the date is parsed strictly (no impossible dates, no other spellings) and
+becomes the start of that day in the reviewed IANA timezone; medium confidence. Bodies over 2 MiB
 or nesting beyond 128 elements fail with `ValueError` and low extraction confidence.
 Tree traversals are iterative and each extraction parses the body once. Text excludes
 `script`, `style`, `template`, and `noscript` subtrees. Trusted loading isolates any

@@ -38,7 +38,7 @@ from cu_rates.contracts.scenarios import (
     computed_match_state,
     statement_matches_excerpt,
 )
-from cu_rates.normalize import _EMPTY, FieldState, _parse
+from cu_rates.normalize import _EMPTY, FieldState, _parse, _values
 
 if TYPE_CHECKING:
     from . import ValidationContext
@@ -627,6 +627,8 @@ def _tier_bounds_match(bounds: tuple[TierBound, ...], text: str) -> bool:
 def _claim_value(path: str, text: str) -> object:
     if text.lower() in _EMPTY:
         return _EMPTY[text.lower()]
+    if path == "effective_at" and (day := _values.prose_day(text)) is not None:
+        return day  # a date written in prose: evidence for the day, not for a clock time
     if path.startswith("scenario_matches."):
         path = "scenario." + path.removeprefix("scenario_matches.")
     if path.startswith("conditions.") or path.endswith(".bounds"):

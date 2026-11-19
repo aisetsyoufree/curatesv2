@@ -9,9 +9,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import cast
+from typing import Self, cast
+from zoneinfo import ZoneInfo
 
-from pydantic import ValidationError
+from pydantic import ValidationError, model_validator
 
 from cu_rates.contracts.base import (
     CONTRACT_VERSION,
@@ -165,6 +166,21 @@ class OfferContext(ContractModel):
     source_id: Identifier
     observed_at: UtcDatetime
     comparison_target: CanonicalScenarioId | None = None
+    # Configured, reviewed reading of a date written in prose (no clock time or zone). Both
+    # or neither. Without them effective_at must be an ISO timestamp with an explicit offset.
+    effective_date_format: _values.DateFormat | None = None
+    effective_timezone: str | None = None
+
+    @model_validator(mode="after")
+    def _date_rule_is_complete(self) -> Self:
+        if (self.effective_date_format is None) != (self.effective_timezone is None):
+            raise ValueError("a prose date rule needs both a format and a timezone")
+        if self.effective_timezone is not None:
+            try:
+                ZoneInfo(self.effective_timezone)  # unknown zone names fail closed
+            except (KeyError, ValueError, OSError) as exc:
+                raise ValueError("unknown timezone") from exc
+        return self
 
 
 @dataclass(frozen=True)
@@ -266,7 +282,7 @@ def _date(text: str) -> datetime:
     return timestamp.astimezone(UTC)
 
 
-def _parse(path: str, text: str) -> tuple[Value | None, str]:
+def _parse(path: str, text: str, context: OfferContext | None = None) -> tuple[Value | None, str]:
     if path == "product_family":
         return _family(text), "t044.family.v1"
     if path == "details.purpose":
@@ -276,6 +292,15 @@ def _parse(path: str, text: str) -> tuple[Value | None, str]:
     if path == "partner_link":
         return text, "t044.non-rate-link.v1"
     if path == "effective_at":
+        if (
+            context is not None
+            and context.effective_date_format is not None
+            and context.effective_timezone is not None
+        ):
+            return (
+                _values.prose_date(text, context.effective_date_format, context.effective_timezone),
+                "t044.prose-date.v1",
+            )
         return _date(text), "t044.iso-utc.v1"
     if path.startswith("scenario."):
         return _values.comparison_statement(
@@ -514,7 +539,7 @@ def normalize_offer(
         return _skip(NoOfferReason.NO_CANDIDATES, inputs, traces)
     metadata = {"product_family", "rate_availability", "partner_link"}
     for path in sorted(metadata & inputs.keys()):
-        traces[path] = _parse_trace(path, inputs[path])
+        traces[path] = _parse_trace(path, inputs[path], context)
     if "partner_link" in inputs:
         if len(inputs) != 1 or _get(traces, "partner_link") is None:
             raise NormalizationError("partner_link", "a link must be a separate non-rate record")
@@ -548,7 +573,7 @@ def normalize_offer(
         ):
             raise NormalizationError(path, "unsupported field for this product")
         if path not in traces:
-            traces[path] = _parse_trace(path, candidate)
+            traces[path] = _parse_trace(path, candidate, context)
     purpose = cast("LoanPurpose | None", _get(traces, "details.purpose"))
     kind = {
         ProductFamily.MORTGAGE: "purchase_mortgage"
@@ -604,11 +629,11 @@ def normalize_offer(
     )
 
 
-def _parse_trace(path: str, candidate: ExtractedCandidate) -> FieldTrace:
+def _parse_trace(path: str, candidate: ExtractedCandidate, context: OfferContext) -> FieldTrace:
     try:
         if candidate.raw_value.lower() in _EMPTY:
             return _trace(candidate, path, None, "t044.absence.v1")
-        value, rule = _parse(path, candidate.raw_value)
+        value, rule = _parse(path, candidate.raw_value, context)
         return _trace(candidate, path, value, rule)
     except ValueError as exc:
         raise NormalizationError(path, str(exc)) from exc
@@ -628,7 +653,9 @@ def _make_offer(
         f"conditions.{condition.condition_id}": condition.provenance for condition in conditions
     }
     payload = {
-        **context.model_dump(exclude={"comparison_target"}),
+        **context.model_dump(
+            exclude={"comparison_target", "effective_date_format", "effective_timezone"}
+        ),
         **headline,
         "schema_version": CONTRACT_VERSION,
         "status": OfferStatus.CANDIDATE,

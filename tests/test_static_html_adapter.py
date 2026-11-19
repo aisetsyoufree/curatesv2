@@ -17,6 +17,7 @@ from cu_rates.adapters.registry import (
 )
 from cu_rates.adapters.static_html import (
     PARSER,
+    Extraction,
     RowExtraction,
     SourceConfiguration,
     configuration_parser,
@@ -25,6 +26,7 @@ from cu_rates.adapters.static_html import (
 from cu_rates.artifact_store import ArtifactStore
 from cu_rates.contracts.audit import PublishedSnapshot, ReviewDecision
 from cu_rates.contracts.enums import (
+    CanonicalScenarioId,
     EvidenceKind,
     FetchMethod,
     InstitutionStatus,
@@ -279,7 +281,7 @@ def test_trusted_reextraction_refuses_forged_claims(change: str) -> None:
 
 
 def prepare(
-    conn: Connection, store: ArtifactStore, name: str = "table"
+    conn: Connection, store: ArtifactStore, name: str = "table", family: str = "mortgage"
 ) -> tuple[RateSource, FetchProfile]:
     config, source, _, _, approval = inputs(name)
     before = NOW - timedelta(days=1)
@@ -313,7 +315,7 @@ def prepare(
             schema_version="1.0",
             product_id=config.rows[0].product_id,
             institution_charter=config.institution_charter,
-            family="mortgage",
+            family=family,
             name="Synthetic purchase",
             lifecycle="active",
             rate_availability="public_rate",
@@ -1137,3 +1139,543 @@ def test_prose_literal_rate_configuration_fails_closed() -> None:
     )
     result = extract(config, source, body, artifact, extraction_run_id="literal", git_sha=GIT)
     assert result.confidence == "low" and any("rate excerpts" in d for d in result.diagnostics)
+
+
+# ---- T040b: tolerant, section-scoped extraction of pages without ids -------------------
+
+
+REAL = "real"
+
+
+def real_inputs(
+    body: bytes | None = None, **changes: object
+) -> tuple[SourceConfiguration, RateSource, bytes, RawArtifact, SourceApproval]:
+    config, source, page, artifact, approval = inputs(REAL, body)
+    if changes:
+        config = config.model_copy(update=changes)
+        approval = approval.model_copy(update={"adapter": configuration_parser(config)})
+    return config, source, page, artifact, approval
+
+
+def run(
+    body: bytes | None = None, **changes: object
+) -> tuple[SourceConfiguration, "Extraction", RawArtifact]:
+    config, source, page, artifact, _ = real_inputs(body, **changes)
+    return (
+        config,
+        extract(config, source, page, artifact, extraction_run_id="r", git_sha=GIT),
+        artifact,
+    )
+
+
+def with_rule(config: SourceConfiguration, path: str, **update: object) -> SourceConfiguration:
+    rows = tuple(
+        row.model_copy(
+            update={
+                "fields": tuple(
+                    f.model_copy(update=update) if f.path == path else f for f in row.fields
+                )
+            }
+        )
+        for row in config.rows
+    )
+    return config.model_copy(update={"rows": rows})
+
+
+def diagnostics(result: "Extraction") -> str:
+    return "; ".join(result.diagnostics)
+
+
+def test_real_page_shape_extracts_tolerantly_as_browse_only() -> None:
+    config, result, artifact = run()
+    assert result.confidence == "medium" and not result.diagnostics
+    _, source, body, _, approval = real_inputs()
+    for row in result.rows:
+        offer = normalize_row(row, config, artifact)
+        # the page states a term and nothing about the borrower: every assumption is unstated
+        states = {m.dimension.value: m.state.value for m in offer.scenario_matches}
+        assert states.pop("term_months") in {"matches", "conflicts"}
+        assert states and set(states.values()) == {"unstated"}
+        assert all(m.stated is None for m in offer.scenario_matches if m.state.value == "unstated")
+        assert offer.details.kind == "fixed_equity"
+        assert offer.effective_at == datetime(2026, 11, 18, 5, tzinfo=UTC)  # start of day, NY
+        verified = verify_offer_against_stored_bytes(source, approval, offer, body, artifact)
+        assert verified.confidence == "medium" and verified.comparable
+    labels = [getattr(c.provenance.locator, "selector", "") for c in result.rows[0].candidates]
+    assert "#loan-rates tbody tr:nth-child(3) > td:nth-child(1)" in labels
+    # footnote markers are stripped from label and value text deterministically
+    terms = {c.proposed_path: c.raw_value for c in result.rows[0].candidates}
+    assert terms["details.term_months"] == "10 Year"
+
+
+def test_imbalance_outside_the_section_is_tolerated_but_whole_document_mode_rejects_it() -> None:
+    _, result, _ = run()
+    assert result.confidence == "medium"
+    legacy = real_inputs(sections=())[0].model_copy(update={"sections": ()})
+    _, source, body, artifact, _ = real_inputs()
+    strict = extract(legacy, source, body, artifact, extraction_run_id="r", git_sha=GIT)
+    assert strict.confidence == "low" and "invalid HTML" in diagnostics(strict)
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        (b"<tr><td>15 Year</td><td>5.333%</td><td>5.444%</td></tr>", b"<tr><td>15 Year</td>"),
+        (b"<td>5.111%</td>", b"<td>5.111%</span></td>"),
+        (b"</tbody>", b"</tbody></tbody>"),
+        (b"<td>10 Year", b"<br></br><td>10 Year"),
+    ],
+)
+def test_imbalance_inside_the_section_still_fails_closed(before: bytes, after: bytes) -> None:
+    _, _, body, _, _ = real_inputs()
+    assert before in body
+    _, result, _ = run(body.replace(before, after))
+    assert result.confidence == "low" and "invalid HTML" in diagnostics(result)
+
+
+def test_unclosed_section_and_duplicate_section_id_fail_closed() -> None:
+    _, _, body, _, _ = real_inputs()
+    _, result, _ = run(body.replace(b'</section>\n<section id="mortgage-rates">', b"\n", 1)[:-30])
+    assert result.confidence == "low"
+    twin = body.replace(
+        b"</footer>", b'<p id="rates-note">Rates accurate as of November 18, 2026.</p></footer>'
+    )
+    _, result, _ = run(twin)
+    assert result.confidence == "low" and "uniquely" in diagnostics(result)
+
+
+def test_layout_drift_inside_sections_only() -> None:
+    _, _, body, _, _ = real_inputs()
+    _, result, _ = run(body.replace(b"<footer>", b"<aside>new banner</aside><footer>"))
+    assert result.confidence == "medium"  # outside the pinned sections: free to change
+    _, result, _ = run(body.replace(b"<td>15 Year</td>", b"<td>15 Year</td><td>x</td>"))
+    assert result.confidence == "low" and "layout drift" in diagnostics(result)
+    _, result, _ = run(body.replace(b"<th>APR<sup>2</sup></th>", b"<th>APY<sup>2</sup></th>"))
+    assert result.confidence == "low" and "layout drift" in diagnostics(result)
+
+
+def test_selector_must_resolve_to_one_element_and_stay_in_sections() -> None:
+    from cu_rates.pipeline.extract import resolve_text
+
+    _, _, body, _, _ = real_inputs()
+    ok = "#loan-rates tbody tr:nth-child(3) > td:nth-child(2)"
+    assert resolve_text(body, ok, tolerant=True) == "5.111%"
+    assert resolve_text(body, "#loan-rates tr:nth-child(4) td:nth-child(3)", tolerant=True) == (
+        "5.444%"
+    )
+    assert resolve_text(body, "#loan-rates caption:nth-of-type(1)", tolerant=True)
+    for ambiguous in (
+        "#loan-rates tbody tr > td:nth-child(2)",  # many rows
+        "#loan-rates td:nth-child(1)",
+        "#loan-rates tbody tr:nth-child(40) > td:nth-child(1)",  # none
+        "#loan-rates tbody tr:nth-child(3) > td:nth-child(9)",
+        "#loan-rates tbody > td",  # td is not a direct child of tbody
+    ):
+        with pytest.raises(ValueError):
+            resolve_text(body, ambiguous, tolerant=True)
+    for malformed in ("#loan-rates tbody tr:nth-child(0)", "#loan-rates >", "#loan-rates  tr"):
+        with pytest.raises(ValueError):
+            resolve_text(body, malformed, tolerant=True)
+
+
+def test_configuration_selectors_must_lie_inside_the_declared_sections() -> None:
+    config = real_inputs()[0]
+    outside = config.rows[0].fields[0].model_copy(update={"selector": "#mortgage-rates caption"})
+    row = config.rows[0].model_copy(update={"fields": (outside, *config.rows[0].fields[1:])})
+    payload = config.model_copy(update={"rows": (row,)}).model_dump(mode="json")
+    with pytest.raises(ValueError, match="outside the configured sections"):
+        SourceConfiguration.model_validate(payload)
+
+
+def test_whole_document_mode_resolves_structural_selectors_after_balanced_parse() -> None:
+    from cu_rates.pipeline.extract import resolve_text
+
+    body = (
+        b'<html><body><div id="a"><table><tbody><tr><td>x</td><td>y</td></tr></tbody></table></div>'
+        b"</body></html>"
+    )
+    assert resolve_text(body, "#a tbody tr:nth-child(1) > td:nth-child(2)") == "y"
+    with pytest.raises(ValueError, match="balanced"):
+        resolve_text(body.replace(b"</div>", b""), "#a td:nth-child(1)")
+
+
+def test_footnote_markers_are_stripped_only_by_tag_not_by_guessing() -> None:
+    from cu_rates.pipeline.extract import resolve_text
+
+    _, _, body, _, _ = real_inputs()
+    assert resolve_text(body, "#loan-rates thead th:nth-child(2)", tolerant=True) == "Rate"
+    # a bare '*' is not a recognised footnote marker: the label (and the pin) no longer match
+    _, result, _ = run(body.replace(b"<sup>1</sup>", b"*"))
+    assert result.confidence == "low"
+    # nor is one inside a value cell removed
+    _, result, _ = run(body.replace(b"<td>5.111%</td>", b"<td>5.111%*</td>"))
+    assert result.confidence == "low"
+
+
+def test_group_header_context_and_prose_date_cap_confidence_at_medium() -> None:
+    config, result, _ = run()
+    assert result.confidence == "medium"
+    # No group header and no prose date anywhere: the tier is decided by literal evidence.
+    plain = config.rows[0].model_copy(
+        update={
+            "fields": tuple(
+                f.model_copy(update={"group_header": False, "date": None, "path": f.path})
+                for f in config.rows[0].fields
+                if f.path != "effective_at"
+            )
+        }
+    )
+    changed = config.model_copy(update={"rows": (plain,)})
+    changed = changed.model_copy(update={"layout_sha256": changed.layout_of(real_inputs()[2])})
+    _, source, body, artifact, _ = real_inputs()
+    again = extract(changed, source, body, artifact, extraction_run_id="r", git_sha=GIT)
+    assert again.confidence == "high" and not again.diagnostics
+    # the group_header marker alone must lower it
+    flagged = plain.model_copy(
+        update={
+            "fields": tuple(
+                f.model_copy(update={"group_header": f.path == "product_family"})
+                for f in plain.fields
+            )
+        }
+    )
+    cfg = changed.model_copy(update={"rows": (flagged,)})
+    assert (
+        extract(cfg, source, body, artifact, extraction_run_id="r", git_sha=GIT).confidence
+        == "medium"
+    )
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "reason"),
+    [
+        (b"November 18, 2026", b"Nov 18, 2026", "date context"),
+        (b"November 18, 2026", b"November 18 2026", "date context"),
+        (b"November 18, 2026", b"November 31, 2026", "out of range"),
+        (b"November 18, 2026", b"November 18, 2027", "follows source observation"),
+        (b"November 18, 2026", b"November 018, 2026", "date context"),
+        (b"Rates and APR accurate as of", b"Rates were accurate as of", "date context"),
+        (b"Rates and APR accurate", b"Preliminary: Rates and APR accurate", "date context"),
+        (b"2026.</p>", b"2026, subject to change.</p>", "date context"),
+        (b"November 18, 2026", b"November 18, 2026 and November 19, 2026", "date context"),
+    ],
+)
+def test_prose_date_is_strict_and_never_inferred(before: bytes, after: bytes, reason: str) -> None:
+    _, _, body, _, _ = real_inputs()
+    _, result, _ = run(body.replace(before, after))
+    assert result.confidence == "low" and reason in diagnostics(result)
+
+
+def test_prose_date_formats_and_timezone_are_reviewed_configuration() -> None:
+    from cu_rates.adapters.static_html import DateRule
+
+    config = real_inputs()[0]
+    rule = config.rows[0].fields[-1].date
+    assert rule is not None
+    iso = (FIXTURES / "real.html").read_bytes().replace(b"November 18, 2026", b"2026-11-18")
+    changed = with_rule(
+        config, "effective_at", date=rule.model_copy(update={"format": "YYYY-MM-DD"})
+    )
+    changed = changed.model_copy(update={"layout_sha256": changed.layout_of(iso)})
+    _, source, body, artifact, _ = inputs(REAL, iso)
+    result = extract(changed, source, body, artifact, extraction_run_id="r", git_sha=GIT)
+    assert result.confidence == "medium", diagnostics(result)
+    effective = normalize_row(result.rows[0], changed, artifact).effective_at
+    assert effective == datetime(2026, 11, 18, 5, tzinfo=UTC)
+    with pytest.raises(ValueError, match="unknown timezone"):
+        DateRule(template=rule.template, format="Month D, YYYY", timezone="Mars/Base")
+
+
+def test_date_rule_requires_one_slot_and_plain_effective_field() -> None:
+    from cu_rates.adapters.static_html import DateRule, Field
+
+    for template in ("accurate as of", "{value} and {value}"):
+        with pytest.raises(ValueError, match="exactly one"):
+            DateRule(template=template, format="Month D, YYYY", timezone="UTC")
+    config = real_inputs()[0]
+    rule = config.rows[0].fields[-1].date
+    assert rule is not None
+    rate = config.rows[0].fields[2].model_dump(mode="json")
+    with pytest.raises(ValueError, match="plain effective_at"):
+        Field.model_validate(rate | {"date": rule.model_dump(mode="json")})
+
+
+def test_no_prose_date_means_no_effective_time_and_no_invention() -> None:
+    config, source, body, artifact, _ = real_inputs()
+    row = config.rows[0]
+    row = row.model_copy(
+        update={"fields": tuple(f for f in row.fields if f.path != "effective_at")}
+    )
+    changed = config.model_copy(update={"rows": (row,)})
+    changed = changed.model_copy(update={"layout_sha256": changed.layout_of(body)})
+    result = extract(changed, source, body, artifact, extraction_run_id="r", git_sha=GIT)
+    assert result.confidence == "medium", diagnostics(result)  # gate's review path owns this
+    assert normalize_row(result.rows[0], changed, artifact).effective_at is None
+    # ... but a row that is not browse-only still requires its effective time.
+    comparable = row.model_copy(update={"browse_only": False})
+    assert "effective_at" in required_paths(comparable, ())
+
+
+def required_paths(row: object, candidates: tuple[object, ...]) -> set[str]:
+    from cu_rates.adapters.static_html import required_paths as real
+
+    return real(row, candidates)  # type: ignore[arg-type]
+
+
+def test_browse_only_rows_never_carry_a_scenario_or_assumptions() -> None:
+    from cu_rates.adapters.static_html import Row
+
+    config = real_inputs()[0]
+    base = config.rows[0].model_dump()
+    with pytest.raises(ValueError, match="browse-only"):
+        Row.model_validate(base | {"comparison_target": None})
+    pinned = dict(base["fields"][1], path="scenario.credit_score")
+    with pytest.raises(ValueError, match="browse-only"):
+        Row.model_validate(base | {"fields": [*base["fields"], pinned]})
+
+
+def test_assumptions_the_page_does_not_state_are_not_required_or_invented() -> None:
+    config = real_inputs()[0]
+    browse = config.rows[0]
+    equity = {"product_family": "home_equity_loan"}
+    cands: tuple[object, ...] = ()
+    paths = required_paths(browse, cands)
+    assert not any(p.startswith("scenario.") for p in paths)
+    assert "details.lock_days" not in paths and "points" not in paths
+    mortgage = type("C", (), {"proposed_path": "product_family", "raw_value": "mortgage"})()
+    mortgage_paths = required_paths(browse, (mortgage,))
+    # purpose and rate type are contract-required for a mortgage; lock days are not
+    assert {"details.purpose", "details.rate_type"} <= mortgage_paths
+    assert "details.lock_days" not in mortgage_paths
+    ranked = browse.model_copy(update={"browse_only": False})
+    assert {"details.lock_days", "points", "effective_at"} <= required_paths(ranked, (mortgage,))
+    assert equity
+
+
+def test_mortgage_row_with_unstated_purpose_is_refused_not_defaulted() -> None:
+    """Contract: a mortgage offer's kind depends on a stated purpose. Never guessed."""
+    config, source, body, artifact, _ = real_inputs()
+    section = "#mortgage-rates tbody tr:nth-child"
+    base = config.rows[0]
+
+    def f(path: str, selector: str, label: str, text: str, **kw: object) -> object:
+        return type(base.fields[0]).model_validate(
+            dict(path=path, selector=selector, label=dict(selector=label, text=text), **kw)
+        )
+
+    row = base.model_copy(
+        update={
+            "offer_id": "real.mortgage",
+            "product_id": "real.mortgage-product",
+            "comparison_target": CanonicalScenarioId.PURCHASE_30Y_FIXED,
+            "fields": (
+                f(
+                    "product_family",
+                    f"{section}(1) > td:nth-child(1)",
+                    "#mortgage-rates caption",
+                    "First mortgage rates",
+                    group_header=True,
+                ),
+                f(
+                    "details.rate_type",
+                    f"{section}(2) > td:nth-child(1)",
+                    "#mortgage-rates caption",
+                    "First mortgage rates",
+                    group_header=True,
+                ),
+                f(
+                    "details.term_months",
+                    f"{section}(3) > td:nth-child(1)",
+                    "#mortgage-rates thead th:nth-child(1)",
+                    "Term",
+                ),
+                f(
+                    "note_rate",
+                    f"{section}(3) > td:nth-child(2)",
+                    "#mortgage-rates thead th:nth-child(2)",
+                    "Rate",
+                ),
+                f(
+                    "apr",
+                    f"{section}(3) > td:nth-child(3)",
+                    "#mortgage-rates thead th:nth-child(3)",
+                    "APR",
+                ),
+            ),
+        }
+    )
+    changed = config.model_copy(
+        update={"sections": (*config.sections, "mortgage-rates"), "rows": (row,)}
+    )
+    changed = changed.model_copy(update={"layout_sha256": changed.layout_of(body)})
+    result = extract(changed, source, body, artifact, extraction_run_id="r", git_sha=GIT)
+    assert result.confidence == "low"
+    assert "details.purpose" in diagnostics(result)
+    # configuring a purpose from a node that does not state one is also refused
+    with_purpose = row.model_copy(
+        update={
+            "fields": (
+                *row.fields,
+                f(
+                    "details.purpose",
+                    f"{section}(1) > td:nth-child(1)",
+                    "#mortgage-rates caption",
+                    "First mortgage rates",
+                ),
+            )
+        }
+    )
+    changed = changed.model_copy(update={"rows": (with_purpose,)})
+    result = extract(changed, source, body, artifact, extraction_run_id="r", git_sha=GIT)
+    assert result.confidence == "low"
+
+
+def test_ranked_row_cannot_be_declared_on_a_page_that_states_no_assumptions() -> None:
+    config, source, body, artifact, _ = real_inputs()
+    row = config.rows[0].model_copy(update={"browse_only": False})
+    changed = config.model_copy(update={"rows": (row,)})
+    result = extract(changed, source, body, artifact, extraction_run_id="r", git_sha=GIT)
+    assert result.confidence == "low"
+    assert "required fields missing" in diagnostics(result)
+
+
+def zone_rule(config: SourceConfiguration, zone: str) -> object:
+    rule = config.rows[0].fields[-1].date
+    assert rule is not None
+    return rule.model_copy(update={"timezone": zone})
+
+
+def test_new_configuration_fields_are_bound_into_the_approved_identity() -> None:
+    config = real_inputs()[0]
+    digests = {config.sha256}
+    variants = [
+        config.model_copy(
+            update={"sections": ("loan-rates", "rates-heading", "rates-note", "mortgage-rates")}
+        ),
+        with_rule(config, "product_family", group_header=False),
+        with_rule(config, "effective_at", date=zone_rule(config, "UTC")),
+        config.model_copy(
+            update={"rows": (config.rows[0].model_copy(update={"browse_only": False}),)}
+        ),
+    ]
+    for variant in variants:
+        digests.add(variant.sha256)
+        assert configuration_parser(variant) != configuration_parser(config)
+    assert len(digests) == 5
+    assert configuration_parser(config).version.startswith(f"{PARSER.version}+cfg.")
+    _, source, body, artifact, approval = real_inputs()
+    row = extract(config, source, body, artifact, extraction_run_id="r", git_sha=GIT).rows[0]
+    offer = normalize_row(row, config, artifact)
+    stale = approval.model_copy(update={"adapter": configuration_parser(variants[2])})
+    with pytest.raises(ValueError, match="digest is not approved"):
+        verify_offer_against_stored_bytes(source, stale, offer, body, artifact)
+
+
+def test_scoped_parse_keeps_size_and_depth_caps() -> None:
+    from cu_rates.pipeline.extract import resolve_text
+
+    deep = b'<p id="note">' + b"<div>" * 5000 + b"4.1%" + b"</div>" * 5000 + b"</p>"
+    with pytest.raises(ValueError, match="limit"):
+        resolve_text(deep, "#note", tolerant=True)
+    big = b"<span>" + b"x" * (2 * 1024 * 1024) + b'</span><p id="note">4.1%</p>'
+    with pytest.raises(ValueError, match="limit"):
+        resolve_text(big, "#note", tolerant=True)
+    # unbounded depth OUTSIDE the section is never built into a tree
+    assert (
+        resolve_text(b"<div>" * 5000 + b'<p id="note">4.1%</p>', "#note", tolerant=True) == "4.1%"
+    )
+    config, source, _, artifact, _ = real_inputs()
+    for hostile in (deep, big):
+        art = artifact.model_copy(
+            update={"artifact_id": sha256(hostile).hexdigest(), "byte_length": len(hostile)}
+        )
+        out = extract(config, source, hostile, art, extraction_run_id="r", git_sha=GIT)
+        assert out.confidence == "low"
+
+
+def test_scoped_parse_reads_only_the_section_once_per_section(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cu_rates.pipeline import extract as html
+
+    calls = 0
+    original = html._ScopedTree.feed
+
+    def counted(parser: html._ScopedTree, data: str) -> None:
+        nonlocal calls
+        calls += 1
+        original(parser, data)
+
+    monkeypatch.setattr(html._ScopedTree, "feed", counted)
+    config, result, _ = run()
+    assert result.confidence == "medium" and calls == len(config.sections)
+
+
+def test_text_outside_sections_and_script_content_is_never_evidence() -> None:
+    _, _, body, _, _ = real_inputs()
+    poisoned = body.replace(b'var tracker = "<div></span>";', b'var rate = "9.999%";')
+    _, result, _ = run(poisoned)
+    assert result.confidence == "medium"
+    values = {c.raw_value for r in result.rows for c in r.candidates}
+    assert not any("9.999" in v for v in values)
+
+
+def test_layout_for_trusted_snapshot_uses_the_adapters_own_reading() -> None:
+    _, source, body, _, approval = real_inputs()
+    assert registry.body_layout_sha256(source, approval, body) == real_inputs()[0].layout_sha256
+    with pytest.raises(ValueError):
+        registry.body_layout_sha256(source, approval, body.replace(b"</table>", b"", 1))
+
+
+def test_stored_locators_resolve_tolerantly_only_for_the_approved_adapter() -> None:
+    from cu_rates.pipeline.trusted import verify_located_claim
+
+    _, result, _ = run()
+    _, _, body, _, approval = real_inputs()
+    provenance = result.rows[0].candidates[1].provenance
+    assert verify_located_claim(body, provenance, approval=approval)
+    with pytest.raises(ValueError):  # identity/correction evidence keeps the strict parse
+        verify_located_claim(body, provenance)
+
+
+def test_fragment_boundary_allows_a_sentence_period_but_not_a_joined_number() -> None:
+    from cu_rates.adapters.static_html import fragment_is_located
+
+    assert fragment_is_located("accurate as of November 18, 2026.", "November 18, 2026")
+    assert fragment_is_located("Rate 4.1% today.", "4.1%")
+    assert not fragment_is_located("Rate 4.1%.5", "4.1%")
+    assert not fragment_is_located("Rate 14.1%", "4.1%")
+    assert not fragment_is_located("5.1.5%", "1.5%")
+    assert not fragment_is_located("11%", "1%") and not fragment_is_located("1.5%", "1")
+
+
+def test_browse_only_capture_reaches_the_gate_as_browse_only_never_ranked(tmp_path: Path) -> None:
+    from cu_rates.contracts.publication import ReasonCode
+
+    database = tmp_path / "worker.sqlite"
+    upgrade_database(database)
+    store = ArtifactStore(tmp_path / "private")
+    engine = open_operational_database(database)
+    with engine.begin() as conn:
+        source, profile = prepare(conn, store, REAL, family="home_equity_loan")
+        body = (FIXTURES / "real.html").read_bytes()
+        for when, run_id, tail in (
+            (NOW - timedelta(hours=4), "first", b"\n"),
+            (NOW, "second", b""),
+        ):
+            artifact = store.put(
+                body + tail,
+                source_url=source.url,
+                media_type="text/html",
+                fetched_at=when,
+                http_status=200,
+                fetch_run_id=run_id,
+            )
+            captured = extract_stored_capture(conn, store, source, fetch_run(profile, artifact))
+            assert captured.confidence == "medium", captured.diagnostics
+            assert len(captured.offers) == 2
+        view = load_publication_context(conn, "real.ten", NOW, store=store)
+        decision = evaluate_publication(view.offer, view.context)
+        assert ReasonCode.SCENARIO_UNSTATED in decision.reasons, decision
+        assert decision.placement.value == "browse_only", decision
+    engine.dispose()

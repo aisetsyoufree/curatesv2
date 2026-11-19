@@ -1,0 +1,163 @@
+{
+  "source_id": "real.rates",
+  "source_url": "https://real.example/rates",
+  "institution_charter": 8000401,
+  "layout_sha256": "ed2533a9dd569209b87c9565ef4e1c23abe8eee1345c228e7f21954530756d90",
+  "sections": [
+    "loan-rates",
+    "rates-heading",
+    "rates-note"
+  ],
+  "rows": [
+    {
+      "offer_id": "real.ten",
+      "product_id": "real.equity",
+      "comparison_target": "fixed_home_equity_10y",
+      "browse_only": true,
+      "fields": [
+        {
+          "path": "product_family",
+          "selector": "#loan-rates tbody tr:nth-child(1) > td:nth-child(1)",
+          "label": {
+            "selector": "#loan-rates caption",
+            "text": "Rates by product"
+          },
+          "excerpt": null,
+          "context_text": null,
+          "group_header": true
+        },
+        {
+          "path": "details.lien_position",
+          "selector": "#loan-rates tbody tr:nth-child(2) > td:nth-child(1)",
+          "label": {
+            "selector": "#loan-rates caption",
+            "text": "Rates by product"
+          },
+          "excerpt": null,
+          "context_text": null,
+          "group_header": true
+        },
+        {
+          "path": "details.term_months",
+          "selector": "#loan-rates tbody tr:nth-child(3) > td:nth-child(1)",
+          "label": {
+            "selector": "#loan-rates thead th:nth-child(1)",
+            "text": "Term"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "note_rate",
+          "selector": "#loan-rates tbody tr:nth-child(3) > td:nth-child(2)",
+          "label": {
+            "selector": "#loan-rates thead th:nth-child(2)",
+            "text": "Rate"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "apr",
+          "selector": "#loan-rates tbody tr:nth-child(3) > td:nth-child(3)",
+          "label": {
+            "selector": "#loan-rates thead th:nth-child(3)",
+            "text": "APR"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "effective_at",
+          "selector": "#rates-note",
+          "label": {
+            "selector": "#rates-heading",
+            "text": "Current rates"
+          },
+          "excerpt": null,
+          "context_text": null,
+          "date": {
+            "template": "Rates and APR accurate as of {value}.",
+            "format": "Month D, YYYY",
+            "timezone": "America/New_York"
+          }
+        }
+      ]
+    },
+    {
+      "offer_id": "real.fifteen",
+      "product_id": "real.equity",
+      "comparison_target": "fixed_home_equity_10y",
+      "browse_only": true,
+      "fields": [
+        {
+          "path": "product_family",
+          "selector": "#loan-rates tbody tr:nth-child(1) > td:nth-child(1)",
+          "label": {
+            "selector": "#loan-rates caption",
+            "text": "Rates by product"
+          },
+          "excerpt": null,
+          "context_text": null,
+          "group_header": true
+        },
+        {
+          "path": "details.lien_position",
+          "selector": "#loan-rates tbody tr:nth-child(2) > td:nth-child(1)",
+          "label": {
+            "selector": "#loan-rates caption",
+            "text": "Rates by product"
+          },
+          "excerpt": null,
+          "context_text": null,
+          "group_header": true
+        },
+        {
+          "path": "details.term_months",
+          "selector": "#loan-rates tbody tr:nth-child(4) > td:nth-child(1)",
+          "label": {
+            "selector": "#loan-rates thead th:nth-child(1)",
+            "text": "Term"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "note_rate",
+          "selector": "#loan-rates tbody tr:nth-child(4) > td:nth-child(2)",
+          "label": {
+            "selector": "#loan-rates thead th:nth-child(2)",
+            "text": "Rate"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "apr",
+          "selector": "#loan-rates tbody tr:nth-child(4) > td:nth-child(3)",
+          "label": {
+            "selector": "#loan-rates thead th:nth-child(3)",
+            "text": "APR"
+          },
+          "excerpt": null,
+          "context_text": null
+        },
+        {
+          "path": "effective_at",
+          "selector": "#rates-note",
+          "label": {
+            "selector": "#rates-heading",
+            "text": "Current rates"
+          },
+          "excerpt": null,
+          "context_text": null,
+          "date": {
+            "template": "Rates and APR accurate as of {value}.",
+            "format": "Month D, YYYY",
+            "timezone": "America/New_York"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -20,13 +20,14 @@ from cu_rates.adapters.static_html import (
     SourceConfiguration,
     configuration_parser,
     extract,
+    offer_context,
 )
 from cu_rates.contracts.enums import OfferStatus
 from cu_rates.contracts.evidence import ParserVersion, RawArtifact
 from cu_rates.contracts.offers import NormalizedOffer
 from cu_rates.contracts.sources import ExtractedCandidate, RateSource, SourceApproval
-from cu_rates.normalize import OfferContext, normalize_offer
-from cu_rates.pipeline.extract import SLICE_PARSER
+from cu_rates.normalize import normalize_offer
+from cu_rates.pipeline.extract import SLICE_PARSER, layout_sha256
 
 CONFIGURATIONS = Path(__file__).with_name("configurations")
 
@@ -86,20 +87,24 @@ def load_configuration(source: RateSource) -> SourceConfiguration:
     return config
 
 
+def body_layout_sha256(
+    source: RateSource,
+    approval: SourceApproval | None,
+    body: bytes,
+    *,
+    allow_fixture: bool = False,
+) -> str:
+    """The structural pin of stored bytes as the approved adapter reads them."""
+    adapter = approved_adapter(source, approval, allow_fixture=allow_fixture)
+    if adapter.fixture:
+        return layout_sha256(body)
+    return load_configuration(source).layout_of(body)
+
+
 def normalize_row(
     row: RowExtraction, config: SourceConfiguration, artifact: RawArtifact
 ) -> NormalizedOffer:
-    result = normalize_offer(
-        row.candidates,
-        OfferContext(
-            offer_id=row.row.offer_id,
-            institution_charter=config.institution_charter,
-            product_id=row.row.product_id,
-            source_id=config.source_id,
-            observed_at=artifact.fetched_at,
-            comparison_target=row.row.comparison_target,
-        ),
-    )
+    result = normalize_offer(row.candidates, offer_context(config, row.row, artifact.fetched_at))
     if result.offer is None:
         raise ValueError(f"normalization yielded {result.no_offer_reason}")
     offer = with_statements(result.offer, result.scenario_checks, artifact.fetched_at)

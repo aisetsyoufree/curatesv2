@@ -2,7 +2,10 @@
 
 import re
 from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from typing import Literal
+from zoneinfo import ZoneInfo
 
 from pydantic import TypeAdapter
 
@@ -47,6 +50,87 @@ _TERM = re.compile(
     r"([0-9]{1,3}|[a-z]+(?:-[a-z]+)?)[ -](years?|months?)"
     r"(?: fixed term)?(?: \(([0-9]{1,3}) months?\))?\.?"
 )
+
+
+_MONTHS_EN = (
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+)
+DateFormat = Literal["Month D, YYYY", "YYYY-MM-DD", "M/D/YYYY"]
+_DAY = r"(?:[1-9]|[12][0-9]|3[01])"
+_DATE_PATTERNS: dict[str, tuple[str, tuple[str, str, str]]] = {
+    "Month D, YYYY": (rf"({'|'.join(_MONTHS_EN)}) ({_DAY}), (20[0-9]{{2}})", ("m", "d", "y")),
+    "YYYY-MM-DD": (r"(20[0-9]{2})-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])", ("y", "m", "d")),
+    "M/D/YYYY": (rf"(1[0-2]|[1-9])/({_DAY})/(20[0-9]{{2}})", ("m", "d", "y")),
+}
+
+
+def date_pattern(fmt: str) -> str:
+    """One strict, unanchored pattern (a single capture group wraps the whole date)."""
+    return f"({_DATE_PATTERNS[fmt][0]})"
+
+
+def _day(text: str, fmt: str) -> date:
+    pattern, order = _DATE_PATTERNS[fmt]
+    match = re.fullmatch(pattern, text)
+    if match is None:
+        raise ValueError(f"date does not match the configured format {fmt}")
+    parts = dict(zip(order, match.groups(), strict=True))
+    month = _MONTHS_EN.index(parts["m"]) + 1 if fmt == "Month D, YYYY" else int(parts["m"])
+    return date(int(parts["y"]), month, int(parts["d"]))  # impossible dates raise, never clamp
+
+
+def prose_date(text: str, fmt: str, timezone: str) -> datetime:
+    """A calendar date exactly as written, as the start of that day in the configured zone.
+
+    The source gives no clock time, so none is invented: the earliest instant of the
+    stated day is the conservative reading and can never lie in the future of a capture
+    taken that day. Impossible dates (February 30) are errors, not corrections.
+    """
+    day = _day(text, fmt)
+    return datetime(day.year, day.month, day.day, tzinfo=ZoneInfo(timezone)).astimezone(UTC)
+
+
+@dataclass(frozen=True)
+class ProseDate:
+    """A claim that states only a calendar day, as evidence for an effective instant.
+
+    It equals an instant that begins that day in some real-world UTC offset (-12h..+14h).
+    The zone is reviewed adapter configuration the validator does not see, so it can only
+    refuse a claim whose day cannot be the one that was normalized.
+    """
+
+    day: date
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, ProseDate):
+            return self.day == other.day
+        if isinstance(other, datetime) and other.utcoffset() is not None:
+            start = datetime(self.day.year, self.day.month, self.day.day, tzinfo=UTC)
+            return start - timedelta(hours=14) <= other <= start + timedelta(hours=12)
+        return False
+
+    def __hash__(self) -> int:
+        return hash(self.day)
+
+
+def prose_day(text: str) -> ProseDate | None:
+    for fmt in _DATE_PATTERNS:
+        try:
+            return ProseDate(_day(text, fmt))
+        except ValueError:
+            continue
+    return None
 
 
 def percent(text: str) -> Decimal:
