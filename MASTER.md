@@ -162,12 +162,15 @@ labeled and never power statewide summary claims.
 12. **Independent expiry:** the web layer enforces `valid_until` even if workers fail.
 13. **Emergency withdrawal:** an independent denylist can suppress a source, offer,
     product, institution, or snapshot with actor, time, and reason.
-14. **Constrained auto-publication:** previously reviewed offers may republish only
-    when source and parser remain approved, structure is unchanged, conditions and
-    evidence are complete, validations pass, point structure and product identity are
-    unchanged, and note-rate/APR movements are no more than 50 basis points. All first
-    publications, new products, structural changes, OCR values, larger movements, or
-    changed points require review.
+14. **Constrained auto-publication (D-20/D-21):** first observations and later rate
+    changes of any size may publish automatically when the deterministic gate passes:
+    source and parser are approved, the product definition is approved (D-22), conditions
+    and evidence are complete, two separate captures of each new value corroborate at
+    least 3 hours apart, and validations pass. Later observations preserve structure,
+    point structure, and product identity. Structural changes, OCR values, changed points,
+    and unexplained/unpairable rate-path changes still require review; movement magnitude
+    alone does not. Corrections, source abandonment, withdrawals, and the denylist still
+    apply.
 15. **Polite collection:** honor robots decisions, identify the project, rate-limit,
     cache, and never bypass authentication, CAPTCHAs, or bot protection.
 16. **Source abandonment review:** an effective date older than 90 days plus no value

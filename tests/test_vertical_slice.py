@@ -545,7 +545,7 @@ def test_changed_rate_goes_through_gate_against_actual_historical_baseline(tmp_p
     )
     decision = evaluate_publication(view.offer, view.context)
     assert decision.outcome is PublicationOutcome.QUARANTINE
-    assert R.RATE_MOVEMENT_EXCEEDS_LIMIT in decision.reasons
+    assert R.RATE_MOVEMENT_EXCEEDS_LIMIT not in decision.reasons
     assert R.INSUFFICIENT_EVIDENCE_PATHS in decision.reasons
     with open_operational_database(run.database).begin() as conn:
         assert (
@@ -560,6 +560,73 @@ def test_changed_rate_goes_through_gate_against_actual_historical_baseline(tmp_p
             is None
         )
         assert len(conn.execute(select(slice_snapshot_baselines)).all()) == 2
+
+
+def test_successive_large_rate_changes_publish_from_two_new_captures(tmp_path: Path) -> None:
+    """Stored evidence, real validators, and an automatic prior all obey D-20(3)."""
+    run = reviewed_fixture(tmp_path)
+    original = run.offers[_THIRTY]
+    initial = _view(run)
+    template = initial.context.fetch_runs[0]
+    assert initial.context.prior is not None
+    previous_id = initial.context.prior.published.snapshot_id
+    engine = open_operational_database(run.database)
+    for step, (note, apr) in enumerate((("7.000", "7.066"), ("13.000", "13.066"))):
+        body = _dated_body().replace(b"6.375%", f"{note}%".encode())
+        body = body.replace(b"6.441%", f"{apr}%".encode())
+        for capture in range(2):
+            moment = original.observed_at + timedelta(hours=1 + step * 4 + capture * 3)
+            artifact = run.store.put(
+                body + b"\n" * capture,
+                source_url=initial.context.source.url,
+                media_type="text/html; charset=utf-8",
+                fetched_at=moment,
+                http_status=200,
+                fetch_run_id=f"movement-{step}-{capture}",
+            )
+            fetch = template.model_copy(
+                update={
+                    "run_id": artifact.fetch_run_id,
+                    "artifact_ids": (artifact.artifact_id,),
+                    "started_at": moment - timedelta(seconds=1),
+                    "finished_at": moment,
+                }
+            )
+            now = moment + timedelta(seconds=1)
+            with engine.begin() as conn:
+                record_fixture_capture(conn, _DATED, run.store, fetch, artifact)
+                view = load_publication_context(
+                    conn, original.offer_id, now, store=run.store, allow_fixture=True
+                )
+                assert view.context.prior is not None
+                assert view.context.prior.published.snapshot_id == previous_id
+                if step == 1:
+                    assert view.context.prior.review is None
+                decision = evaluate_publication(view.offer, view.context)
+                snapshot = publish(
+                    conn,
+                    original.offer_id,
+                    store=run.store,
+                    evaluated_at=now,
+                    snapshot_id=f"movement-{step}-{capture}",
+                    allow_fixture=True,
+                )
+                if capture == 0:
+                    # Captures of the preceding value cannot corroborate the new value.
+                    assert decision.outcome is PublicationOutcome.QUARANTINE
+                    assert R.INSUFFICIENT_EVIDENCE_PATHS in decision.reasons
+                    assert snapshot is None
+                else:
+                    assert decision.outcome is PublicationOutcome.AUTO_PUBLISH
+                    assert decision.ranking_eligible
+                    assert decision.reasons == ()
+                    assert snapshot is not None
+                    assert snapshot.supersedes == previous_id
+                    assert snapshot.review_ids == ()
+                    assert view.offer.note_rate is not None
+                    assert view.offer.note_rate.value == Decimal(note)
+                    previous_id = snapshot.snapshot_id
+    engine.dispose()
 
 
 def test_unchanged_200_and_repeated_validations_choose_the_latest_once(tmp_path: Path) -> None:

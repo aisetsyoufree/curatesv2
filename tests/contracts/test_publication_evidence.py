@@ -5,6 +5,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from cu_rates.contracts import (
     ArmTerms,
@@ -31,6 +32,8 @@ from cu_rates.contracts import (
 )
 
 from .factories import (
+    ARTIFACT_ID,
+    ARTIFACT_ID_2,
     EVALUATED_AT,
     IMAGE_ARTIFACT_ID,
     T0,
@@ -38,11 +41,14 @@ from .factories import (
     condition,
     context,
     equity_offer,
+    evidence_paths_for,
+    fetch_run,
     grid_tier,
     heloc_details,
     heloc_offer,
     margin,
     matches_all,
+    prior,
     product,
     product_review,
     provenance,
@@ -52,6 +58,7 @@ from .factories import (
     raw_artifact,
     relationship,
     review,
+    validation,
     withdrawal,
 )
 
@@ -68,7 +75,7 @@ def decide(
     return evaluate_publication(offer, context(base or offer, subject=offer, **ctx))
 
 
-# --- per-path rate movement gates ---------------------------------------------------------
+# --- corroborated rate movement has no magnitude limit (D-20) -----------------------------
 
 
 def _heloc(**overrides: Any) -> NormalizedOffer:
@@ -76,51 +83,54 @@ def _heloc(**overrides: Any) -> NormalizedOffer:
 
 
 @pytest.mark.parametrize(
-    ("changed", "limit_hit"),
+    ("changed", "structural"),
     [
         (_heloc(margin=margin("1.000")), False),  # +50bp margin and post-intro: allowed
-        (_heloc(margin=margin("1.001")), True),
-        (_heloc(margin=margin("-0.100")), True),  # Prime minus 0.10: -60bp
-        (_heloc(index_rate=rate("8.001")), True),
+        (_heloc(margin=margin("1.001")), False),
+        (_heloc(margin=margin("-0.100")), False),  # Prime minus 0.10: -60bp
+        (_heloc(index_rate=rate("8.001")), False),
         (_heloc(floor=rate("4.500")), False),  # floor not binding: post-intro unmoved, +50bp
-        (_heloc(floor=rate("9.000")), True),
-        (_heloc(ceiling=rate("18")), None),  # added path -> structural, no pairing
+        (_heloc(floor=rate("9.000")), False),  # +500bp is allowed with corroboration
+        (_heloc(ceiling=rate("18")), True),  # added path -> structural, no pairing
     ],
 )
-def test_heloc_value_moves_anywhere_are_bounded(
-    changed: NormalizedOffer, limit_hit: bool | None
+def test_heloc_value_moves_anywhere_publish_but_structure_still_requires_review(
+    changed: NormalizedOffer, structural: bool
 ) -> None:
     decision = decide(changed, heloc_offer(), product=HELOC_PRODUCT)
-    if limit_hit is None:
+    assert R.RATE_MOVEMENT_EXCEEDS_LIMIT not in decision.reasons
+    if structural:
         assert R.STRUCTURAL_CHANGE in decision.reasons
         assert decision.outcome is PublicationOutcome.REQUIRES_REVIEW
         return
-    assert (R.RATE_MOVEMENT_EXCEEDS_LIMIT in decision.reasons) is limit_hit
-    expected = PublicationOutcome.REQUIRES_REVIEW if limit_hit else PublicationOutcome.AUTO_PUBLISH
-    assert decision.outcome is expected
+    assert decision.outcome is PublicationOutcome.AUTO_PUBLISH
 
 
-def test_heloc_intro_rate_jump_requires_review() -> None:
+def test_heloc_intro_rate_jump_publishes() -> None:
     def with_intro(value: str) -> NormalizedOffer:
         return _heloc(intro=IntroRate(rate=rate(value), duration_months=6))
 
     ok = decide(with_intro("3.500"), with_intro("3.000"), product=HELOC_PRODUCT)
     assert ok.outcome is PublicationOutcome.AUTO_PUBLISH
     jump = decide(with_intro("4.000"), with_intro("3.000"), product=HELOC_PRODUCT)
-    assert R.RATE_MOVEMENT_EXCEEDS_LIMIT in jump.reasons
+    assert jump.outcome is PublicationOutcome.AUTO_PUBLISH
+    assert R.RATE_MOVEMENT_EXCEEDS_LIMIT not in jump.reasons
 
 
-def test_tier_rate_jump_requires_review_even_when_headline_is_unchanged() -> None:
+def test_tier_rate_jump_preserves_headline_mismatch_placement() -> None:
     def tiered(value: str) -> NormalizedOffer:
         return purchase_offer(tiers=(grid_tier("t", (TierDimension.LTV, 0, 80), rate_value=value),))
 
     # The tier disagrees with the headline (a TIER_RATE_MISMATCH) but the movement is the point.
     decision = decide(tiered("6.700"), tiered("6.125"))
-    assert R.RATE_MOVEMENT_EXCEEDS_LIMIT in decision.reasons
+    assert decision.outcome is PublicationOutcome.AUTO_PUBLISH
+    assert decision.placement is Placement.BROWSE_ONLY
+    assert R.TIER_RATE_MISMATCH in decision.reasons
+    assert R.RATE_MOVEMENT_EXCEEDS_LIMIT not in decision.reasons
     assert decide(tiered("6.125"), tiered("6.125")).outcome is PublicationOutcome.AUTO_PUBLISH
 
 
-def test_arm_margin_jump_requires_review() -> None:
+def test_arm_margin_jump_preserves_missing_scenario_quarantine() -> None:
     def arm_offer(value: str) -> NormalizedOffer:
         arm = ArmTerms(
             initial_period_months=84,
@@ -139,7 +149,9 @@ def test_arm_margin_jump_requires_review() -> None:
         PublicationOutcome.QUARANTINE  # No evidence-backed scenario for this ARM.
     )
     jump = decide(arm_offer("3.500"), arm_offer("2.750"))
-    assert R.RATE_MOVEMENT_EXCEEDS_LIMIT in jump.reasons
+    assert jump.outcome is PublicationOutcome.QUARANTINE
+    assert R.EVIDENCE_PATH_SCENARIO_MISMATCH in jump.reasons
+    assert R.RATE_MOVEMENT_EXCEEDS_LIMIT not in jump.reasons
 
 
 def test_added_or_removed_rate_path_requires_review() -> None:
@@ -165,6 +177,106 @@ def test_unpairable_value_change_requires_review() -> None:
     decision = evaluate_publication(moved, context(moved, prior=lossy_prior))
     assert R.RATE_MOVEMENT_UNBOUNDED in decision.reasons
     assert decision.outcome is PublicationOutcome.REQUIRES_REVIEW
+    assert not decision.publishable_now
+
+
+@pytest.mark.parametrize("missing_path", ["note_rate", "apr", "points"])
+def test_large_movement_needs_two_captures_of_each_new_value(missing_path: str) -> None:
+    baseline = purchase_offer()
+    moved = purchase_offer(note_rate=rate("12.125"), apr=rate("12.250"))
+    paths = tuple(
+        path
+        for path in evidence_paths_for(moved)
+        if not (path.path == missing_path and path.capture_id == "fetch-002")
+    )
+    decision = decide(moved, baseline, evidence_paths=paths)
+    assert decision.outcome is PublicationOutcome.QUARANTINE
+    assert R.INSUFFICIENT_EVIDENCE_PATHS in decision.reasons
+    assert not decision.publishable_now
+
+
+@pytest.mark.parametrize("path", ["note_rate", "apr"])
+def test_old_value_does_not_corroborate_a_large_new_value(path: str) -> None:
+    baseline = purchase_offer()
+    moved = purchase_offer(note_rate=rate("12.125"), apr=rate("12.250"))
+    old = next(
+        p for p in evidence_paths_for(baseline) if p.path == path and p.capture_id == "fetch-002"
+    )
+    paths = tuple(
+        old if p.path == path and p.capture_id == "fetch-002" else p
+        for p in evidence_paths_for(moved)
+    )
+    decision = decide(moved, baseline, evidence_paths=paths)
+    assert decision.outcome is PublicationOutcome.QUARANTINE
+    assert R.EVIDENCE_PATH_VALUE_MISMATCH in decision.reasons
+    assert not decision.publishable_now
+
+
+@pytest.mark.parametrize("spacing", [timedelta(hours=3), timedelta(hours=3, seconds=-1)])
+def test_large_movement_keeps_three_hour_capture_boundary(spacing: timedelta) -> None:
+    moved = purchase_offer(note_rate=rate("12.125"), apr=rate("12.250"))
+    seen = T0 - spacing
+    second = raw_artifact(artifact_id=ARTIFACT_ID_2, fetch_run_id="fetch-002", fetched_at=seen)
+    paths = tuple(
+        p.model_copy(update={"observed_at": seen}) if p.capture_id == "fetch-002" else p
+        for p in evidence_paths_for(moved)
+    )
+    ctx = context(
+        purchase_offer(),
+        subject=moved,
+        evidence_paths=paths,
+        known_artifacts=(raw_artifact(), second),
+        fetch_runs=(
+            fetch_run(ARTIFACT_ID),
+            fetch_run(
+                ARTIFACT_ID_2,
+                run_id="fetch-002",
+                started_at=seen - timedelta(seconds=1),
+                finished_at=seen,
+            ),
+        ),
+    )
+    decision = evaluate_publication(moved, ctx)
+    if spacing == timedelta(hours=3):
+        assert decision.outcome is PublicationOutcome.AUTO_PUBLISH
+        assert decision.reasons == ()
+    else:
+        assert decision.outcome is PublicationOutcome.QUARANTINE
+        assert R.DUPLICATE_EVIDENCE_CAPTURE in decision.reasons
+        assert not decision.publishable_now
+
+
+def test_failed_range_validation_still_quarantines_a_corroborated_large_movement() -> None:
+    moved = purchase_offer(note_rate=rate("12.125"), apr=rate("12.250"))
+    decision = decide(
+        moved,
+        purchase_offer(),
+        validations=(validation("rule.rate-range", moved, passed=False),),
+    )
+    assert decision.outcome is PublicationOutcome.QUARANTINE
+    assert R.VALIDATION_FAILED in decision.reasons
+    assert not decision.publishable_now
+
+
+@pytest.mark.parametrize("value", ["-0.00001", "100.00001", "NaN", "Infinity"])
+def test_rate_range_remains_enforced_before_publication(value: str) -> None:
+    with pytest.raises(ValidationError):
+        purchase_offer(note_rate=rate(value))
+
+
+def test_large_movement_does_not_bypass_withdrawn_automatic_prior() -> None:
+    moved = purchase_offer(note_rate=rate("12.125"), apr=rate("12.250"))
+    baseline = prior(purchase_offer(), reviewed=False)
+    decision = decide(
+        moved,
+        purchase_offer(),
+        prior=baseline,
+        withdrawals=(withdrawal(WithdrawalScope.SNAPSHOT, baseline.published.snapshot_id),),
+    )
+    assert decision.outcome is PublicationOutcome.SUPPRESS
+    assert R.DENYLISTED in decision.reasons
+    assert R.PRIOR_NOT_REVIEWED in decision.reasons
+    assert not decision.publishable_now
 
 
 # --- validity window ----------------------------------------------------------------------

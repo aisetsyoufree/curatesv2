@@ -2,8 +2,8 @@
 
 ``evaluate_publication`` is a pure function of the offer and an explicit context
 (including the evaluation time). It fails closed: anything unproven suppresses,
-quarantines, or routes to review; only a fully proven, previously reviewed, unchanged-
-structure offer receives ``AUTO_PUBLISH``. Review and withdrawal inputs are auditable
+quarantines, or routes to review; only a fully proven offer with no outstanding review
+reason receives ``AUTO_PUBLISH``. Review and withdrawal inputs are auditable
 records (``ReviewDecision``, ``WithdrawalEntry``), not booleans. No model output has
 authority here.
 """
@@ -104,7 +104,6 @@ from cu_rates.contracts.sources import (
     profile_sha256,
 )
 
-MAX_AUTO_MOVEMENT_BP = Decimal(50)
 DEGRADE_AFTER = timedelta(hours=72)
 WITHDRAW_AFTER = timedelta(hours=96)
 ABANDONED_EFFECTIVE_AGE = timedelta(days=90)
@@ -194,6 +193,7 @@ class ReasonCode(StrEnum):
     REOBSERVATION_CLAIM_CHANGED = "reobservation_claim_changed"
     CORRECTION_PENDING = "correction_pending"
     POINTS_CHANGED = "points_changed"
+    # Frozen legacy code: retained for stored decisions, never emitted by this gate (D-20).
     RATE_MOVEMENT_EXCEEDS_LIMIT = "rate_movement_exceeds_limit"
     RATE_MOVEMENT_UNBOUNDED = "rate_movement_unbounded"
     EFFECTIVE_DATE_MISSING = "effective_date_missing"
@@ -292,7 +292,6 @@ REVIEW_REASONS = frozenset(
         R.REOBSERVATION_CLAIM_CHANGED,
         R.CORRECTION_PENDING,
         R.POINTS_CHANGED,
-        R.RATE_MOVEMENT_EXCEEDS_LIMIT,
         R.RATE_MOVEMENT_UNBOUNDED,
         R.EFFECTIVE_DATE_MISSING,
         R.OCR_VALUE,
@@ -1397,8 +1396,9 @@ def _change_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[Reas
         reasons.add(R.STRUCTURAL_CHANGE)
     if proof.points_changed:
         reasons.add(R.POINTS_CHANGED)
-    if proof.max_abs_delta_bp > MAX_AUTO_MOVEMENT_BP:
-        reasons.add(R.RATE_MOVEMENT_EXCEEDS_LIMIT)
+    # D-20(3): a fully explained rate change has no magnitude-based review threshold.
+    # Every NEW value still needs two corroborating captures and passing validations.
+    # Missing/unexplained rate paths remain reviewable: that is uncertainty, not size.
     if proof.unbounded:
         reasons.add(R.RATE_MOVEMENT_UNBOUNDED)
     if _proven_refresh(offer, ctx) and not _claims_extend(offer, prior, ctx):

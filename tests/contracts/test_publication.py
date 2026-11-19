@@ -138,7 +138,10 @@ def test_every_reason_code_has_a_category() -> None:
         | DETAIL_ONLY_REASONS
         | BROWSE_ONLY_REASONS
     )
-    assert set(ReasonCode) - categorized == {R.STALE_DEGRADED}
+    assert set(ReasonCode) - categorized == {
+        R.STALE_DEGRADED,
+        R.RATE_MOVEMENT_EXCEEDS_LIMIT,  # frozen legacy code, no longer emitted (D-20)
+    }
     assert not SUPPRESS_REASONS & QUARANTINE_REASONS
     assert not (SUPPRESS_REASONS | QUARANTINE_REASONS) & (REVIEW_REASONS | BROWSE_ONLY_REASONS)
 
@@ -505,18 +508,18 @@ UNSAFE_CASES: list[tuple[str, dict[str, Any], dict[str, Any], ReasonCode, Public
         PublicationOutcome.REQUIRES_REVIEW,
     ),
     (
-        "note-rate-jump",
+        "note-rate-above-apr",
         {"note_rate": rate("6.63001")},
         {},
-        R.RATE_MOVEMENT_EXCEEDS_LIMIT,
-        # The jump also puts APR under the note rate, which the gate recomputes.
+        R.VALIDATION_FAILED,
+        # Movement size is allowed, but APR under the note rate is still quarantined.
         PublicationOutcome.QUARANTINE,
     ),
     (
-        "apr-drop",
+        "apr-below-note-rate",
         {"apr": rate("5.700")},
         {},
-        R.RATE_MOVEMENT_EXCEEDS_LIMIT,
+        R.VALIDATION_FAILED,
         PublicationOutcome.QUARANTINE,
     ),
 ]
@@ -586,7 +589,7 @@ def test_unsafe_cases_cover_every_blocking_reason() -> None:
     }  # covered by dedicated tests below and in test_publication_gate.py
 
 
-# --- review-trigger boundaries -------------------------------------------------------------
+# --- rate magnitude is not a review trigger (D-20); all other guards remain ------------------
 
 
 def _moved(note: str, apr: str = "6.250") -> NormalizedOffer:
@@ -594,26 +597,41 @@ def _moved(note: str, apr: str = "6.250") -> NormalizedOffer:
 
 
 @pytest.mark.parametrize(
-    ("note", "apr", "flagged"),
+    ("note", "apr"),
     [
-        ("6.625", "6.250", False),  # exactly +50 bp is allowed
-        ("6.62501", "6.250", True),
-        ("5.625", "6.250", False),  # exactly -50 bp
-        ("5.62499", "6.250", True),
-        ("6.125", "6.750", False),
-        ("6.125", "6.75001", True),
-        ("6.125", "5.700", True),
+        ("6.62499", "6.750"),  # just below, at, and above the former +50 bp limit
+        ("6.625", "6.750"),
+        ("6.62501", "6.750"),
+        ("5.62501", "6.250"),  # same boundaries for a downward note-rate move
+        ("5.625", "6.250"),
+        ("5.62499", "6.250"),
+        ("6.125", "6.74999"),  # APR-only moves around the former limit
+        ("6.125", "6.750"),
+        ("6.125", "6.75001"),
+        ("12.125", "12.250"),  # +600 bp, both headline rates
+        ("0.125", "0.250"),  # -600 bp
+        ("6.125", "15.250"),  # large APR-only move
     ],
 )
-def test_fifty_basis_point_boundary(note: str, apr: str, flagged: bool) -> None:
-    decision = decide(_moved(note, apr), prior=prior_of(purchase_offer()))
-    assert (R.RATE_MOVEMENT_EXCEEDS_LIMIT in decision.reasons) is flagged
-    if D(apr) < D(note):
-        assert decision.outcome is PublicationOutcome.QUARANTINE
-        assert R.VALIDATION_FAILED in decision.reasons
-        return
-    expected = PublicationOutcome.REQUIRES_REVIEW if flagged else PublicationOutcome.AUTO_PUBLISH
-    assert decision.outcome is expected
+@pytest.mark.parametrize("reviewed_prior", [True, False], ids=["human-prior", "automatic-prior"])
+def test_corroborated_rate_changes_publish_regardless_of_size(
+    note: str, apr: str, reviewed_prior: bool
+) -> None:
+    decision = decide(_moved(note, apr), prior=prior_of(purchase_offer(), reviewed=reviewed_prior))
+    assert decision.outcome is PublicationOutcome.AUTO_PUBLISH
+    assert decision.placement is Placement.RANKED
+    assert decision.ranking_eligible
+    assert decision.reasons == ()
+
+
+@pytest.mark.parametrize(("note", "apr"), [("12.125", "12.12499"), ("0.125", "0.12499")])
+def test_large_rate_changes_still_quarantine_apr_below_note(note: str, apr: str) -> None:
+    # The fixture supplies recorded passes; the gate must recompute this relation anyway.
+    decision = decide(_moved(note, apr), prior=prior_of(purchase_offer(), reviewed=False))
+    assert decision.outcome is PublicationOutcome.QUARANTINE
+    assert R.VALIDATION_FAILED in decision.reasons
+    assert R.RATE_MOVEMENT_EXCEEDS_LIMIT not in decision.reasons
+    assert not decision.publishable_now
 
 
 def test_small_rate_move_with_unchanged_structure_still_auto_publishes() -> None:

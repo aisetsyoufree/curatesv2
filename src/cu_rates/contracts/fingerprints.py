@@ -223,8 +223,9 @@ class RateChangeProof(ContractModel):
 
     ``deltas`` cover every path present on both sides. ``unbounded`` is set when the
     value fingerprint moved (or the path sets differ without a structural change) yet no
-    paired path or points change accounts for it: the movement cannot be bounded, so it
-    must not be trusted as small.
+    paired path or points change accounts for it: the movement cannot be fully explained.
+    This is missing comparison detail, not a magnitude limit; D-20 allows rate changes
+    of any size when the publication gate's other controls pass.
     """
 
     change: ChangeKind
