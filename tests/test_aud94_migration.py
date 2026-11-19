@@ -131,3 +131,30 @@ def test_t014_downgrade_refuses_while_trusted_history_exists(tmp_path: Path, tab
     with pytest.raises(RuntimeError, match="refusing downgrade of t014"):
         downgrade_database(path, "t020_roster_import")
     assert current_revision(path) == "t014_trusted_records"
+
+
+@pytest.mark.parametrize(
+    "table",
+    ("roster_imports", "roster_import_entries"),
+)
+def test_t020_downgrade_refuses_while_roster_history_exists(tmp_path: Path, table: str) -> None:
+    path = tmp_path / "history.sqlite"
+    upgrade_database(path, "t020_roster_import")
+    with closing(sqlite3.connect(path)) as raw:
+        _insert_dummy_row(raw, table)
+    with pytest.raises(
+        RuntimeError,
+        match="refusing downgrade of t020_roster_import while roster import history exists",
+    ):
+        downgrade_database(path, "t012_initial")
+    assert current_revision(path) == "t020_roster_import"
+    with closing(sqlite3.connect(path)) as raw:
+        assert raw.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 1
+
+
+def test_t020_downgrade_succeeds_when_empty(tmp_path: Path) -> None:
+    path = tmp_path / "empty.sqlite"
+    upgrade_database(path, "t020_roster_import")
+    assert current_revision(path) == "t020_roster_import"
+    downgrade_database(path, "t012_initial")
+    assert current_revision(path) == "t012_initial"

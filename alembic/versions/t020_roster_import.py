@@ -111,6 +111,13 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    bind = op.get_bind()
+    for table in ROSTER_TABLES:
+        if int(bind.exec_driver_sql(f"SELECT COUNT(*) FROM {table}").scalar_one()) > 0:
+            raise RuntimeError(
+                "refusing downgrade of t020_roster_import while roster import history exists: "
+                "append-only history must not be dropped"
+            )
     _append_only_triggers(False)
     op.drop_table("roster_import_entries")
     op.drop_table("roster_imports")

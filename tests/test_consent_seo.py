@@ -51,11 +51,11 @@ def _choose(client: FlaskClient, choice: str) -> TestResponse:
 
 
 def _require_node() -> str:
-    # Optional developer runtime, never installed by this suite. In CI, execution
-    # is required; locally, absent Node skips with an informative notice.
+    # Optional developer runtime, never installed by this suite. In CI or when
+    # REQUIRE_NODE=1, execution is required; locally, absent Node skips with an informative notice.
     node = shutil.which("node")
     if node is None:
-        if os.environ.get("CI") == "true":
+        if os.environ.get("REQUIRE_NODE") == "1" or os.environ.get("CI") == "true":
             pytest.fail("Node runtime is required in CI for consent-script execution")
         pytest.skip("optional Node runtime unavailable for inert consent-script execution")
     return node
@@ -210,6 +210,7 @@ def test_missing_node_policy_fails_in_ci_skips_locally(
     expected_exception: type[BaseException],
     match: str,
 ) -> None:
+    monkeypatch.delenv("REQUIRE_NODE", raising=False)
     if ci_value is None:
         monkeypatch.delenv("CI", raising=False)
     else:
@@ -217,6 +218,37 @@ def test_missing_node_policy_fails_in_ci_skips_locally(
     monkeypatch.setattr(shutil, "which", lambda _name: None)
     with pytest.raises(expected_exception, match=match):
         _require_node()
+
+
+@pytest.mark.parametrize(
+    "require_node,expected_exception,match",
+    [
+        ("1", pytest.fail.Exception, "Node runtime is required"),
+        ("0", pytest.skip.Exception, "optional Node runtime unavailable"),
+        (None, pytest.skip.Exception, "optional Node runtime unavailable"),
+    ],
+)
+def test_missing_node_policy_fails_when_require_node_is_set(
+    monkeypatch: pytest.MonkeyPatch,
+    require_node: str | None,
+    expected_exception: type[BaseException],
+    match: str,
+) -> None:
+    monkeypatch.delenv("CI", raising=False)
+    if require_node is None:
+        monkeypatch.delenv("REQUIRE_NODE", raising=False)
+    else:
+        monkeypatch.setenv("REQUIRE_NODE", require_node)
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    try:
+        _require_node()
+    except BaseException as exc:
+        assert isinstance(exc, expected_exception), (
+            f"Expected {expected_exception}, got {type(exc)}"
+        )
+        assert match in str(exc)
+    else:
+        pytest.fail("expected _require_node to raise an outcome exception")
 
 
 def test_choice_cookie_only_after_explicit_post_and_nojs_controls() -> None:

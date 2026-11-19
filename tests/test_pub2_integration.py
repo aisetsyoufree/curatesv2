@@ -206,3 +206,13 @@ def test_unverified_current_capture_cannot_borrow_verified_history(tmp_path: Pat
         )
     assert result.offer.status is OfferStatus.QUARANTINED
     assert not evaluate_publication(result.offer, result.context).publishable_now
+
+
+def test_automatic_publication_records_automatic_publisher(tmp_path: Path) -> None:
+    from cu_rates.pipeline.trusted import AUTOMATIC_PUBLISHER
+
+    run = reviewed_fixture(tmp_path)
+    assert run.refreshed_snapshot is not None
+    assert run.refreshed_snapshot.published_by == AUTOMATIC_PUBLISHER
+    assert run.reviewed_snapshot is not None
+    assert run.reviewed_snapshot.published_by != AUTOMATIC_PUBLISHER
