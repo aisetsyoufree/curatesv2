@@ -23,7 +23,9 @@ NEW_DIMENSIONS = ("property_value", "autopay_discount", "first_lien_balance")
 TABLE = "verified_scenario_statements"
 
 
-_LATER_TABLES = frozenset({"institution_identity_reviews", "institution_identity_evidence"})
+_LATER_TABLES = frozenset(
+    {"institution_identity_reviews", "institution_identity_evidence", "source_review_requests"}
+)
 
 
 def _expected_triggers() -> dict[str, str]:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
 import sys
 from collections.abc import Sequence
@@ -54,22 +55,16 @@ def correction_items(path: Path | None) -> list[Item]:
     for case in IntakeStore(path).list_cases():
         detail = dict(
             case_id=case.case_id,
-            received_at=case.received_at.isoformat(),
             kind=case.kind.value,
-            page=case.affected_url,
-            field=case.affected_field,
-            reason=case.reason,
-            evidence_url=case.evidence_url,
-            triage_due=case.triage_due.isoformat(),
-            commands=f"python -m cu_rates.intake --db {path} "
-            f"show|triage|resolve|withdraw {case.case_id}",
+            field=_correction_field(case.affected_field),
+            commands=f"python -m cu_rates.intake --db {path} show {case.case_id}",
         )
         result.append(
             Item(
                 "correction",
                 case.case_id,
                 case.received_at,
-                f"{case.kind.value}: {case.affected_field}; " + detail["commands"],
+                f"{case.kind.value}: {detail['field']}; " + detail["commands"],
                 digest(detail),
                 detail,
             )
@@ -95,6 +90,16 @@ def age(item: Item, now: datetime) -> str:
 def _line(text: str) -> str:
     # Untrusted source excerpts/labels must not add terminal control sequences or rows.
     return " ".join("".join(c if c.isprintable() else " " for c in text).split())
+
+
+def _correction_field(text: str) -> str:
+    # The full reporter submission belongs in the restricted intake tool. Even
+    # field labels may contain pasted links; redact before truncation.
+    return re.sub(
+        r"(?i)(?:\b[a-z][a-z0-9+.-]*://|//|\bwww\.|\b[\w-]+\.[a-z]{2,}\b)\S*",
+        "[URL omitted]",
+        _line(text),
+    )[:80]
 
 
 _PAGE = """<!doctype html>

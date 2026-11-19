@@ -14,9 +14,10 @@ from typing import Any
 
 from sqlalchemy import Connection, select
 
+from cu_rates.adapters import registry
 from cu_rates.contracts import Provenance, ReviewDecision, ReviewSubject, ReviewVerdict
 from cu_rates.contracts.fingerprints import product_content_sha256
-from cu_rates.contracts.sources import FetchProfile, SourceApproval, profile_sha256
+from cu_rates.contracts.sources import FetchProfile, RateSource, SourceApproval, profile_sha256
 from cu_rates.db import schema as s
 from cu_rates.db.records import (
     _insert_provenance,
@@ -115,6 +116,7 @@ def enqueue_source_review(
         or not any(r["institution_charter"] == charter for r in state["relationships"])
     ):
         raise ValueError("proposal must match the stored source, institution and profile")
+    adapter_identity = _approved_adapter_identity(state, proposal)
     for evidence in proposal.evidence:
         key = _insert_provenance(conn, evidence, charter)
         owner = conn.execute(
@@ -125,7 +127,15 @@ def enqueue_source_review(
     payload = proposal.model_dump(
         mode="json", exclude={"approval_id", "decision", "actor", "decided_at", "rationale"}
     )
-    sha = digest(dict(proposal=payload, state=state, charter=charter, reason=reason.strip()))
+    sha = digest(
+        dict(
+            proposal=payload,
+            state=state,
+            charter=charter,
+            reason=reason.strip(),
+            adapter_identity=adapter_identity,
+        )
+    )
     request_id = f"source-review-{sha}"
     if not conn.execute(
         select(s.source_review_requests.c.request_id).where(
@@ -145,6 +155,14 @@ def enqueue_source_review(
             )
         )
     return request_id
+
+
+def _approved_adapter_identity(state: dict[str, Any], proposal: SourceApproval) -> dict[str, Any]:
+    # Requests discard the proposed verdict. Validate adapter eligibility using an
+    # approval-shaped template; this neither records nor grants source approval.
+    template = proposal.model_copy(update={"decision": ReviewVerdict.APPROVED})
+    adapter = registry.approved_adapter(RateSource.model_validate(state["source"][0]), template)
+    return adapter.parser.model_dump(mode="json")
 
 
 def product_item(conn: Connection, product_id: str) -> Item:
@@ -204,6 +222,22 @@ def source_item(conn: Connection, request_id: str) -> Item:
         select(s.source_review_requests).where(s.source_review_requests.c.request_id == request_id)
     ).one()
     state = _source_state(conn, row.source_id, row.profile_id)
+    proposal = SourceApproval.model_validate(
+        dict(
+            row.proposal_json,
+            approval_id=request_id,
+            decision=ReviewVerdict.APPROVED,
+            actor="review-template",
+            decided_at=row.requested_at,
+            rationale=row.reason,
+        )
+    )
+    try:
+        adapter_identity = _approved_adapter_identity(state, proposal)
+    except ValueError as exc:
+        # Invalidated deployments remain inspectable, but are stale and cannot
+        # be decided. Bind the failure into CAS rather than hiding the request.
+        adapter_identity = {"error": str(exc)}
     decided = bool(
         conn.execute(
             select(s.source_approvals.c.approval_id).where(
@@ -217,6 +251,7 @@ def source_item(conn: Connection, request_id: str) -> Item:
             state=state,
             charter=row.institution_charter,
             reason=row.reason,
+            adapter_identity=adapter_identity,
         )
     )
     detail = dict(
@@ -225,6 +260,7 @@ def source_item(conn: Connection, request_id: str) -> Item:
         proposal=row.proposal_json,
         state=state,
         reason=row.reason,
+        adapter_identity=adapter_identity,
         stale=current != row.content_sha256,
         approves="Exact source URL, policy, profile, layout, adapter and origins in proposal; "
         "does not approve identity, robots/terms, restore a denylist, or publish.",
@@ -320,6 +356,8 @@ def decide(
     """Caller must hold BEGIN IMMEDIATE through reload, CAS and append."""
     if not actor.strip() or not note.strip():
         raise ValueError("actor and note must be nonempty")
+    if len(actor) > 200 or any(not char.isprintable() for char in actor + note):
+        raise ValueError("actor and note must be printable single-line text; actor limit is 200")
     if kind not in {"product", "source"}:
         raise ValueError("read-only kind; use cu_rates.intake for correction decisions")
     item = product_item(conn, identifier) if kind == "product" else source_item(conn, identifier)
@@ -329,8 +367,15 @@ def decide(
         raise ValueError("content hash changed; run show and review again")
     verdict = ReviewVerdict.APPROVED if approve else ReviewVerdict.REJECTED
     if kind == "product":
+        if approve and not item.evidence:
+            raise ValueError("product approval requires evidence")
+        latest = item.detail["latest_decision"]
         review_id = "console-product-" + digest(
-            [identifier, item.detail["reviewed_product_sha256"]]
+            [
+                identifier,
+                item.detail["reviewed_product_sha256"],
+                latest[0]["review_id"] if latest else None,
+            ]
         )
         persist_review_decision(
             conn,
@@ -349,23 +394,32 @@ def decide(
             institution_charter=item.detail["product"]["institution_charter"],
         )
         return review_id
-    if item.detail["stale"] and approve:
-        raise ValueError("stale source proposal; route a new request for current content")
     row = conn.execute(
         select(s.source_review_requests).where(s.source_review_requests.c.request_id == identifier)
     ).one()
+    proposal = SourceApproval.model_validate(
+        dict(
+            row.proposal_json,
+            approval_id=identifier,
+            decision=verdict,
+            actor=actor,
+            decided_at=at,
+            rationale=note,
+        )
+    )
+    try:
+        _approved_adapter_identity(item.detail["state"], proposal)
+    except ValueError as exc:
+        if item.detail["stale"] and approve:
+            raise ValueError(
+                "stale source proposal; route a new request for current content"
+            ) from exc
+        raise
+    if item.detail["stale"] and approve:
+        raise ValueError("stale source proposal; route a new request for current content")
     insert_approval(
         conn,
-        SourceApproval.model_validate(
-            dict(
-                row.proposal_json,
-                approval_id=identifier,
-                decision=verdict,
-                actor=actor,
-                decided_at=at,
-                rationale=note,
-            )
-        ),
+        proposal,
         row.institution_charter,
     )
     return identifier

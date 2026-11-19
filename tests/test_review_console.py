@@ -1,14 +1,20 @@
 """Private operator queue: real persistence, gate integration and refusal paths."""
 
 import json
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Event
 from typing import Any
 
 import pytest
 from flask import Flask
-from sqlalchemy import select
+from sqlalchemy import Connection, select
 
+from cu_rates.adapters import registry
+from cu_rates.adapters.static_html import SourceConfiguration, configuration_parser
 from cu_rates.contracts import ReviewSubject
 from cu_rates.contracts.publication import ReasonCode, evaluate_publication
 from cu_rates.contracts.sources import SourceApproval
@@ -18,6 +24,7 @@ from cu_rates.db.records import load_review_decision
 from cu_rates.intake import IntakeStore, Resolution
 from cu_rates.pipeline.slice import CHARTER, SliceRun, run_fixture
 from cu_rates.pipeline.trusted import _approval, load_publication_context
+from cu_rates.review import store as review_store
 from cu_rates.review.cli import create_app, main, queue, read_engine, serve
 from cu_rates.review.store import Item, enqueue_source_review, product_item, source_item
 from tests.test_intake_cli import _case
@@ -25,6 +32,14 @@ from tests.test_intake_cli import _case
 NOW = datetime(2026, 11, 18, 20, tzinfo=UTC)
 ACTOR = "owner-human"
 NOTE = "Inspected the exact stored evidence and policy."
+
+
+@pytest.fixture(autouse=True)
+def source_configurations(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    path = tmp_path / "configurations"
+    path.mkdir()
+    monkeypatch.setattr(registry, "CONFIGURATIONS", path)
+    return path
 
 
 @pytest.fixture
@@ -49,7 +64,12 @@ def pending_product(run: SliceRun, *, name: str = "Owner review product") -> Ite
         engine.dispose()
 
 
-def pending_source(run: SliceRun, reason: str = "Uncertain automation suitability") -> Item:
+def pending_source(
+    run: SliceRun,
+    reason: str = "Uncertain automation suitability",
+    *,
+    adapter_defect: str | None = None,
+) -> Item:
     engine = open_operational_database(run.database)
     try:
         with engine.begin() as conn:
@@ -63,6 +83,31 @@ def pending_source(run: SliceRun, reason: str = "Uncertain automation suitabilit
             template = SourceApproval.model_validate(
                 template.model_copy(update={"evidence": evidence}).model_dump()
             )
+            config = SourceConfiguration.model_validate(
+                dict(
+                    source_id=source_id,
+                    source_url=template.source_url,
+                    institution_charter=CHARTER,
+                    layout_sha256=template.approved_layout_sha256,
+                    rows=[
+                        dict(offer_id="synthetic-offer", product_id="synthetic-product", fields=[])
+                    ],
+                )
+            )
+            config_path = registry.CONFIGURATIONS / f"{source_id}.json"
+            if config_path.exists():
+                config = SourceConfiguration.model_validate_json(config_path.read_bytes())
+            else:
+                config_path.write_text(config.model_dump_json())
+            adapter = configuration_parser(config)
+            if adapter_defect == "fixture":
+                assert template.adapter is not None
+                adapter = template.adapter
+            elif adapter_defect == "mismatch":
+                adapter = adapter.model_copy(update={"version": "1.0.0+cfg." + "0" * 64})
+            elif adapter_defect == "unknown":
+                adapter = adapter.model_copy(update={"name": "unregistered-adapter"})
+            template = template.model_copy(update={"adapter": adapter})
             profile_id = conn.execute(
                 select(s.fetch_profiles.c.profile_id).where(
                     s.fetch_profiles.c.source_id == source_id
@@ -361,13 +406,42 @@ def test_read_only_engine_and_missing_db(run: SliceRun, tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("kind", ["product", "source"])
-def test_concurrent_decisions_only_append_once(run: SliceRun, kind: str) -> None:
-    from concurrent.futures import ThreadPoolExecutor
-
+def test_decision_blocks_content_writer_between_read_and_append(
+    run: SliceRun, kind: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     item = pending_product(run) if kind == "product" else pending_source(run)
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        results = list(pool.map(lambda _: decision(run, item), range(2)))
-    assert sorted(results) == [0, 1]
+    loaded, resume = Event(), Event()
+    loader = review_store.product_item if kind == "product" else review_store.source_item
+
+    def paused(conn: Connection, identifier: str) -> Item:
+        current = loader(conn, identifier)
+        loaded.set()
+        assert resume.wait(10), "decision was never resumed"
+        return current
+
+    monkeypatch.setattr(review_store, f"{kind}_item", paused)
+    if kind == "product":
+        sql = "UPDATE products SET name='Concurrent change' WHERE product_id=?"
+        identifier = item.id
+    else:
+        sql = "UPDATE rate_sources SET url='https://changed.example/rates' WHERE source_id=?"
+        identifier = item.detail["proposal"]["source_id"]
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(decision, run, item)
+        try:
+            assert loaded.wait(10), "decision never reached its content read"
+            # An independent writer must be locked out AFTER the review read.
+            # Without BEGIN IMMEDIATE this update commits against stale review content.
+            with closing(sqlite3.connect(run.database, timeout=0)) as writer:
+                with pytest.raises(sqlite3.OperationalError, match="locked"):
+                    writer.execute(sql, (identifier,))
+                writer.rollback()
+        finally:
+            resume.set()
+        assert future.result(timeout=10) == 0
+    # The same update succeeds once the decision releases its transaction.
+    with closing(sqlite3.connect(run.database, timeout=0)) as writer, writer:
+        writer.execute(sql, (identifier,))
     engine = read_engine(run.database)
     try:
         with engine.connect() as conn:
@@ -424,3 +498,194 @@ def test_queue_summaries_cannot_inject_terminal_rows(
     assert call(run, "list") == 0
     out = capsys.readouterr().out
     assert "\x1b" not in out and "\nforged row" not in out
+
+
+def test_product_without_evidence_cannot_be_approved(run: SliceRun) -> None:
+    original = pending_product(run)
+    engine = open_operational_database(run.database)
+    try:
+        with engine.begin() as conn:
+            row = dict(
+                conn.execute(select(s.products).where(s.products.c.product_id == original.id))
+                .mappings()
+                .one()
+            )
+            row["product_id"] = "product-without-evidence"
+            conn.execute(s.products.insert().values(**row))
+            item = product_item(conn, row["product_id"])
+        assert item.evidence == ()
+        assert decision(run, item) == 1
+        with engine.connect() as conn:
+            assert product_item(conn, item.id).detail["latest_decision"] == []
+        # Rejecting an unsupported definition remains possible.
+        assert decision(run, item, "reject") == 0
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize("defect", ["fixture", "mismatch", "unknown"])
+def test_enqueue_refuses_unapproved_adapter(run: SliceRun, defect: str) -> None:
+    with pytest.raises(ValueError, match="adapter"):
+        pending_source(run, adapter_defect=defect)
+    engine = read_engine(run.database)
+    try:
+        with engine.connect() as conn:
+            assert conn.execute(select(s.source_review_requests)).all() == []
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize("command", ["approve", "reject"])
+@pytest.mark.parametrize("defect", ["fixture", "mismatch", "unknown"])
+def test_decide_revalidates_adapter_for_preexisting_request(
+    run: SliceRun, defect: str, command: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Emulate a request persisted before this gate existed, without bypassing the
+    # adapter registry during decide. Normal routing must reject it (test above).
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            registry,
+            "approved_adapter",
+            lambda *a, **kw: registry.Adapter(
+                configuration_parser(
+                    SourceConfiguration.model_validate_json(
+                        next(registry.CONFIGURATIONS.glob("*.json")).read_bytes()
+                    )
+                )
+            ),
+        )
+        item = pending_source(run, adapter_defect=defect)
+    engine = read_engine(run.database)
+    try:
+        with engine.connect() as conn:
+            item = source_item(conn, item.id)
+        assert decision(run, item, command) == 1
+        with engine.connect() as conn:
+            assert not conn.execute(
+                select(s.source_approvals).where(s.source_approvals.c.approval_id == item.id)
+            ).first()
+    finally:
+        engine.dispose()
+
+
+def test_source_hash_tracks_deployed_configuration(run: SliceRun) -> None:
+    item = pending_source(run)
+    path = registry.CONFIGURATIONS / f"{item.detail['proposal']['source_id']}.json"
+    config = json.loads(path.read_text())
+    config["rows"][0]["product_id"] = "different-product"
+    path.write_text(json.dumps(config))
+    engine = read_engine(run.database)
+    try:
+        with engine.connect() as conn:
+            changed = source_item(conn, item.id)
+        assert changed.sha256 != item.sha256
+        assert changed.detail["stale"]
+        assert decision(run, item) == 1
+        assert decision(run, changed) == 1
+        # Rebinding the proposal to the new reviewed configuration yields a new request.
+        rerouted = pending_source(run)
+        assert rerouted.id != item.id
+    finally:
+        engine.dispose()
+
+
+def test_product_content_revert_can_be_reviewed_again(
+    run: SliceRun, capsys: pytest.CaptureFixture[str]
+) -> None:
+    review_ids = []
+    engine = read_engine(run.database)
+    try:
+        for index, name in enumerate(("Definition A", "Definition B", "Definition A")):
+            item = pending_product(run, name=name)
+            assert not item.decided
+            assert (
+                main(
+                    [
+                        "--db",
+                        str(run.database),
+                        "approve",
+                        "product",
+                        item.id,
+                        "--sha256",
+                        item.sha256,
+                        "--actor",
+                        ACTOR,
+                        "--note",
+                        NOTE,
+                    ],
+                    now=NOW + timedelta(seconds=index),
+                )
+                == 0
+            )
+            capsys.readouterr()
+            with engine.connect() as conn:
+                review_ids.append(
+                    product_item(conn, item.id).detail["latest_decision"][0]["review_id"]
+                )
+            assert decision(run, item) == 1
+        assert len(set(review_ids)) == 3
+        with engine.connect() as conn:
+            rows = conn.execute(
+                select(s.review_decisions)
+                .where(s.review_decisions.c.review_id.in_(review_ids))
+                .order_by(s.review_decisions.c.decided_at)
+            ).all()
+            assert len(rows) == 3
+            assert rows[0].reviewed_product_sha256 == rows[2].reviewed_product_sha256
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize("kind", ["product", "source"])
+@pytest.mark.parametrize("field", ["actor", "note"])
+@pytest.mark.parametrize("control", ["\n", "\r", "\t", "\x00", "\x1b[31m", "\x7f", "\x85"])
+def test_decision_refuses_control_characters(
+    run: SliceRun, kind: str, field: str, control: str
+) -> None:
+    item = pending_product(run) if kind == "product" else pending_source(run)
+    assert decision(run, item, **{field: f"safe{control}forged"}) == 1
+    assert item.id in {i.id for i in queue(run.database, None)}
+
+
+def test_actor_length_is_bounded(run: SliceRun) -> None:
+    item = pending_product(run)
+    assert decision(run, item, actor="a" * 201) == 1
+    assert decision(run, item, actor="a" * 200) == 0
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "F" * 90 + " https://field.example/secret",
+        "APR https://field.example/secret //other.example/x www.example.org bare.example.org",
+    ],
+)
+def test_corrections_expose_only_bounded_non_url_metadata(
+    run: SliceRun, tmp_path: Path, capsys: pytest.CaptureFixture[str], field: str
+) -> None:
+    from dataclasses import replace
+
+    path = tmp_path / "intake" / "intake.sqlite"
+    intake = IntakeStore(path)
+    intake.initialize()
+    case = replace(
+        _case(),
+        reason="PRIVATE-REASON https://reason.example/secret",
+        evidence_url="https://evidence.example/secret",
+        affected_field=field,
+    )
+    case_id = intake.record_case(case, now=NOW)
+    args = ["--db", str(run.database), "--intake-db", str(path)]
+    assert main([*args, "list"], now=NOW) == 0
+    listing = capsys.readouterr().out
+    assert main([*args, "show", "correction", case_id], now=NOW) == 0
+    shown = capsys.readouterr().out
+    html = create_app(run.database, path).test_client().get("/").get_data(as_text=True)
+    for output in (listing, shown, html):
+        assert case_id in output and "cu_rates.intake" in output and "show" in output
+        assert "PRIVATE-REASON" not in output
+        assert "https://" not in output and ".example" not in output
+        assert "F" * 81 not in output
+    detail = json.loads(shown)["detail"]
+    assert set(detail) == {"case_id", "kind", "field", "commands"}
+    assert len(detail["field"]) <= 80

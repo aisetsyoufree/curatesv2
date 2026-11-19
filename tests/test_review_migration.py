@@ -107,3 +107,39 @@ def test_foreign_keys_and_engine_guard(tmp_path: Path) -> None:
             conn.execute(s.source_review_requests.update().values(reason="changed"))
     finally:
         engine.dispose()
+
+
+@pytest.mark.parametrize("target", ["aud98_canonical_dimensions", "aud73_unique_guards"])
+@pytest.mark.parametrize("populated", [False, True])
+def test_downgrade_past_queue_requires_empty_queue_and_preserves_earlier_history(
+    tmp_path: Path, target: str, populated: bool
+) -> None:
+    path = tmp_path / "history.sqlite"
+    upgrade_database(path, target)
+    _seed_history(path)
+    with closing(sqlite3.connect(path)) as raw:
+        tables = {
+            row[0] for row in raw.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        before = {name: _rows(raw, name) for name in tables if name != "alembic_version"}
+        triggers = _triggers(raw)
+    upgrade_database(path)
+    if populated:
+        with closing(sqlite3.connect(path)) as raw:
+            seed_request(raw)
+        with pytest.raises(RuntimeError, match="source review requests exist"):
+            downgrade_database(path, target)
+        assert current_revision(path) == REVISION
+        with closing(sqlite3.connect(path)) as raw:
+            assert len(_rows(raw, TABLE)) == 1
+            assert _triggers(raw) == dict(s.schema_triggers())
+            assert {name: _rows(raw, name) for name in before} == before
+    else:
+        downgrade_database(path, target)
+        assert current_revision(path) == target
+        with closing(sqlite3.connect(path)) as raw:
+            assert {
+                row[0] for row in raw.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            } == tables
+            assert _triggers(raw) == triggers
+            assert {name: _rows(raw, name) for name in before} == before
