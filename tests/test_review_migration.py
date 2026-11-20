@@ -20,9 +20,26 @@ from cu_rates.db import schema as s
 from cu_rates.db.migrate import VERSIONS_DIR, _config
 from tests.test_append_only_unique_guards import _rows, _seed_history, _triggers
 
+HEAD = "t046_rate_batch_staging"
 REVISION = "t056a_source_review_requests"
 PREVIOUS = "aud94_identity_reviews"
 TABLE = "source_review_requests"
+_LATER_TABLES = frozenset(
+    {
+        "staged_rate_batches",
+        "staged_rate_candidates",
+        "staged_rate_findings",
+    }
+)
+
+
+def _expected_triggers() -> dict[str, str]:
+    """Guards for the tables that exist at this revision (later tables arrive later)."""
+    return {
+        name: sql
+        for name, sql in s.schema_triggers()
+        if not any(name.startswith(f"{table}_") for table in _LATER_TABLES)
+    }
 
 
 def seed_request(raw: sqlite3.Connection) -> None:
@@ -40,28 +57,42 @@ def test_frozen_linear_migration_upgrade_preserves_history(tmp_path: Path) -> No
     upgrade_database(path, PREVIOUS)
     _seed_history(path)
     with closing(sqlite3.connect(path)) as raw:
-        before = {name: _rows(raw, name) for name in s.APPEND_ONLY_TABLES if name != TABLE}
+        before = {
+            name: _rows(raw, name)
+            for name in s.APPEND_ONLY_TABLES
+            if name != TABLE and name not in _LATER_TABLES
+        }
     script = ScriptDirectory.from_config(_config(path))
-    assert script.get_heads() == [REVISION]
+    assert script.get_heads() == [HEAD]
+    head_revision = script.get_revision(HEAD)
+    assert head_revision is not None and head_revision.down_revision == REVISION
     revision = script.get_revision(REVISION)
     assert revision is not None and revision.down_revision == PREVIOUS
     source = (VERSIONS_DIR / f"{REVISION}.py").read_text()
     assert "cu_rates.db.schema" not in source and "schema_triggers" not in source
-    upgrade_database(path)
+    upgrade_database(path, REVISION)
     with closing(sqlite3.connect(path)) as raw:
-        assert _triggers(raw) == dict(s.schema_triggers())
+        assert _triggers(raw) == _expected_triggers()
         assert {name: _rows(raw, name) for name in before} == before
         assert raw.execute("PRAGMA foreign_key_check").fetchall() == []
     engine = open_operational_database(path)
     try:
         with engine.connect() as conn:
             assert TABLE in inspect(conn).get_table_names()
-            assert compare_metadata(MigrationContext.configure(conn), s.metadata) == []
+            context = MigrationContext.configure(
+                conn,
+                opts={
+                    "include_object": lambda obj, name, type_, *_: (
+                        not (type_ == "table" and name in _LATER_TABLES)
+                    ),
+                },
+            )
+            assert compare_metadata(context, s.metadata) == []
     finally:
         engine.dispose()
     downgrade_database(path, PREVIOUS)
     assert current_revision(path) == PREVIOUS
-    upgrade_database(path)
+    upgrade_database(path, REVISION)
     assert current_revision(path) == REVISION
 
 
@@ -132,7 +163,7 @@ def test_downgrade_past_queue_requires_empty_queue_and_preserves_earlier_history
         assert current_revision(path) == REVISION
         with closing(sqlite3.connect(path)) as raw:
             assert len(_rows(raw, TABLE)) == 1
-            assert _triggers(raw) == dict(s.schema_triggers())
+            assert _triggers(raw) == _expected_triggers()
             assert {name: _rows(raw, name) for name in before} == before
     else:
         downgrade_database(path, target)
