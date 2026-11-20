@@ -13,8 +13,9 @@ comparison project.
 
 The pilot uses operator-led, AI-assisted research and extraction, with independent
 checking against saved lender evidence. The website and publication gate do not use a
-runtime model. Model batch intake is planned but not implemented; there is no supported
-way to publish rates from an AI workbook. See `MASTER.md` decision D-23 and the
+runtime model. Offline model batches can be staged as private candidates only; the
+publication hookup is separate, and a workbook cannot publish rates. See
+`MASTER.md` decision D-23 and the
 [release roadmap](https://github.com/aisetsyoufree/curatesv2/issues/157).
 
 ## Authoritative clone and runtime location
@@ -70,6 +71,7 @@ uv run ruff format --check .
 | `src/cu_rates/normalize/`, `validation/` | Deterministic normalization and validation/quarantine |
 | `src/cu_rates/db/`, `alembic/` | Operational SQLite schema and frozen migrations |
 | `src/cu_rates/roster/` | Source-versioned institution roster import |
+| `src/cu_rates/rate_batch/` | Offline private candidate intake and evidence checks |
 | `src/cu_rates/pipeline/` | Offline vertical slice (slice-only extractor) |
 | `src/cu_rates/snapshot/` | Atomic public snapshot builder, reader, publisher, and denylists |
 | `src/cu_rates/web/` | Server-rendered website (comparison views reading sealed snapshots, `/credit-unions` profile pages, draft articles) |
@@ -115,3 +117,41 @@ hash. The frozen schema cannot retain a human identity-review citation or a dire
 relationship-evidence link: verified flags therefore produce explicit missing-proof
 findings. The validator does not invent those proofs, fetch the roster, or read raw
 private artifact bytes; evidence checks establish stored reference consistency only.
+
+## Offline rate batch intake
+
+`cu_rates.rate_batch` provides bounded intake for offline model-extracted candidate
+rates and coverage findings (M4 / decision D-23). It reconciles candidates against
+identity bindings in the operational database and verifies field-level evidence locators
+against the private Content-Addressed Evidence Store (`ArtifactStore`).
+
+Verified items remain **candidate-only**; intake cannot approve, publish, or synthesize
+evidence. Rows with ambiguous, unsupported, or unverified evidence fail closed to auditable
+holds with stable reason codes.
+
+Pass UTF-8 JSON or JSONL at schema version `1.0`, up to 10 MiB and 5,000 items.
+Compute the envelope digest with `cu_rates.rate_batch.compute_batch_digest` before
+adding `batch_digest`. Supply decimal strings and the actual UTC capture time;
+use `points_not_applicable` only for an explicit, located source disclosure.
+Record source, charter, run and artifact IDs from existing private evidence. The
+database must already be migrated, and the artifact store must already exist.
+Use candidate and finding IDs that are unique to the capture and row.
+Never attach financial data, lender captures, or batch payloads to a public issue.
+
+```sh
+# Dry run reconciliation
+uv run python -m cu_rates.rate_batch batch.json \
+  --database operational.sqlite --store evidence/ --dry-run
+
+# Candidate-only staging
+uv run python -m cu_rates.rate_batch batch.json \
+  --database operational.sqlite --store evidence/
+```
+
+- **Replay**: Re-importing identical batch bytes is an idempotent no-op. Reusing an existing
+  `batch_id` with altered contents raises a conflict error.
+- **Transactions**: Mid-import errors roll back completely; no partial SQLite state is left.
+- **Dry run**: SQLite is opened read-only. It may manage normal WAL sidecars, but no
+  batch rows, schema, or artifact-store directories are created.
+- **Isolation**: Public tables (`normalized_offers`, `products`, `fetch_runs`, `source_approvals`)
+  are never mutated by batch intake.

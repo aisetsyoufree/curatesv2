@@ -15,6 +15,23 @@ from tests.test_append_only_unique_guards import _rows, _seed_history, _triggers
 REVISION = "aud94_identity_reviews"
 PREVIOUS = "aud98_canonical_dimensions"
 NEW_TABLES = ("institution_identity_reviews", "institution_identity_evidence")
+_LATER_TABLES = frozenset(
+    {
+        "source_review_requests",
+        "staged_rate_batches",
+        "staged_rate_candidates",
+        "staged_rate_findings",
+    }
+)
+
+
+def _expected_triggers() -> dict[str, str]:
+    """Guards for the tables that exist at this revision (later tables arrive later)."""
+    return {
+        name: sql
+        for name, sql in s.schema_triggers()
+        if not any(name.startswith(f"{table}_") for table in _LATER_TABLES)
+    }
 
 
 def _deployed(path: Path) -> None:
@@ -47,11 +64,7 @@ def test_upgrade_adds_guarded_tables_and_preserves_history(tmp_path: Path) -> No
     with closing(sqlite3.connect(path)) as raw:
         assert _tables(raw) - before_tables == set(NEW_TABLES)
         assert {name: _rows(raw, name) for name in kept} == kept
-        assert _triggers(raw) == {
-            name: sql
-            for name, sql in s.schema_triggers()
-            if not name.startswith("source_review_requests_")
-        }
+        assert _triggers(raw) == _expected_triggers()
         for table in NEW_TABLES:
             for action in ("update", "delete", "replace"):
                 assert f"{table}_no_{action}" in _triggers(raw)

@@ -24,14 +24,23 @@ TABLE = "verified_scenario_statements"
 
 
 _LATER_TABLES = frozenset(
-    {"institution_identity_reviews", "institution_identity_evidence", "source_review_requests"}
+    {
+        "institution_identity_reviews",
+        "institution_identity_evidence",
+        "source_review_requests",
+        "staged_rate_batches",
+        "staged_rate_candidates",
+        "staged_rate_findings",
+    }
 )
 
 
 def _expected_triggers() -> dict[str, str]:
     """Guards for the tables that exist at this revision (later tables arrive later)."""
     return {
-        name: sql for name, sql in s.schema_triggers() if not name.startswith(tuple(_LATER_TABLES))
+        name: sql
+        for name, sql in s.schema_triggers()
+        if not any(name.startswith(f"{table}_") for table in _LATER_TABLES)
     }
 
 

@@ -236,7 +236,9 @@ def test_deployed_upgrade_downgrade_restores_frozen_sql_and_data(
         kept = {
             table: _rows(raw, table)
             for table in s.APPEND_ONLY_TABLES
-            if not table.startswith(("institution_identity", "source_review_requests"))
+            if not table.startswith(
+                ("institution_identity", "source_review_requests", "staged_rate")
+            )
         }
     expected = {
         name: sql
@@ -246,6 +248,7 @@ def test_deployed_upgrade_downgrade_restores_frozen_sql_and_data(
                 "institution_identity_reviews",
                 "institution_identity_evidence",
                 "source_review_requests",
+                "staged_rate",
             )
         )
     }
