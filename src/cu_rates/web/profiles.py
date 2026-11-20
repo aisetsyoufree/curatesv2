@@ -1,11 +1,12 @@
 """Credit-union profile and coverage read model, derived only from the public snapshot.
 
 The public snapshot carries verified offers and nothing else about an institution, so this
-read model can express exactly two coverage states: ``verified`` (a display-eligible offer
-observed within the degrade window) and ``stale`` (display-eligible offers exist but all are
-older than that window). Every other MASTER section 5 state (no product, no public rate,
-blocked, unsupported) is NOT derivable from public data today and is rendered as ``unknown``
-rather than guessed. Nothing here opens a database or the network.
+read model can express three coverage states: ``verified`` (a display-eligible offer
+observed within the degrade window), ``detail_only`` (only fresh note rates without APR,
+shown on this profile alone under D-05 and never counted as verified for comparison or SEO)
+and ``stale`` (offers exist but all are older than that window). Other MASTER section 5 states
+(no product, no public rate, blocked, unsupported) cannot be inferred from public data and
+are rendered as ``unknown``. Nothing here opens a database or the network.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from cu_rates.snapshot import SnapshotInfo
 from cu_rates.web.comparison import (
     FormattedOffer,
     classify_and_format_offer,
+    format_institution_detail_offer,
     read_snapshot_offers,
 )
 
@@ -33,6 +35,8 @@ FAMILY_LABELS: dict[ProductFamily, str] = {
 
 STATE_LABELS: dict[str, str] = {
     "verified": "Verified",
+    # D-05: fresh verified note rate(s) with no APR. Not "verified" for comparison or SEO.
+    "detail_only": "Institution detail only (APR not published)",
     "stale": "Stale",
     "unknown": "Unknown",
 }
@@ -59,8 +63,17 @@ class Institution:
 
     @property
     def has_verified(self) -> bool:
-        """Indexable content: at least one fresh, display-eligible verified offer."""
+        """Indexable content: at least one fresh, display-eligible verified offer.
+
+        Detail-only (no APR) rows never count, so they cannot make a profile indexable
+        or put it in the sitemap on their own.
+        """
         return any(row.state == "verified" for row in self.coverage)
+
+    @property
+    def has_detail_only(self) -> bool:
+        """At least one profile-only note rate without APR is shown (D-05)."""
+        return any(o.detail_only for row in self.coverage for o in row.offers)
 
 
 def snapshot_clock() -> datetime:
@@ -75,10 +88,13 @@ def _coverage_for(
     offers: list[FormattedOffer], now: datetime, family: ProductFamily
 ) -> CoverageRow:
     mine = tuple(sorted((o for o in offers if o.family == family.value), key=_offer_key))
+    fresh = [o for o in mine if now - o.sort_freshness <= DEGRADE_AFTER]
     if not mine:
         state = "unknown"
-    elif any(now - o.sort_freshness <= DEGRADE_AFTER for o in mine):
+    elif any(not o.detail_only for o in fresh):
         state = "verified"
+    elif fresh:
+        state = "detail_only"
     else:
         state = "stale"
     return CoverageRow(family.value, FAMILY_LABELS[family], state, STATE_LABELS[state], mine)
@@ -102,7 +118,9 @@ def build_directory(
         names.setdefault(raw.institution_charter, set()).add(raw.institution_name)
     eligible: dict[int, list[FormattedOffer]] = {}
     for raw in raw_offers:
-        item = classify_and_format_offer(raw, now)
+        # The two projections are disjoint by placement. The detail-only one is used only
+        # here, for the institution's own profile (D-05); comparison callers never see it.
+        item = classify_and_format_offer(raw, now) or format_institution_detail_offer(raw, now)
         if item is not None:
             eligible.setdefault(raw.institution_charter, []).append(item)
     directory: dict[int, Institution] = {}
