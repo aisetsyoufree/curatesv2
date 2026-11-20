@@ -164,12 +164,11 @@ labeled and never power statewide summary claims.
 12. **Independent expiry:** the web layer enforces `valid_until` even if workers fail.
 13. **Emergency withdrawal:** an independent denylist can suppress a source, offer,
     product, institution, or snapshot with actor, time, and reason.
-14. **Constrained auto-publication:** previously reviewed offers may republish only
-    when source and parser remain approved, structure is unchanged, conditions and
-    evidence are complete, validations pass, point structure and product identity are
-    unchanged, and note-rate/APR movements are no more than 50 basis points. All first
-    publications, new products, structural changes, OCR values, larger movements, or
-    changed points require review.
+14. **Constrained auto-publication:** never bypass the gate. D-20, D-21, and D-22
+    supersede the original review policy in D-03 where specified. If the current
+    implementation still routes a case to review (for example, a large rate movement),
+    keep it in review until a separately approved change aligns the gate. This pivot
+    does not change the gate, approvals, or review requirements.
 15. **Polite collection:** honor robots decisions, identify the project, rate-limit,
     cache, and never bypass authentication, CAPTCHAs, or bot protection.
 16. **Source abandonment review:** an effective date older than 90 days plus no value
@@ -418,7 +417,7 @@ failures, timestamps, configuration, and code version:
    evidence, or use an existing approved adapter. Intake cannot approve or publish.
 7. Normalize candidates into typed product-specific offers.
 8. Apply deterministic field and cross-record validation.
-9. Review quarantined, new, or structurally changed offers.
+9. Resolve evidence holds and complete required reviews before publication.
 10. Build and verify an atomic public snapshot.
 11. Serve comparisons, profiles, education, methodology, coverage, and exports.
 12. Monitor freshness, structural drift, coverage regression, and publication health.
@@ -616,8 +615,8 @@ in the issue/PR; durable product or architecture decisions are incorporated here
 | ID | Decision |
 |---|---|
 | D-01 | Use the four declared canonical scenarios; form-generated quotes are labeled and never power statewide summary language. |
-| D-02 | Collect daily, degrade after 72 hours, withdraw comparisons after 96 hours, and support immediate manual withdrawal. |
-| D-03 | Auto-publish only previously reviewed, structurally unchanged offers satisfying every evidence, condition, validation, freshness, movement, product, and points rule. |
+| D-02 | Original collection target: daily. Degrade after 72 hours, withdraw comparisons after 96 hours, and support immediate manual withdrawal. D-23 changes the pilot cadence, not these thresholds. |
+| D-03 | Original automatic publication policy: previously reviewed, structurally unchanged offers must satisfy every evidence, condition, validation, freshness, movement, product, and points rule. See D-20 through D-22 for amendments and D-23 for the new intake lane. |
 | D-04 | Rank conventional conforming offers only; keep jumbo, government, first-time-buyer, and partner programs browse-only until modeled. |
 | D-05 | Rate without APR is institution-detail-only and excluded from rankings and headlines. |
 | D-06 | MIT for original code; CC BY 4.0 for original documentation and exported normalized datasets; third-party artifacts remain private and are not relicensed. |
