@@ -11,6 +11,12 @@ comparison project.
   [Issues](https://github.com/aisetsyoufree/curatesv2/issues) for all stories and
   execution status.
 
+The pilot uses operator-led, AI-assisted research and extraction, with independent
+checking against saved lender evidence. The website and publication gate do not use a
+runtime model. Model batch intake is planned but not implemented; there is no supported
+way to publish rates from an AI workbook. See `MASTER.md` decision D-23 and the
+[release roadmap](https://github.com/aisetsyoufree/curatesv2/issues/157).
+
 ## Authoritative clone and runtime location
 
 The authoritative active clone is `~/Code/cu-rates.org-v2`, a full clone (not a

@@ -308,7 +308,17 @@ Procedure:
 
 ### Worker wiring check (issue #115)
 
-Nothing starts the worker, and `cu-rates-worker.service` remains the disabled stub. `python -m cu_rates.worker_config check` (as the service user, with the settings from `env.example` in the environment) is a **read-only** check that every path the worker will need exists and is sane: the operational database opens, the terms ledger and both denylists parse, the state and artifact directories are private, and the operator and automatic ledgers are separate files in separate directories. It creates nothing and prints JSON; exit status 1 means something is missing or invalid. The terms ledger is written only by the operator (`TermsLedger.record`), never by the worker.
+Nothing starts the worker, and `cu-rates-worker.service` remains the disabled stub.
+The operator-led pilot in MASTER.md D-23 does not change these deployment
+restrictions: no model scheduler, live worker, or import of real rate batches is
+enabled by this runbook. `python -m cu_rates.worker_config check` (as the service user,
+with the settings from `env.example` in the environment) is a **read-only** check that
+every path the worker will need exists and is sane: the operational database opens,
+the terms ledger and both denylists parse, the state and artifact directories are
+private, and the operator and automatic ledgers are separate files in separate
+directories. It creates nothing and prints JSON; exit status 1 means something is
+missing or invalid. The terms ledger is written only by the operator
+(`TermsLedger.record`), never by the worker.
 
 ### Automatic suppression ledger (issue #118)
 

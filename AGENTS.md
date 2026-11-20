@@ -9,6 +9,10 @@
 6. Do not self-merge or begin another issue. Codex owns integration and final QA.
 7. Edit `MASTER.md` only when an approved product or architecture decision changes.
 
+For rate work, follow the D-23 collection and verification lane in `MASTER.md`.
+Model output is untrusted input. Do not schedule collection, enable the worker,
+import real evidence, or publish rates unless the assigned issue authorizes it.
+
 GitHub Issues/Project own task state. Do not create task ledgers, task packets, or
 standalone review reports in the repository.
 

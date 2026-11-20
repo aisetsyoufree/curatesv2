@@ -47,9 +47,10 @@ Success means:
 - Mortgage, refinance, fixed home-equity, and HELOC semantics remain distinct.
 - Uncertain, stale, anomalous, or ungrounded data is quarantined.
 - Public pages expose freshness, assumptions, eligibility, coverage, and limitations.
-- A fresh clone can bootstrap, test, collect the pilot, and build the website.
+- A fresh clone can bootstrap, test, ingest a reproducible pilot batch, and build the website.
 - The production system runs reliably on a Raspberry Pi 5.
-- Routine collection and publication require no runtime LLM.
+- Models may assist with collection and extraction outside the app. Validation,
+  publication, and public serving never depend on a runtime LLM.
 
 ## 3. Scope
 
@@ -148,7 +149,8 @@ labeled and never power statewide summary claims.
 2. **Provenance or no publication:** every public value has an artifact and locator.
 3. **Raw before normalized:** preserve the source response before extraction.
 4. **Immutable history:** append observations; do not overwrite collection history.
-5. **Deterministic routine:** parsers and rules perform normal extraction and checks.
+5. **Deterministic gate:** models can propose extractions, but rules verify evidence,
+   normalize values, and decide whether offers qualify for publication.
 6. **LLMs propose and audit:** no LLM directly approves a financial value.
 7. **Human-approved identity:** discovered URLs are untrusted until institution and
    product relationships are verified.
@@ -157,8 +159,8 @@ labeled and never power statewide summary claims.
 9. **Like-for-like comparison:** rankings use one declared scenario and expose points,
    conditions, eligibility, and coverage.
 10. **No fabricated completeness:** report coverage by pipeline stage and status.
-11. **Bounded freshness:** collect daily; degrade after 72 hours without successful
-    re-observation and withdraw rate comparisons after 96 hours.
+11. **Bounded freshness:** degrade after 72 hours without successful re-observation
+    and withdraw rate comparisons after 96 hours. D-23 sets the pilot cadence.
 12. **Independent expiry:** the web layer enforces `valid_until` even if workers fail.
 13. **Emergency withdrawal:** an independent denylist can suppress a source, offer,
     product, institution, or snapshot with actor, time, and reason.
@@ -182,7 +184,50 @@ collection is appropriate.
 **Approval status:** approved by the product owner in T007; see decision D-12. Product
 approval does not substitute for source-by-source review or legal clearance.
 
-#### Default collection behavior
+#### Operator-led, AI-assisted lane (D-23)
+
+1. **Discover and capture.** Codex leads public-rate research against the official
+   roster. Verify the institution, product, and official or authorized-provider source.
+   Use approved public evidence only. A permitted operator capture must record the
+   actual URL, capture ID, UTC observation time, media type, and artifact hash; save
+   the material needed to trace each value to its original row and qualifications.
+   Search snippets, URLs alone, screenshots without traceable claims, and exported AI
+   spreadsheets are leads, not verified observations. Do not use a model or another
+   browser to route around a blocked source or automate an unapproved collection path.
+2. **Extract and cross-check.** Codex proposes structured candidates from the stored
+   evidence. Opus or Gemini independently reads the same artifact without seeing
+   the first extraction; a human can substitute. Compare product and purpose, note
+   rate and APR, term and ARM adjustment interval, points, conditions, borrower
+   assumptions, and whether all public rows were found. Record tool/model and
+   recipe version, independent result, and material disagreements privately.
+3. **Corroborate and validate.** Import to private staging only. Independently
+   resolve each material field to stored evidence before trusting it. A second
+   model reading an artifact is not a second capture under D-20. Corroborating
+   captures must independently support the same offer, terms, and conditions.
+   When reusing the same approved page, log separate successful captures at least
+   three hours apart and obey any stricter profile spacing. Identical bytes are
+   acceptable; a cached result, reused capture, or HTTP 304 is not corroboration.
+4. **Route and publish.** Use evidence-backed outcomes, not an LLM probability:
+   - **Verified / eligible for comparison:** corroborated, current, fully supported
+     claims that match a canonical scenario and pass all existing approvals and gates.
+   - **Verified / browse-only:** a publishable, source-supported advertised value
+     whose scenario is unstated, different, or out of ranking scope. Show the reason;
+     never infer missing conditions or rank the row.
+   - **Hold:** conflicting, stale, unsupported, or unverifiable claims stay private.
+     Recheck the original with the operator or a reviewer; never resolve by majority
+     vote. Quote-only, blocked, and no-public-rate observations are coverage findings,
+     not offers.
+5. **Measure.** Keep dated dispositions for every in-scope charter and separately
+   report field accuracy and public-row recall against an independently checked
+   inventory. Silence on one page never proves that an institution lacks a product.
+
+This lane is a design, not an implemented importer or approval to acquire, publish,
+schedule, or deploy. The source, product, privacy, retention, and withdrawal controls
+still apply. Operator captures use only permitted public access; any automated
+retrieval remains subject to the controls below, including D-15. No borrower inputs,
+applications, lead forms, sign-ins, paywalls, or bot-block bypasses in this pilot.
+
+#### Automated collection controls (retained; not the pilot path)
 
 - Identify the project with one stable user agent that links to the public methodology
   and contact page. Do not impersonate a consumer browser, rotate identities, hide
@@ -241,28 +286,31 @@ approval does not substitute for source-by-source review or legal clearance.
 
 #### Source approval checklist and classifications
 
-A source becomes `approved` only after a human reviewer records all of the following:
+A source becomes `approved` only after the following are recorded. Verify institution
+identity and product authorization. D-21 and D-22 govern the limited exceptions to
+manual review; operator-led capture needs an explicit approved procedure for each source.
 
 1. The institution identity, official domain, product relationship, and lending
    footprint are verified.
 2. The rate location is an institution or authorized-provider page for that product.
 3. Robots, applicable terms, authentication, form inputs, and access controls have been
    reviewed with no unresolved block.
-4. The fetch profile, schedule, limits, artifact type, expected locator, and responsible
-   adapter are named. Browser profiles also set tested per-render request, byte, and time
-   budgets before approval.
+4. The permitted capture method, schedule, limits, artifact type, and expected locators
+   are named. Automated paths also name the fetch profile and responsible adapter.
+   Browser profiles set tested per-render request, byte, and time budgets.
 5. A fixture proves collection can occur without personal data, lead submission,
    circumvention, or unrelated browsing. Committed fixtures are synthetic or original
    and contain no third-party text; real captures remain only in the private store and
    never enter the repository, CI, or exports.
 6. Retention, public excerpt, freshness, correction contact, and withdrawal behavior are
    defined.
-7. A reviewer approves the first observation and records the decision, time, evidence,
-   and any conditions.
+7. Record the approval, actor, time, evidence, and conditions. Source approval does
+   not approve the first observation or authorize publication.
 
 Use these evidence-backed source classifications:
 
-- `approved`: automated collection may run under the recorded profile.
+- `approved`: collection can use only the explicitly approved capture method and
+  limits. This status alone does not enable a worker, scheduler, or publication.
 - `quote_only`: the institution offers the product but no comparable public rate can be
   collected without borrower data or human contact.
 - `login_required`: the rate is visible only after authentication.
@@ -365,8 +413,9 @@ failures, timestamps, configuration, and code version:
 2. Reconcile institution identity, membership, address, and lending footprint.
 3. Catalog home-lending products and explicit absence.
 4. Approve product-bound source URLs and fetch profiles.
-5. Collect raw HTML, PDF, JSON/XHR, rendered DOM, images, and HTTP metadata.
-6. Extract source-grounded candidates without changing meaning.
+5. Capture source evidence under the recorded approval and store it privately.
+6. Stage model-extracted candidates and independent checks with field-level
+   evidence, or use an existing approved adapter. Intake cannot approve or publish.
 7. Normalize candidates into typed product-specific offers.
 8. Apply deterministic field and cross-record validation.
 9. Review quarantined, new, or structurally changed offers.
@@ -419,6 +468,11 @@ when collection or publication is down.
 - SQLite with WAL for the single-writer operational database
 
 ### Collection
+
+The launch candidate is an operator-led workflow with model-assisted extraction and
+an offline import into SQLite. Existing adapter and transport code stays available
+where a demonstrated need justifies it. The following apply to optional automated
+collection work; they are not default requirements for the pilot.
 
 - `httpx` for HTTP
 - BeautifulSoup/lxml for HTML
@@ -478,14 +532,17 @@ Model availability is verified immediately before assignment.
 | Product manager / architect / integrator | Claude (orchestrator), with Codex, Gemini and Claude subagents as workers and independent reviewers | Product decisions, architecture, issue specifications, disagreement resolution, integration, and final QA |
 | Primary implementation | Claude Sonnet 5.5 | Bounded features, migrations, tests, and fixes from one approved issue |
 | Implementation fallback | Claude Sonnet 4.6 Thinking | Same role when the preferred model is unavailable |
-| Scraper and long-running implementation | Grok Build | Adapters, collection debugging, and bounded implementation |
-| Mechanical/high-volume work | Gemini Flash | Fixtures, test expansion, repetitive transformation, and reviewed educational drafts |
+| Research and primary rate extraction | Codex | Find official sources and propose evidence-linked candidates; never self-certify |
+| Independent rate verification | Claude Opus or Gemini | Read stored evidence independently; flag mismatched fields and missing rows |
+| Bounded implementation | Grok Build | Implement scoped features and tests; adapter work only when justified |
+| Mechanical/high-volume work | Gemini Flash | Coverage inventory, fixtures, test expansion, and reviewed educational drafts |
 | Architecture review | Claude Opus | Independent review; report first and do not edit by default |
 | Adversarial audit | Grok | Challenge attribution, taxonomy, validation, and publication safety |
 | Product approval | Sid | Scope, source disputes, major tradeoffs, and release approval |
 
-LLMs are development assistants and auditors, never runtime publishers. One writer
-owns one issue. Reviewers do not edit unless separately assigned remediation.
+LLMs can assist development, research, and extraction. They are never the source of
+record or runtime publishers. One writer owns one issue. Reviewers do not edit unless
+separately assigned remediation.
 
 ## 10. Work tracking and enterprise delivery rules
 
@@ -545,9 +602,10 @@ in the issue/PR; durable product or architecture decisions are incorporated here
   fetch worker, invariants, and one static CU end to end.
 - **M2 — Institution/product/source registry:** official roster, identity, products,
   source profiles, and registry validation.
-- **M3 — Representative pilot:** 10–12 platform-diverse institutions and fixtures.
-- **M4 — Extraction and validation:** HTML, vendor, PDF, browser/XHR adapters,
-  normalization, validation, and quarantine.
+- **M3 — Representative pilot:** 10–12 source-diverse institutions, approved public
+  pages, independently checked coverage, and a real-data rehearsal.
+- **M4 — Extraction and validation:** private batch intake, evidence binding,
+  normalization, independent verification, validation, and quarantine.
 - **M5 — Publication and educational website:** snapshots, profiles, comparisons,
   education, analytics/SEO/ad readiness, corrections, and launch gate.
 - **M6 — Raspberry Pi operations and expansion:** deployment, scheduling, backup,
@@ -571,7 +629,7 @@ in the issue/PR; durable product or architecture decisions are incorporated here
 | D-12 | Adopt §5 as the collection, evidence, corrections, and licensing policy. Publish only verified public rate facts and their context; keep full source captures private. |
 | D-13 | Risky changes (contracts, publication, collection, database, security) require an independent review by a different reviewer or vendor than the author before merge; a writer never approves its own work. The integrator merges by pull request only after `scripts/check`, the format check, and CI pass, and records evidence on the issue (D-11). Adopted 2026-11-16. |
 | D-14 | Institution identity data comes from the NCUA quarterly call-report ZIP, downloaded manually by the product owner once per quarter and imported from the local file. No automated retrieval of NCUA or Mass.gov data is approved; the Division of Banks cross-check list is still to be identified. The raw file stays private and only normalized fields are published. Approved 2026-11-16 (issue #18). |
-| D-15 | Live transport and live collection stay disabled until the gateway-owned pinned dialer (issue #68) is built and independently reviewed, and until each source has its own recorded approval under §5. The fetch worker dispatches only a mock transport today. Adopted 2026-11-16. |
+| D-15 | Live automated collection stays disabled until the gateway-owned pinned dialer (issue #68) is independently reviewed and enabled by a separate decision, and each source has its own recorded approval under §5. Having the dialer code is not approval to run it. Adopted 2026-11-16; D-23 describes the separate operator-led pilot. |
 | D-16 | Workers run headless in visible terminals with Grok 4.7 (high reasoning), Gemini 3.8 Flash (high) through Antigravity, and GPT-6.1-Sol (high) through Codex. Before assigning work the orchestrator checks the worker's 5-hour and weekly quota and assigns only if both are at least 15%; Codex is reserved for independent reviews of high-risk work. Adopted 2026-11-16. |
 | D-17 | The project's Raspberry Pi 5 may receive real installs of the reviewed deploy bundle (T060). Installation grants no launch permission: the worker service and timer stay stopped, disabled and masked, and the bundle's identity (commit) is recorded at install, until the D-15 conditions and a recorded per-source approval under D-18 are met. No private host details (addresses, users, key paths) enter the repository or public issues. Approved 2026-11-17. |
 | D-18 | The product owner delegates authorization of bounded acquisition from a source (not publication) to the orchestrator, subordinate to every §5 and D-15 control, including human identity approval of the source and human review of its first observation and values. A source may be authorized only when robots and terms are reviewed and permit automated access, the pinned dialer (issue #68) is merged and independently reviewed, and limits and recheck intervals are set. Publication is a separate step: a value publishes only when the deterministic gate passes with at least two separately captured authoritative evidence paths (not model agreement) that match product, scenario and time. LLMs and web search may assist discovery, extraction and cross-checking but are never the source of record; unverifiable values fail closed. Each authorization is recorded append-only on the source's issue and spot-checked by a human at least quarterly; anyone may stop collection or withdraw a source, only the product owner may restore a blocked source, and the owner may revoke this delegation at any time. Approved 2026-11-17, revised after independent review. |
@@ -579,14 +637,16 @@ in the issue/PR; durable product or architecture decisions are incorporated here
 | D-20 | Owner decisions of 2026-11-18, replacing the earlier stricter readings. (1) Two "separately captured" evidence paths may be two captures of the same approved page taken at least 3 hours apart (the minimum spacing is set per source profile and never below 3 hours), because this is an educational site; identical bytes are acceptable, a single capture or a 304 revalidation is not. (2) Encrypted and off-device backups are not required; backups stay local, verified and access-controlled (the §5 requirement for encrypted evidence at rest is relaxed to access-controlled). (3) After a source is approved and its first observation and values were human-reviewed (D-18), later observations, including rate changes of any size that pass the deterministic gate, publish automatically when extraction confidence is high or medium; low-confidence extractions are quarantined for human re-run or review and never publish. All other controls stay: human identity approval, robots/terms, the pinned dialer, two-path corroboration, fail-closed gating, withdrawal and denylist. Approved by the product owner 2026-11-18. |
 | D-21 | Owner decision of 2026-11-18, amending D-18 and D-20: the human review of a source's first observation and values is dropped. A source's first observation may publish automatically when the deterministic gate passes (two corroborating captures per D-20) and extraction confidence is high or medium; low confidence is quarantined for human re-run or review. Human identity approval of the source and institution (including Massachusetts scope), robots and terms review that permits automated access, the pinned dialer, per-source limits, the denylist and withdrawal, corrections handling and the quarterly spot-check all stay. Approved by the product owner 2026-11-18. |
 | D-22 | Owner decisions of 2026-11-18 on approvals. (1) The per-product review gate stays: the product owner approves each product's definition before anything about it publishes. (2) Source approval (identity match to the roster, robots and terms permitting automated access, adapter selected, limits set) may be granted automatically by the orchestrator when every automated check passes and a dry-run extraction of the stored page has high confidence; any uncertainty (unreadable terms, ambiguous robots, medium or low confidence, an access block, a CAPTCHA) routes the source to the product owner's approval queue instead, and a source that is blocked or prohibits automated access is never auto-approved. Auto-approvals are recorded append-only on the source's issue and are covered by the quarterly human spot-check. (3) Cloudflare Tunnel exposure (T060c) happens only after the product owner has tested the site locally from the Pi. Approved by the product owner 2026-11-18. |
+| D-23 | Owner-approved 2026-11-19: adopt the operator-led AI-assisted lane in §5 for the pilot and defer new scraper families unless measured coverage, accuracy, or operating effort justifies them. This supplements D-15/D-17/D-18; it does not enable the worker or waive source/product approval, D-20 corroboration, or any publication gate. Codex leads pilot research and extraction (exception to D-16); Opus, Gemini, or a human independently checks it. For the pilot, plan at least two operator-run refresh windows per week, never more than 96 hours apart, preferably no more than 72; D-02's 72/96-hour thresholds are unchanged and the production cadence depends on pilot results. This decision does not authorize scheduling. Keep any stricter current code behavior until a separate, reviewed change aligns it with prior decisions. See [pivot issue](https://github.com/aisetsyoufree/curatesv2/issues/158). |
 
 Reopening a resolved decision requires a recorded rationale and impact review in the
 relevant GitHub issue or pull request, followed by an update to this document.
 
 ## 13. Current implemented foundation
 
-This section describes what exists in the repository, not what is planned. Everything below
-runs offline; no live collection has been approved or enabled.
+This section describes what exists in the repository, not what is planned. Live
+collection remains disabled, and the operator-led batch intake and gate integration
+described in D-23 are not implemented yet.
 
 - **Toolchain:** `uv`-managed Python 3.12, committed lockfile, Ruff, strict mypy, pytest, and
   the executable `scripts/check` quality gate.
