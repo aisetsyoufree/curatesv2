@@ -8,7 +8,8 @@ import pytest
 from flask import Flask
 from flask.testing import FlaskClient
 
-from cu_rates.contracts.enums import WithdrawalScope
+from cu_rates.contracts.enums import ConditionKind, MatchState, WithdrawalScope
+from cu_rates.contracts.offers import OfferCondition
 from cu_rates.contracts.publication import (
     DEGRADE_AFTER,
     WITHDRAW_AFTER,
@@ -32,8 +33,17 @@ def _offer(
     charter: int,
     *,
     apr: str | None = "6.250",
+    note_rate: str | None = "6.125",
+    conditions: tuple[OfferCondition, ...] = (),
 ) -> PublicOffer:
-    item = _make_candidate(offer_id, "Placeholder CU", apr_str=apr, now=NOW)
+    item = _make_candidate(
+        offer_id,
+        "Placeholder CU",
+        note_rate_str=note_rate,
+        apr_str=apr,
+        conditions=conditions,
+        now=NOW,
+    )
     projected = _public_projection(
         item, evaluate_publication(item.offer, item.context).placement, False
     )
@@ -142,6 +152,72 @@ def test_profile_with_verified_offer(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert "https://cu-rates.org/credit-unions" in _sitemap(client)
     listing = client.get("/credit-unions").get_data(as_text=True)
     assert 'href="/credit-unions/111"' in listing
+
+
+def _condition(condition_id: str, kind: ConditionKind, text: str) -> OfferCondition:
+    """Synthetic condition (no real institution text); it conflicts with the scenario."""
+    return OfferCondition(
+        condition_id=condition_id,
+        kind=kind,
+        description=text,
+        provenance=make.provenance(text),
+        scenario_state=MatchState.CONFLICTS,
+    )
+
+
+def _profile_items(html: str) -> list[str]:
+    coverage = html.split("Coverage by product")[1].split("How to read coverage")[0]
+    return [item.split("</li>")[0] for item in coverage.split("<li>")[1:]]
+
+
+def test_profile_shows_each_offers_own_conditions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#103 (a): the profile renders the same validated conditions the comparison shows.
+
+    Synthetic fixture only: two separate public offers for one charter, one with an
+    autopay and an advertised as-low-as condition, one with none recorded.
+    """
+    conditioned = _offer(
+        "o-terms",
+        "Synthetic Conditions CU",
+        888,
+        note_rate="5.875",
+        apr="5.990",
+        conditions=(
+            _condition("c-autopay", ConditionKind.AUTOPAY, "synthetic autopay"),
+            _condition("c-ala", ConditionKind.AS_LOW_AS, "synthetic as low as"),
+        ),
+    )
+    plain = _offer("o-plain", "Synthetic Conditions CU", 888).model_copy(update={"assumptions": ()})
+    app, _ = _app(tmp_path, monkeypatch, [conditioned, plain])
+    resp = app.test_client().get("/credit-unions/888")
+    assert resp.status_code == 200
+    items = _profile_items(resp.get_data(as_text=True))
+    assert len(items) == 2  # separate public offers stay separate rows (sorted by offer id)
+    plain_item, terms_item = items
+    assert "6.125%" in plain_item and "5.875%" not in plain_item
+    assert "5.875%" in terms_item and "5.990%" in terms_item
+
+    # The conditioned offer discloses its own conditions, in the comparison's wording.
+    assert "Conditions: " in terms_item
+    assert "Autopay discount condition" in terms_item
+    assert "As-low-as qualification condition" in terms_item
+    assert "none recorded" not in terms_item
+    # Its separation reason is still shown independently of the conditions disclosure.
+    assert "Not comparable:" in terms_item
+
+    # Empty conditions are unknown, never "no conditions": no leak from the other offer.
+    assert "Autopay" not in plain_item and "As-low-as" not in plain_item
+    assert (
+        "Conditions: none recorded in the verified snapshot; this does not mean none apply."
+        in plain_item
+    )
+    for overclaim in ("None published", "No conditions", "no conditions apply"):
+        assert overclaim not in plain_item
+    # Effective date and review status are deliberately not rendered here (deferred to #160).
+    for deferred in ("Reviewed by human", "Automated check", "Effective"):
+        assert deferred not in terms_item and deferred not in plain_item
 
 
 def test_profile_without_verified_offers_is_noindex_and_unknown(

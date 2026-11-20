@@ -42,6 +42,13 @@
                 {% for offer in row.offers %}
                 <li>
                   {{ offer.loan_type_display }}: note rate {{ offer.note_rate_display }}, APR {{ offer.apr_display }}, points {{ offer.points_display }}, term {{ offer.term_display }}.
+                  {# "None published" is the comparison formatter's empty sentinel: absence of a
+                      recorded condition is unknown, never a claim that no conditions apply. #}
+                  {% if offer.conditions_display == "None published" %}
+                  Conditions: none recorded in the verified snapshot; this does not mean none apply.
+                  {% else %}
+                  Conditions: {{ offer.conditions_display }}.
+                  {% endif %}
                   Observed {{ offer.freshness_display }}.
                   {% if offer.separation_reason %}Not comparable: {{ offer.separation_reason }}.{% endif %}
                   <a href="{{ offer.source_url }}" class="source-link" rel="nofollow noopener noreferrer" target="_blank" aria-label="Source reference for {{ institution.name }} {{ row.label }}">Source</a>
