@@ -88,6 +88,97 @@ echo "Target root: ${NVME_ROOT}"
 echo "Dedicated user: ${APP_USER}:${APP_GROUP}"
 echo "================================================"
 
+# Permission bits and owner uid via GNU (Linux) or BSD (macOS) stat; non-zero exit on failure.
+path_mode() {
+    stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null
+}
+path_owner_uid() {
+    stat -c '%u' "$1" 2>/dev/null || stat -f '%u' "$1" 2>/dev/null
+}
+
+# Checking only the final component is not enough: a symlinked or rewritable parent can
+# redirect every later mkdir/chown/chmod outside the intended storage (#101d). Every existing
+# ancestor must be a real, traversable directory, owned by root or the invoking user, and not
+# writable by group/others (a sticky shared directory such as /tmp is tolerated only when the
+# next component already exists and is owned by root or the invoking user). Components that do
+# not exist yet are created later by mkdir -p as real directories under the last checked one.
+# This validates path shape only; it does not prove the storage is NVMe-backed.
+validate_path_ancestors() {
+    local target="$1"
+    if [[ "${target}" == *"//"* || "${target}" == */ || "${target}/" == *"/./"* ]]; then
+        echo "Error: Path '${target}' must be normalized (no '//', trailing '/', or '.' component). Exiting." >&2
+        exit 1
+    fi
+    local self_uid="${EUID}"
+    local rest="${target#/}"
+    local current=""
+    local parent_shared=0
+    local component mode owner_uid
+    while [[ -n "${rest}" ]]; do
+        component="${rest%%/*}"
+        if [[ "${rest}" == */* ]]; then
+            rest="${rest#*/}"
+        else
+            rest=""
+        fi
+        current="${current}/${component}"
+        if [[ ! -e "${current}" && ! -L "${current}" ]]; then
+            if [[ "${parent_shared}" -eq 1 ]]; then
+                echo "Error: '${current}' does not exist and would be created inside a shared writable directory. Exiting." >&2
+                exit 1
+            fi
+            return 0
+        fi
+        if [[ -z "${rest}" ]]; then
+            # The target itself: symlink and non-directory checks follow in validate_path.
+            if [[ "${parent_shared}" -eq 1 && ! -L "${current}" ]]; then
+                if ! owner_uid="$(path_owner_uid "${current}")" || [[ ! "${owner_uid}" =~ ^[0-9]+$ ]]; then
+                    echo "Error: Cannot read owner of '${current}'. Exiting." >&2
+                    exit 1
+                fi
+                if [[ "${owner_uid}" != "0" && "${owner_uid}" != "${self_uid}" ]]; then
+                    echo "Error: Path '${current}' sits in a shared writable directory and is owned by another user (uid ${owner_uid}). Exiting." >&2
+                    exit 1
+                fi
+            fi
+            return 0
+        fi
+        if [[ -L "${current}" ]]; then
+            echo "Error: Ancestor '${current}' of path '${target}' is a symlink. Symlinked parents are forbidden." >&2
+            exit 1
+        fi
+        if [[ ! -d "${current}" ]]; then
+            echo "Error: Ancestor '${current}' of path '${target}' is not a directory." >&2
+            exit 1
+        fi
+        if [[ ! -x "${current}" ]]; then
+            echo "Error: Ancestor '${current}' of path '${target}' cannot be traversed for inspection." >&2
+            exit 1
+        fi
+        if ! mode="$(path_mode "${current}")" || [[ ! "${mode}" =~ ^[0-7]+$ ]]; then
+            echo "Error: Cannot read permissions of ancestor '${current}'. Exiting." >&2
+            exit 1
+        fi
+        if ! owner_uid="$(path_owner_uid "${current}")" || [[ ! "${owner_uid}" =~ ^[0-9]+$ ]]; then
+            echo "Error: Cannot read owner of ancestor '${current}'. Exiting." >&2
+            exit 1
+        fi
+        if [[ "${owner_uid}" != "0" && "${owner_uid}" != "${self_uid}" ]]; then
+            echo "Error: Ancestor '${current}' of path '${target}' is owned by another user (uid ${owner_uid}). Exiting." >&2
+            exit 1
+        fi
+        parent_shared=0
+        if (( (8#${mode} & 8#022) != 0 )); then
+            if [[ -k "${current}" ]]; then
+                parent_shared=1
+            else
+                echo "Error: Ancestor '${current}' of path '${target}' is writable by group or others. Exiting." >&2
+                exit 1
+            fi
+        fi
+    done
+}
+
 # 1. Guard against invalid, SD-card, cloud-synchronized, or unsafe paths (MASTER.md §7, D-07, D-10)
 validate_path() {
     local target="$1"
@@ -113,6 +204,7 @@ validate_path() {
             exit 1
             ;;
     esac
+    validate_path_ancestors "${target}"
     if [[ -L "${target}" || -h "${target}" ]]; then
         echo "Error: Path '${target}' is a symlink. Symlinks are forbidden." >&2
         exit 1
