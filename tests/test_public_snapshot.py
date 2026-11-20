@@ -209,6 +209,60 @@ def test_snapshot_records_provenance_generation_and_immutable_format(
             conn.execute("DELETE FROM public_offers")
 
 
+@pytest.mark.parametrize(
+    "changed", ["missing blob", "corrupt blob", "missing observation", "changed observation"]
+)
+def test_historical_corroboration_must_survive_final_admission(
+    tmp_path: Path, stored: StoredFixture, monkeypatch: pytest.MonkeyPatch, changed: str
+) -> None:
+    publisher, reader, _ = setup_storage(tmp_path)
+    item = stored.row()
+    primary, earlier = item.context.known_artifacts
+    assert primary.artifact_id != earlier.artifact_id
+    publisher.build(release("before", item), conn=stored.conn, store=stored.run.store)
+    load = builder._load_candidate
+
+    def load_then_change(
+        conn: Connection,
+        store: ArtifactStore,
+        offer_id: str,
+        manifest: PublishedSnapshot,
+        *,
+        allow_fixture: bool,
+    ) -> SnapshotCandidate:
+        candidate = load(conn, store, offer_id, manifest, allow_fixture=allow_fixture)
+        paths = corroborated_paths(candidate.offer, candidate.context)
+        assert earlier.fetch_run_id in {path.capture_id for path in paths}
+        blob = store._blob_path(earlier.artifact_id)
+        if changed == "missing blob":
+            blob.unlink()
+        elif changed == "corrupt blob":
+            blob.chmod(0o600)
+            blob.write_bytes(b"!" * earlier.byte_length)
+            blob.chmod(0o400)
+        elif changed == "missing observation":
+            store._observation_path(earlier.fetch_run_id, earlier.source_url).unlink()
+        else:
+            observation = store._observation_path(earlier.fetch_run_id, earlier.source_url)
+            observation.chmod(0o600)
+            amended = earlier.model_copy(
+                update={"fetched_at": earlier.fetched_at + timedelta(seconds=1)}
+            )
+            observation.write_text(amended.model_dump_json(), encoding="utf-8")
+            observation.chmod(0o400)
+        assert store.get_observation(primary.fetch_run_id, primary.source_url) == primary
+        assert store.read(primary)
+        return candidate
+
+    monkeypatch.setattr(builder, "_load_candidate", load_then_change)
+    with pytest.raises(SnapshotError, match="could not verify persisted evidence"):
+        publisher.build(
+            release("after", item, supersedes="before"), conn=stored.conn, store=stored.run.store
+        )
+    assert reader.read(at=_BIRTH).info.snapshot_id == "before"
+    assert not (publisher.root / "versions" / "after").exists()
+
+
 def test_a_dated_t014_human_approval_is_exported_without_web_access_to_worker(
     tmp_path: Path, stored: StoredFixture
 ) -> None:

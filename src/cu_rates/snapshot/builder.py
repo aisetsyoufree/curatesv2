@@ -15,13 +15,15 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.exc import SQLAlchemyError
 
 from cu_rates.adapters.registry import verify_offer_against_stored_bytes
-from cu_rates.artifact_store import ArtifactStore, ArtifactStoreError
+from cu_rates.artifact_store import ArtifactCorruptError, ArtifactStore, ArtifactStoreError
 from cu_rates.contracts.audit import PublishedSnapshot, ReviewDecision, snapshot_manifest_sha256
 from cu_rates.contracts.base import ContractModel, Identifier
 from cu_rates.contracts.enums import OfferStatus, ReviewSubject
+from cu_rates.contracts.evidence import RawArtifact
 from cu_rates.contracts.fingerprints import OfferSnapshot, offer_fingerprints
 from cu_rates.contracts.offers import NormalizedOffer
 from cu_rates.contracts.publication import (
+    EvidencePath,
     Placement,
     PublicationContext,
     _origin,
@@ -131,9 +133,9 @@ def _load_candidate(
     primary = next(
         (
             artifact
-            for artifact in view.context.known_artifacts
-            if artifact.fetched_at == view.offer.observed_at
-            and artifact.artifact_id in {ref.artifact_id for ref in view.offer.iter_provenance()}
+            for ref in view.offer.iter_provenance()
+            if (artifact := view.context.artifact_for(ref.artifact_id)) is not None
+            and artifact.fetched_at == view.offer.observed_at
         ),
         None,
     )
@@ -178,7 +180,13 @@ def _without_provenance(value: JsonValue) -> JsonValue:
     return value
 
 
-def _public_projection(row: SnapshotCandidate, placement: Placement, reviewed: bool) -> PublicOffer:
+def _public_projection(
+    row: SnapshotCandidate,
+    placement: Placement,
+    reviewed: bool,
+    *,
+    paths: tuple[EvidencePath, ...] | None = None,
+) -> PublicOffer:
     offer, ctx = row.offer, row.context
     if offer.valid_until is None:
         raise SnapshotError("offer has no independently enforceable expiry")
@@ -191,7 +199,8 @@ def _public_projection(row: SnapshotCandidate, placement: Placement, reviewed: b
         PublicEvidence(path=path, artifact_id=ref.artifact_id, locator=ref.locator)
         for path, ref in offer.iter_labeled_provenance()
     }
-    paths = corroborated_paths(offer, ctx)
+    if paths is None:
+        paths = corroborated_paths(offer, ctx)
     evidence.update(
         PublicEvidence(path=p.path, artifact_id=p.artifact_id, locator=p.provenance.locator)
         for p in paths
@@ -259,7 +268,32 @@ def _public_projection(row: SnapshotCandidate, placement: Placement, reviewed: b
     )
 
 
-def _admit(row: SnapshotCandidate, manifest: PublishedSnapshot) -> PublicOffer:
+def _recheck_admission_evidence(
+    store: ArtifactStore,
+    ctx: PublicationContext,
+    paths: tuple[EvidencePath, ...],
+    primary_artifacts: tuple[RawArtifact, ...],
+) -> None:
+    """Re-read both T045's direct evidence and the selected corroboration observations."""
+    artifacts = {(item.artifact_id, item.fetch_run_id): item for item in primary_artifacts}
+    for path in paths:
+        key = (path.artifact_id, path.capture_id)
+        if key in artifacts:
+            continue
+        artifact = ctx.artifact_for(path.artifact_id, capture_id=path.capture_id)
+        if artifact is None:
+            raise ArtifactCorruptError("corroborating capture is missing from verified evidence")
+        artifacts[key] = artifact
+    for artifact in artifacts.values():
+        # Render responses can originate at a distinct approved URL in the same fetch.
+        if store.get_observation(artifact.fetch_run_id, artifact.source_url) != artifact:
+            raise ArtifactCorruptError("capture does not match verified metadata")
+        store.read(artifact)  # verifies the content address and length
+
+
+def _admit(
+    row: SnapshotCandidate, manifest: PublishedSnapshot, store: ArtifactStore
+) -> PublicOffer:
     offer = row.offer
     ctx = PublicationContext.model_validate(
         {
@@ -284,18 +318,25 @@ def _admit(row: SnapshotCandidate, manifest: PublishedSnapshot) -> PublicOffer:
         )
 
     decision = evaluate_publication(offer, ctx)
+    paths = corroborated_paths(offer, ctx)
     reviewed = (
         review is not None
         and offer.observed_at <= review.decided_at
         and review.review_id in manifest.review_ids
         and review.reviewed_fingerprints == offer_fingerprints(offer)
-        and review.reviewed_evidence_sha256
-        == publication_evidence_sha256(offer, corroborated_paths(offer, ctx))
+        and review.reviewed_evidence_sha256 == publication_evidence_sha256(offer, paths)
     )
     if not decision.publishable_now or decision.placement is Placement.NONE:
         reasons = ", ".join(reason.value for reason in decision.reasons)
         raise SnapshotError(f"publication gate refused offer: {offer.offer_id}: {reasons}")
 
+    # T045 verifies this offer's direct capture, not the other proven
+    # corroboration observations (which may have the same content address).
+    primary_artifacts = tuple(
+        artifact
+        for artifact in ctx.known_artifacts
+        if ctx.artifact_for(artifact.artifact_id) == artifact
+    )
     proof = validate_offer(
         offer.model_copy(update={"status": OfferStatus.CANDIDATE, "published_at": None}),
         ValidationContext(
@@ -303,7 +344,7 @@ def _admit(row: SnapshotCandidate, manifest: PublishedSnapshot) -> PublicOffer:
             source=ctx.source,
             product=ctx.product,
             fetch_runs=ctx.fetch_runs,
-            artifacts=ctx.known_artifacts,
+            artifacts=primary_artifacts,
             candidates=row.candidates,
         ),
     )
@@ -317,7 +358,8 @@ def _admit(row: SnapshotCandidate, manifest: PublishedSnapshot) -> PublicOffer:
     placement = decision.placement
     if placement is Placement.RANKED and (decision.degraded or proof.comparison_blockers):
         placement = Placement.BROWSE_ONLY
-    return _public_projection(row, placement, reviewed)
+    _recheck_admission_evidence(store, ctx, paths, primary_artifacts)
+    return _public_projection(row, placement, reviewed, paths=paths)
 
 
 def _write_database(path: Path, info: SnapshotInfo, offers: tuple[PublicOffer, ...]) -> None:
@@ -392,6 +434,7 @@ class SnapshotPublisher:
                                 allow_fixture=self._allow_fixture,
                             ),
                             manifest,
+                            store,
                         )
                         for entry in manifest.entries
                     ),
