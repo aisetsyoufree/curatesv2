@@ -131,9 +131,9 @@ def _load_candidate(
     primary = next(
         (
             artifact
-            for artifact in view.context.known_artifacts
-            if artifact.fetched_at == view.offer.observed_at
-            and artifact.artifact_id in {ref.artifact_id for ref in view.offer.iter_provenance()}
+            for ref in view.offer.iter_provenance()
+            if (artifact := view.context.artifact_for(ref.artifact_id)) is not None
+            and artifact.fetched_at == view.offer.observed_at
         ),
         None,
     )
@@ -303,7 +303,13 @@ def _admit(row: SnapshotCandidate, manifest: PublishedSnapshot) -> PublicOffer:
             source=ctx.source,
             product=ctx.product,
             fetch_runs=ctx.fetch_runs,
-            artifacts=ctx.known_artifacts,
+            # T045 verifies this offer's direct capture, not the other proven
+            # corroboration observations (which may have the same content address).
+            artifacts=tuple(
+                artifact
+                for artifact in ctx.known_artifacts
+                if ctx.artifact_for(artifact.artifact_id) == artifact
+            ),
             candidates=row.candidates,
         ),
     )

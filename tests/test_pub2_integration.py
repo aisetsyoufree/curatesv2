@@ -1,10 +1,18 @@
 """Publication uses stored capture history, never an inferred second observation."""
 
+from collections.abc import Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import pytest
+from pydantic import ValidationError
 from sqlalchemy import select
 
+from cu_rates.artifact_store import ArtifactNotFoundError
+from cu_rates.contracts.audit import Correction
+from cu_rates.contracts.enums import OfferStatus
+from cu_rates.contracts.evidence import RawArtifact
+from cu_rates.contracts.fingerprints import offer_fingerprints
 from cu_rates.contracts.publication import ReasonCode as R
 from cu_rates.contracts.publication import (
     corroborated_paths,
@@ -13,8 +21,10 @@ from cu_rates.contracts.publication import (
 )
 from cu_rates.db import open_operational_database
 from cu_rates.db.schema import slice_snapshot_baselines
-from cu_rates.pipeline.slice import run_fixture
-from cu_rates.pipeline.trusted import load_publication_context, publish
+from cu_rates.fetch_policy import FetchRegistry, TermsLedger
+from cu_rates.pipeline.slice import _Clock, _worker, record_fixture_capture, run_fixture
+from cu_rates.pipeline.trusted import insert_reobservation, load_publication_context, publish
+from cu_rates.snapshot import Denylist, SnapshotReader
 from cu_rates.snapshot.builder import SnapshotCandidate, SnapshotPublisher, _public_projection
 
 from .pub2_fixtures import reviewed_fixture
@@ -139,7 +149,7 @@ def test_a_stale_single_capture_review_is_not_attached_to_an_automatic_publicati
     assert {o.review_status for o in view.offers} == {"automatic"}
 
 
-def test_repeated_bytes_in_two_runs_do_not_make_independent_evidence(tmp_path: Path) -> None:
+def test_repeated_bytes_one_hour_apart_are_not_independent_evidence(tmp_path: Path) -> None:
     from .test_vertical_slice import _dated_body, _later_200
 
     run = run_fixture(tmp_path)
@@ -158,8 +168,233 @@ def test_repeated_bytes_in_two_runs_do_not_make_independent_evidence(tmp_path: P
     assert not decision.publishable_now
 
 
+@pytest.fixture
+def repeated_capture(
+    tmp_path: Path,
+) -> Iterator[tuple[StoredFixture, SnapshotCandidate]]:
+    worker_root = tmp_path / "worker"
+    run = run_fixture(worker_root)
+    offer = run.offers["purchase-30-year"]
+    engine = open_operational_database(run.database)
+    with engine.begin() as conn:
+        first = load_publication_context(
+            conn,
+            offer.offer_id,
+            offer.observed_at + timedelta(minutes=1),
+            store=run.store,
+            allow_fixture=True,
+        )
+        original = first.context.known_artifacts[0]
+        profile = first.context.approved_profile
+        assert profile is not None
+    # A cold worker issues a separate unconditional request through the offline
+    # transport. Do not create a second FetchRun by cloning the original record.
+    now = original.fetched_at + timedelta(hours=3)
+    registry = FetchRegistry(
+        run.database,
+        TermsLedger(worker_root / "private" / "terms.json"),
+        Denylist(worker_root / "independent" / "withdrawals.json"),
+        automatic=None,
+    )
+    cold_root = tmp_path / "cold-worker"
+    cold_root.mkdir()
+    worker = _worker(cold_root, run.store, _Clock(now), run.store.read(original), registry)
+    direct = worker.fetch(first.context.source, profile)
+    assert direct.artifact is not None and direct.run is not None
+    assert direct.artifact.artifact_id == original.artifact_id
+    assert direct.run.run_id != original.fetch_run_id
+    with engine.begin() as conn:
+        record_fixture_capture(conn, "athol-style-dated", run.store, direct.run, direct.artifact)
+        stored = StoredFixture(run, conn)
+        yield stored, stored.row(now=direct.run.finished_at + timedelta(minutes=1))
+    engine.dispose()
+
+
+def test_identical_bodies_publish_with_two_independent_captures(
+    tmp_path: Path, repeated_capture: tuple[StoredFixture, SnapshotCandidate]
+) -> None:
+    stored, row = repeated_capture
+    offer, ctx = row.offer, row.context
+    assert len(ctx.known_artifacts) == 2
+    newest, oldest = ctx.known_artifacts
+    assert newest.artifact_id == oldest.artifact_id
+    assert newest.fetch_run_id == ctx.primary_capture_id
+    assert newest.fetched_at - oldest.fetched_at >= timedelta(hours=3)
+    assert offer.observed_at == newest.fetched_at
+    assert ctx.artifact_for(newest.artifact_id) == newest
+    paths = corroborated_paths(offer, ctx)
+    assert len(paths) == 6
+    assert {p.capture_id for p in paths} == {newest.fetch_run_id, oldest.fetch_run_id}
+    assert evaluate_publication(offer, ctx).ranking_eligible
+
+    public_root = tmp_path / "public"
+    publisher = SnapshotPublisher(public_root, allow_fixture=True)
+    publisher.build(release("identical-bodies", row), conn=stored.conn, store=stored.run.store)
+    denylist = Denylist(tmp_path / "public-denylist" / "withdrawals.json")
+    denylist.initialize()
+    (visible,) = SnapshotReader(public_root, denylist.path).read(at=ctx.evaluated_at).offers
+    assert {p.capture_id for p in visible.require_protocol2().publication_evidence} == {
+        newest.fetch_run_id,
+        oldest.fetch_run_id,
+    }
+
+
+def test_content_lookup_cannot_guess_or_swap_primary_capture(
+    repeated_capture: tuple[StoredFixture, SnapshotCandidate],
+) -> None:
+    _, row = repeated_capture
+    offer, ctx = row.offer, row.context
+    latest, earlier = ctx.known_artifacts
+    assert evaluate_publication(
+        offer, ctx.model_copy(update={"known_artifacts": (earlier, latest)})
+    ).ranking_eligible
+    for run_id, reason in (
+        (None, R.ARTIFACT_NOT_STORED),
+        (earlier.fetch_run_id, R.OBSERVATION_UNBOUND),
+    ):
+        decision = evaluate_publication(
+            offer, ctx.model_copy(update={"primary_capture_id": run_id})
+        )
+        assert reason in decision.reasons
+        assert not decision.publishable_now
+    with pytest.raises(ValidationError, match="duplicate known artifact"):
+        type(ctx).model_validate({**dict(ctx), "known_artifacts": (latest, latest)})
+
+
+def test_unverifiable_basis_cannot_fall_back_to_an_older_identical_capture(
+    repeated_capture: tuple[StoredFixture, SnapshotCandidate], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stored, row = repeated_capture
+    latest, earlier = row.context.known_artifacts
+    get_observation = stored.run.store.get_observation
+
+    def without_latest(fetch_run_id: str, source_url: str) -> RawArtifact:
+        if fetch_run_id == latest.fetch_run_id:
+            raise ArtifactNotFoundError("latest observation record is missing")
+        return get_observation(fetch_run_id, source_url)
+
+    monkeypatch.setattr(stored.run.store, "get_observation", without_latest)
+    view = load_publication_context(
+        stored.conn,
+        row.offer.offer_id,
+        row.context.evaluated_at,
+        store=stored.run.store,
+        allow_fixture=True,
+    )
+    assert view.offer.status is OfferStatus.QUARANTINED
+    assert view.context.primary_capture_id == latest.fetch_run_id
+    assert view.context.known_artifacts == (earlier,)
+    assert view.context.artifact_for(latest.artifact_id) is None
+    assert not view.context.source_fingerprints
+    assert not evaluate_publication(view.offer, view.context).publishable_now
+
+
+def test_identical_body_cannot_borrow_a_foreign_capture(
+    repeated_capture: tuple[StoredFixture, SnapshotCandidate],
+) -> None:
+    _, row = repeated_capture
+    offer, ctx = row.offer, row.context
+    latest, earlier = ctx.known_artifacts
+    for artifacts, runs in (
+        (
+            (latest, earlier.model_copy(update={"source_url": "https://other.example/rates"})),
+            ctx.fetch_runs,
+        ),
+        (
+            (latest, earlier),
+            tuple(
+                run.model_copy(update={"source_id": "other-source"})
+                if run.run_id == earlier.fetch_run_id
+                else run
+                for run in ctx.fetch_runs
+            ),
+        ),
+    ):
+        decision = evaluate_publication(
+            offer, ctx.model_copy(update={"known_artifacts": artifacts, "fetch_runs": runs})
+        )
+        assert R.EVIDENCE_PATH_NON_AUTHORITATIVE in decision.reasons
+        assert not decision.publishable_now
+
+
+def test_identical_body_cannot_borrow_older_layout(
+    repeated_capture: tuple[StoredFixture, SnapshotCandidate],
+) -> None:
+    _, row = repeated_capture
+    offer, ctx = row.offer, row.context
+    _, earlier = ctx.known_artifacts
+    (fingerprint,) = ctx.source_fingerprints
+    old_layout = fingerprint.model_copy(
+        update={"fetch_run_id": earlier.fetch_run_id, "observed_at": earlier.fetched_at}
+    )
+    decision = evaluate_publication(
+        offer, ctx.model_copy(update={"source_fingerprints": (old_layout,)})
+    )
+    assert R.LAYOUT_UNREVIEWED in decision.reasons
+    assert not decision.publishable_now
+
+
+def test_correction_uses_primary_capture_even_with_an_identical_older_blob(
+    repeated_capture: tuple[StoredFixture, SnapshotCandidate],
+) -> None:
+    _, row = repeated_capture
+    offer, ctx = row.offer, row.context
+    assert offer.note_rate is not None
+    _, earlier = ctx.known_artifacts
+    correction = Correction(
+        schema_version="1.0",
+        correction_id="fixture-correction",
+        offer_id=offer.offer_id,
+        field_path="note_rate",
+        previous_value="6.000",
+        corrected_value=format(offer.note_rate.value, "f"),
+        actor="fixture-reviewer",
+        corrected_at=earlier.fetched_at + timedelta(minutes=1),
+        reason="Require direct evidence after the correction.",
+        evidence=(offer.note_rate.provenance,),
+        corrected_fingerprints=offer_fingerprints(offer),
+    )
+    decision = evaluate_publication(offer, ctx.model_copy(update={"corrections": (correction,)}))
+    assert R.CORRECTION_PENDING not in decision.reasons
+    assert decision.publishable_now
+
+
+def test_independent_worker_304_cannot_be_second_body(tmp_path: Path) -> None:
+    run = run_fixture(tmp_path)
+    offer = run.offers["purchase-30-year"]
+    now = offer.observed_at + timedelta(hours=4)
+    engine = open_operational_database(run.database)
+    with engine.connect() as conn:
+        first = load_publication_context(
+            conn, offer.offer_id, now, store=run.store, allow_fixture=True
+        )
+    artifact = first.context.known_artifacts[0]
+    profile = first.context.approved_profile
+    assert profile is not None
+    registry = FetchRegistry(
+        run.database,
+        TermsLedger(tmp_path / "private" / "terms.json"),
+        Denylist(tmp_path / "independent" / "withdrawals.json"),
+        automatic=None,
+    )
+    # Reopen the original worker state: the same strong validator gives a real mock 304.
+    worker = _worker(tmp_path, run.store, _Clock(now), run.store.read(artifact), registry)
+    result = worker.fetch(first.context.source, profile)
+    assert result.reobserved is not None and result.artifact is None
+    with engine.begin() as conn:
+        observation = result.reobserved.record()
+        insert_reobservation(conn, observation)
+        view = load_publication_context(
+            conn, offer.offer_id, observation.observed_at, store=run.store, allow_fixture=True
+        )
+    assert view.context.reobservations == (observation,)
+    assert len(view.context.known_artifacts) == 1
+    assert {p.capture_id for p in view.context.evidence_paths} == {artifact.fetch_run_id}
+    assert R.INSUFFICIENT_EVIDENCE_PATHS in evaluate_publication(view.offer, view.context).reasons
+    engine.dispose()
+
+
 def test_unverified_current_capture_cannot_borrow_verified_history(tmp_path: Path) -> None:
-    from cu_rates.contracts.enums import OfferStatus
     from cu_rates.pipeline.trusted import insert_artifact, insert_capture, insert_run
 
     run = reviewed_fixture(tmp_path)
