@@ -495,6 +495,7 @@ class PublicationContext(ContractModel):
     source_approval: SourceApproval | None = None
     validation_policy: ValidationPolicy | None = None
     approved_parsers: tuple[ParserVersion, ...] = ()
+    primary_capture_id: Identifier | None = None
     known_artifacts: tuple[RawArtifact, ...] = ()
     fetch_runs: tuple[FetchRun, ...] = ()
     reobservations: tuple[NotModifiedObservation, ...] = ()
@@ -516,7 +517,7 @@ class PublicationContext(ContractModel):
         """Duplicates would be silently collapsed or shadowed by lookups; reject them."""
         keyed: dict[str, list[object]] = {
             "approved parser": [(p.name, p.version) for p in self.approved_parsers],
-            "known artifact": [a.artifact_id for a in self.known_artifacts],
+            "known artifact": [(a.artifact_id, a.fetch_run_id) for a in self.known_artifacts],
             "fetch run": [
                 *(r.run_id for r in self.fetch_runs),
                 *(o.run_id for o in self.reobservations),
@@ -541,6 +542,22 @@ class PublicationContext(ContractModel):
             if len(set(keys)) != len(keys):
                 raise ValueError(f"duplicate {label} in publication context")
         return self
+
+    def artifact_for(
+        self, artifact_id: str, *, capture_id: str | None = None
+    ) -> RawArtifact | None:
+        """Resolve bytes in an explicit capture, or the trusted loader's basis run.
+
+        Offer provenance names a content address, not a fetch. Legacy inputs without
+        a basis may resolve an unambiguous address only; never guess among captures.
+        """
+        run_id = capture_id if capture_id is not None else self.primary_capture_id
+        matches = [
+            item
+            for item in self.known_artifacts
+            if item.artifact_id == artifact_id and (run_id is None or item.fetch_run_id == run_id)
+        ]
+        return matches[0] if len(matches) == 1 else None
 
 
 class PublicationDecision(ContractModel):
@@ -855,12 +872,11 @@ def _artifact_reasons(
 
 def _evidence_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[ReasonCode]:
     reasons: set[ReasonCode] = set()
-    stored = {artifact.artifact_id: artifact for artifact in ctx.known_artifacts}
     approved = set(ctx.approved_parsers)
     used: dict[str, datetime] = {}
     for provenance in offer.iter_provenance():
         locator = provenance.locator
-        primary_artifact = stored.get(provenance.artifact_id)
+        primary_artifact = ctx.artifact_for(provenance.artifact_id)
         referenced = [(provenance.artifact_id, True)]
         if isinstance(locator, RenderedDomLocator):
             if ctx.approved_profile is None or (
@@ -869,9 +885,18 @@ def _evidence_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[Re
                 reasons.add(R.PROFILE_UNAPPROVED)
             referenced += [(response_id, False) for response_id in locator.response_ids]
         for artifact_id, primary in referenced:
-            artifact = stored.get(artifact_id)
+            artifact = (
+                primary_artifact
+                if primary
+                else ctx.artifact_for(
+                    artifact_id,
+                    capture_id=primary_artifact.fetch_run_id if primary_artifact else None,
+                )
+            )
             if artifact is None:
                 reasons.add(R.ARTIFACT_NOT_STORED)
+                if not primary and any(a.artifact_id == artifact_id for a in ctx.known_artifacts):
+                    reasons.add(R.FETCH_NOT_VERIFIED)
                 continue
             observed, unproven = (
                 _reobservation_basis(artifact, offer, ctx) if primary else (None, False)
@@ -949,7 +974,7 @@ def _path_reasons(
     p: EvidencePath, offer: NormalizedOffer, ctx: PublicationContext
 ) -> set[ReasonCode]:
     reasons: set[ReasonCode] = set()
-    artifact = next((a for a in ctx.known_artifacts if a.artifact_id == p.artifact_id), None)
+    artifact = ctx.artifact_for(p.artifact_id, capture_id=p.capture_id)
     if (
         artifact is None
         or p.source_id != offer.source_id
@@ -1010,8 +1035,6 @@ def _pair_reasons(p1: EvidencePath, p2: EvidencePath) -> set[ReasonCode]:
     # Separate guards deliberately: each identity is independently necessary.
     # D-20: identical bytes are fine in principle (a static page); what must differ is the fetch,
     # and the two fetches must be far enough apart to be independent observations.
-    # NOTE: the trusted loader and artifact lookups still key on artifact_id, so identical bytes
-    # from two runs fail closed end to end until that lookup is capture-aware (issue #143).
     if p1.capture_id == p2.capture_id:
         reasons.add(R.DUPLICATE_EVIDENCE_CAPTURE)
     if abs(p1.observed_at - p2.observed_at) < DUAL_EVIDENCE_MIN_SPACING:
@@ -1216,9 +1239,8 @@ def _correction_evidence_is_current(
     bound = {
         item for label, item in offer.iter_labeled_provenance() if label in (path, f"fields.{path}")
     }
-    stored = {artifact.artifact_id: artifact for artifact in ctx.known_artifacts}
     for item in correction.evidence:
-        capture = stored.get(item.artifact_id)
+        capture = ctx.artifact_for(item.artifact_id)
         if (
             item not in bound
             or not _field_excerpt_matches(offer, path, actual, item.source_text)
@@ -1233,10 +1255,9 @@ def _correction_evidence_is_current(
 
 def _proven_refresh(offer: NormalizedOffer, ctx: PublicationContext) -> bool:
     """True when a fully proven 304, and no unproven one, is this offer's observation."""
-    stored = {artifact.artifact_id: artifact for artifact in ctx.known_artifacts}
     proven = False
     for item in offer.iter_provenance():
-        artifact = stored.get(item.artifact_id)
+        artifact = ctx.artifact_for(item.artifact_id)
         if artifact is None:
             continue
         claimed = [
@@ -1286,25 +1307,23 @@ def _layout_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[Reas
         or approval.adapter not in ctx.approved_parsers
     ):
         return {R.LAYOUT_UNREVIEWED}
-    stored = {artifact.artifact_id: artifact for artifact in ctx.known_artifacts}
     cited = {
-        item.artifact_id
+        artifact
         for item in offer.iter_provenance()
-        if (artifact := stored.get(item.artifact_id)) is not None
+        if (artifact := ctx.artifact_for(item.artifact_id)) is not None
         and artifact.source_url == ctx.source.url
     }
     if not cited:
         return {R.LAYOUT_UNREVIEWED}
     if any(item.extraction.parser != approval.adapter for item in offer.iter_provenance()):
         return {R.LAYOUT_UNREVIEWED}
-    for artifact_id in cited:
-        artifact = stored[artifact_id]
+    for artifact in cited:
         match = next(
             (
                 fingerprint
                 for fingerprint in ctx.source_fingerprints
                 if fingerprint.source_id == offer.source_id
-                and fingerprint.artifact_id == artifact_id
+                and fingerprint.artifact_id == artifact.artifact_id
                 and fingerprint.fetch_run_id == artifact.fetch_run_id
                 and fingerprint.content_sha256 == artifact.artifact_id
                 and fingerprint.structure_sha256 == approval.approved_layout_sha256
@@ -1492,7 +1511,6 @@ def _verified_scenario_matches(
 ) -> tuple[tuple[DimensionMatch, ...], set[ReasonCode]]:
     """Rank only independently verified statements tied to the current rate capture."""
     assert offer.scenario_id is not None
-    stored = {artifact.artifact_id: artifact for artifact in ctx.known_artifacts}
     verified = {
         (proof.dimension, proof.fetch_run_id): proof
         for proof in ctx.verified_scenario_statements
@@ -1502,7 +1520,7 @@ def _verified_scenario_matches(
     rate_runs = {
         capture.fetch_run_id
         for _, rate in offer.rate_items()
-        if (capture := stored.get(rate.provenance.artifact_id)) is not None
+        if (capture := ctx.artifact_for(rate.provenance.artifact_id)) is not None
     }
     scenario = CANONICAL_SCENARIOS[offer.scenario_id]
     reasons: set[ReasonCode] = set()
@@ -1512,7 +1530,7 @@ def _verified_scenario_matches(
             adjusted.append(match)
             continue
         provenance = match.provenance
-        capture = stored.get(provenance.artifact_id) if provenance is not None else None
+        capture = ctx.artifact_for(provenance.artifact_id) if provenance is not None else None
         proof = (
             verified.get((match.dimension, capture.fetch_run_id)) if capture is not None else None
         )
@@ -1529,7 +1547,7 @@ def _verified_scenario_matches(
             or not statement_matches_excerpt(match.dimension, match.stated, provenance.source_text)
             or _reobservation_basis(capture, offer, ctx) != (offer.observed_at, False)
         ):
-            if provenance is not None and provenance.artifact_id not in stored:
+            if provenance is not None and capture is None:
                 reasons.add(R.ARTIFACT_NOT_STORED)
             adjusted.append(
                 match.model_copy(update={"state": MatchState.UNSTATED, "source_text": None})
@@ -1542,11 +1560,10 @@ def _verified_scenario_matches(
 
 
 def _verified_conditions(offer: NormalizedOffer, ctx: PublicationContext) -> bool:
-    captures = {artifact.artifact_id: artifact for artifact in ctx.known_artifacts}
     rate_runs = {
         capture.fetch_run_id
         for _, rate in offer.rate_items()
-        if (capture := captures.get(rate.provenance.artifact_id)) is not None
+        if (capture := ctx.artifact_for(rate.provenance.artifact_id)) is not None
     }
     proofs = {
         item.condition.condition_id: item
@@ -1555,7 +1572,7 @@ def _verified_conditions(offer: NormalizedOffer, ctx: PublicationContext) -> boo
     }
     for condition in offer.conditions:
         proven = proofs.get(condition.condition_id)
-        capture = captures.get(condition.provenance.artifact_id)
+        capture = ctx.artifact_for(condition.provenance.artifact_id)
         if (
             condition.scenario_state is not MatchState.MATCHES
             or proven is None
