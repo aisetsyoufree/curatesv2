@@ -184,6 +184,10 @@ HTML_SHA256 = hashlib.sha256(HTML_CONTENT).hexdigest()
 NOTE_RATE_TEXT_SHA = hashlib.sha256(b"6.125%").hexdigest()
 APR_TEXT_SHA = hashlib.sha256(b"6.250%").hexdigest()
 POINTS_TEXT_SHA = hashlib.sha256(b"0 points").hexdigest()
+PURPOSE_TEXT = "30-Year Fixed Purchase"
+PURPOSE_TEXT_SHA = hashlib.sha256(PURPOSE_TEXT.encode("utf-8")).hexdigest()
+TERM_TEXT = "30 Years"
+TERM_TEXT_SHA = hashlib.sha256(TERM_TEXT.encode("utf-8")).hexdigest()
 
 HELOC_NOTE_RATE_SHA = hashlib.sha256(b"7.500%").hexdigest()
 HELOC_APR_SHA = hashlib.sha256(b"7.750%").hexdigest()
@@ -372,6 +376,8 @@ def _build_valid_30y_candidate(
             "note_rate": "6.125%",
             "apr": "6.250%",
             "points": "0 points",
+            "term_months": TERM_TEXT,
+            "loan_purpose": PURPOSE_TEXT,
         },
         "locators": {
             "note_rate": {
@@ -391,6 +397,19 @@ def _build_valid_30y_candidate(
                 "selector_type": "css",
                 "selector": "#row-001 > td:nth-child(5)",
                 "normalized_text_sha256": POINTS_TEXT_SHA,
+            },
+            # Term and purpose are material claims: each is located in its own cell.
+            "term_months": {
+                "kind": "html",
+                "selector_type": "css",
+                "selector": "#row-001 > td:nth-child(2)",
+                "normalized_text_sha256": TERM_TEXT_SHA,
+            },
+            "loan_purpose": {
+                "kind": "html",
+                "selector_type": "css",
+                "selector": "#row-001 > td:nth-child(1)",
+                "normalized_text_sha256": PURPOSE_TEXT_SHA,
             },
         },
         "observed_at": T0.isoformat(),
@@ -546,13 +565,6 @@ def test_stage_heloc_candidate_clean_staging(env: tuple[Engine, ArtifactStore, P
         "product_family": "heloc",
         "note_rate": "7.500",
         "apr": "7.750",
-        "heloc_terms": {
-            "index_name": "Prime",
-            "index_rate": "7.500",
-            "margin": "0.250",
-            "max_cltv": "80",
-            "lien_position": "second",
-        },
         "raw_text": "Home Equity Line of Credit Prime 7.500% 7.750%",
         "field_raw_texts": {
             "note_rate": "7.500%",
@@ -697,7 +709,12 @@ def test_unknown_points_vs_explicit_zero_points(
         "apr": "6.250",
         "points": None,  # Preserves missing / unknown points
         "raw_text": "30-Year Fixed Purchase 30 Years 6.125% 6.250%",
-        "field_raw_texts": {"note_rate": "6.125%", "apr": "6.250%"},
+        "field_raw_texts": {
+            "note_rate": "6.125%",
+            "apr": "6.250%",
+            "term_months": TERM_TEXT,
+            "loan_purpose": PURPOSE_TEXT,
+        },
         "locators": {
             "note_rate": {
                 "kind": "html",
@@ -710,6 +727,18 @@ def test_unknown_points_vs_explicit_zero_points(
                 "selector_type": "css",
                 "selector": "#row-001 > td:nth-child(4)",
                 "normalized_text_sha256": APR_TEXT_SHA,
+            },
+            "term_months": {
+                "kind": "html",
+                "selector_type": "css",
+                "selector": "#row-001 > td:nth-child(2)",
+                "normalized_text_sha256": TERM_TEXT_SHA,
+            },
+            "loan_purpose": {
+                "kind": "html",
+                "selector_type": "css",
+                "selector": "#row-001 > td:nth-child(1)",
+                "normalized_text_sha256": PURPOSE_TEXT_SHA,
             },
         },
         "observed_at": T0.isoformat(),
@@ -818,6 +847,86 @@ def test_holds_for_ambiguous_and_unsupported_locators(
             select(staged_rate_candidates).where(staged_rate_candidates.c.disposition == "held")
         ).all()
         assert len(held_rows) == 2
+
+
+def test_unverified_claims_and_unsupported_paths_hold_with_payload_retained(
+    env: tuple[Engine, ArtifactStore, Path, Path],
+) -> None:
+    """Model values without verified evidence hold under stable codes and stay auditable."""
+    engine, store, _, _ = env
+    stager = RateBatchStager(engine, store, clock=lambda: T1)
+
+    # A claimed term whose own locator is missing: the headline locators no longer carry it.
+    cand_unlocated_term = _build_valid_30y_candidate(candidate_id="cand-term-unlocated")
+    del cand_unlocated_term["locators"]["term_months"]
+
+    # A locator on an unknown path is never matched generically against raw text.
+    cand_unknown_path = _build_valid_30y_candidate(candidate_id="cand-unknown-path")
+    cand_unknown_path["locators"]["bogus_field"] = dict(cand_unknown_path["locators"]["note_rate"])
+    cand_unknown_path["field_raw_texts"]["bogus_field"] = "6.125%"
+
+    # HELOC attributes are claims too: located headline rate does not verify them.
+    cand_heloc_terms = {
+        "candidate_id": "cand-heloc-terms",
+        "row_id": "row-heloc-001",
+        "institution_charter": CHARTER,
+        "product_id": PRODUCT_HELOC,
+        "source_id": SOURCE_ID,
+        "fetch_run_id": RUN_ID,
+        "artifact_id": HTML_SHA256,
+        "product_family": "heloc",
+        "note_rate": "7.500",
+        "heloc_terms": {"index_name": "Prime", "max_cltv": "80", "lien_position": "second"},
+        "raw_text": "Home Equity Line of Credit Prime 7.500%",
+        "field_raw_texts": {"note_rate": "7.500%"},
+        "locators": {
+            "note_rate": {
+                "kind": "html",
+                "selector_type": "css",
+                "selector": "#row-heloc-001 > td:nth-child(2)",
+                "normalized_text_sha256": HELOC_NOTE_RATE_SHA,
+            }
+        },
+        "observed_at": T0.isoformat(),
+    }
+    observations = [
+        {
+            "institution_charter": CHARTER,
+            "source_id": SOURCE_ID,
+            "source_url": SOURCE_URL,
+            "fetch_run_id": RUN_ID,
+            "observed_at": T0.isoformat(),
+            "artifact_id": HTML_SHA256,
+            "media_type": "text/html; charset=utf-8",
+        }
+    ]
+
+    report = stager.stage(
+        make_envelope_payload(
+            batch_id="batch-unverified-claims",
+            candidates=[cand_unlocated_term, cand_unknown_path, cand_heloc_terms],
+            observations=observations,
+        )
+    )
+
+    assert report.staged == 0
+    assert report.held == 3
+    assert report.rejected == 0
+    assert report.hold_reasons == {
+        HoldReason.EVIDENCE_MISSING.value: 2,
+        HoldReason.LOCATOR_UNSUPPORTED.value: 1,
+    }
+
+    with engine.connect() as conn:
+        rows = {row.candidate_id: row for row in conn.execute(select(staged_rate_candidates)).all()}
+    assert {row.disposition for row in rows.values()} == {"held"}
+    assert rows["cand-term-unlocated"].hold_reason == HoldReason.EVIDENCE_MISSING.value
+    assert rows["cand-term-unlocated"].payload_json["term_months"] == 360
+    assert "term_months" not in rows["cand-term-unlocated"].payload_json["locators"]
+    assert rows["cand-unknown-path"].hold_reason == HoldReason.LOCATOR_UNSUPPORTED.value
+    assert "bogus_field" in rows["cand-unknown-path"].payload_json["locators"]
+    assert rows["cand-heloc-terms"].hold_reason == HoldReason.EVIDENCE_MISSING.value
+    assert rows["cand-heloc-terms"].payload_json["heloc_terms"]["index_name"] == "Prime"
 
 
 def test_missing_artifact_held_at_storage_layer(

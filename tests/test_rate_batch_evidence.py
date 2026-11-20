@@ -28,6 +28,7 @@ import types
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -43,6 +44,7 @@ if "cu_rates.rate_batch.staging" not in sys.modules:
 
 from cu_rates.artifact_store import ArtifactStore
 from cu_rates.contracts.enums import (
+    ConditionKind,
     LienPosition,
     LoanPurpose,
     ProductFamily,
@@ -63,7 +65,9 @@ from cu_rates.rate_batch.locators import (
 )
 from cu_rates.rate_batch.models import (
     BATCH_SCHEMA_VERSION,
+    BatchArmTerms,
     BatchCandidate,
+    BatchCondition,
     BatchDisposition,
     BatchFinding,
     BatchHelocTerms,
@@ -101,7 +105,7 @@ HTML_FIXTURE = (
     </thead>
     <tbody>
       <tr id="row-30y">
-        <td class="prod">30-Year Fixed Conforming</td>
+        <td class="prod">30-Year Fixed Conforming Purchase</td>
         <td class="term">360 Months</td>
         <td class="rate">6.375%</td>
         <td class="apr">6.450%</td>
@@ -200,6 +204,56 @@ def store(tmp_path: Path) -> ArtifactStore:
         fetch_run_id=FETCH_RUN,
     )
     return s
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _css(selector: str, text: str) -> HtmlLocator:
+    return HtmlLocator(selector_type="css", selector=selector, normalized_text_sha256=_sha(text))
+
+
+# Cells of HTML_FIXTURE row-30y by claim path: (column index, exact cell text).
+_ROW30Y_CELLS: dict[str, tuple[int, str]] = {
+    "loan_purpose": (1, "30-Year Fixed Conforming Purchase"),
+    "term_months": (2, "360 Months"),
+    "note_rate": (3, "6.375%"),
+    "apr": (4, "6.450%"),
+    "points": (5, "0 Points"),
+}
+
+
+def _row30y_locators(*paths: str) -> dict[str, Any]:
+    return {
+        path: _css(f"#mortgage-rates tr:nth-child(1) td:nth-child({col})", text)
+        for path in paths
+        for col, text in (_ROW30Y_CELLS[path],)
+    }
+
+
+def _row30y_texts(*paths: str) -> dict[str, str]:
+    return {path: _ROW30Y_CELLS[path][1] for path in paths}
+
+
+def _row30y_candidate(candidate_id: str, paths: tuple[str, ...], **claims: Any) -> BatchCandidate:
+    """A 30-year purchase mortgage on HTML_FIXTURE row-30y; ``paths`` choose located claims."""
+    base: dict[str, Any] = {
+        "candidate_id": candidate_id,
+        "row_id": "row-30y",
+        "institution_charter": CHARTER,
+        "product_id": "mortgage-30y-fixed",
+        "source_id": SOURCE_ID,
+        "fetch_run_id": FETCH_RUN,
+        "artifact_id": HTML_ARTIFACT_ID,
+        "product_family": ProductFamily.MORTGAGE,
+        "raw_text": "30-Year Fixed Conforming Purchase 360 Months 6.375% 6.450% 0 Points",
+        "field_raw_texts": _row30y_texts(*paths),
+        "locators": _row30y_locators(*paths),
+        "observed_at": T0,
+    }
+    base.update(claims)
+    return BatchCandidate(**base)
 
 
 def build_sample_envelope_dict(
@@ -527,48 +581,15 @@ def test_candidate_inherits_neither_freshness_nor_unstated_conditions() -> None:
 
 
 def test_verify_30y_mortgage_staged(store: ArtifactStore) -> None:
-    rate_sha = hashlib.sha256(b"6.375%").hexdigest()
-    apr_sha = hashlib.sha256(b"6.450%").hexdigest()
-    pts_sha = hashlib.sha256(b"0 Points").hexdigest()
-
-    candidate = BatchCandidate(
-        candidate_id="cand-30y-fixed",
-        row_id="row-30y",
-        institution_charter=CHARTER,
-        product_id="mortgage-30y-fixed",
-        source_id=SOURCE_ID,
-        fetch_run_id=FETCH_RUN,
-        artifact_id=HTML_ARTIFACT_ID,
-        product_family=ProductFamily.MORTGAGE,
+    """Every present claim (rates, points, term, purpose) is individually located and stated."""
+    candidate = _row30y_candidate(
+        "cand-30y-fixed",
+        ("loan_purpose", "term_months", "note_rate", "apr", "points"),
         loan_purpose=LoanPurpose.PURCHASE,
         term_months=360,
         note_rate=Decimal("6.375"),
         apr=Decimal("6.450"),
         points=Decimal("0"),
-        raw_text="30-Year Fixed Conforming 360 Months 6.375% 6.450% 0 Points",
-        field_raw_texts={
-            "note_rate": "6.375%",
-            "apr": "6.450%",
-            "points": "0 Points",
-        },
-        locators={
-            "note_rate": HtmlLocator(
-                selector_type="css",
-                selector="#mortgage-rates tr:nth-child(1) td:nth-child(3)",
-                normalized_text_sha256=rate_sha,
-            ),
-            "apr": HtmlLocator(
-                selector_type="css",
-                selector="#mortgage-rates tr:nth-child(1) td:nth-child(4)",
-                normalized_text_sha256=apr_sha,
-            ),
-            "points": HtmlLocator(
-                selector_type="css",
-                selector="#mortgage-rates tr:nth-child(1) td:nth-child(5)",
-                normalized_text_sha256=pts_sha,
-            ),
-        },
-        observed_at=T0,
     )
 
     disposition, reason, msg = verify_batch_item_locators(candidate, store)
@@ -690,50 +711,257 @@ def test_reject_cross_row_mixing(store: ArtifactStore) -> None:
     assert "multiple conflicting table rows" in str(msg)
 
 
-def test_heloc_with_lower_cltv_tier(store: ArtifactStore) -> None:
-    t1_rate_sha = hashlib.sha256(b"7.250%").hexdigest()
+HELOC_T1_PRODUCT = "Home Equity Line of Credit <= 70% CLTV"
+HELOC_T1_SELECTOR = "#heloc-rates tr:nth-child(1) td:nth-child({col})"
 
-    tier_1 = BatchTier(
+
+def _heloc_t1_tier(
+    *,
+    note_rate: Decimal | None = Decimal("7.250"),
+    apr: Decimal | None = None,
+    upper: Decimal = Decimal("70"),
+    dimension: TierDimension = TierDimension.CLTV,
+    lower: Decimal | None = Decimal("0"),
+    col: int = 2,
+    text: str = "7.250%",
+) -> BatchTier:
+    """A tier whose rate cell is in row-heloc-t1; its CLTV bound lives in the product cell."""
+    return BatchTier(
         tier_id="tier-cltv-70",
+        bounds=(BatchTierBound(dimension=dimension, lower=lower, upper=upper),),
+        note_rate=note_rate,
+        apr=apr,
+        raw_text=text,
+        locator=_css(HELOC_T1_SELECTOR.format(col=col), text),
+    )
+
+
+def _heloc_candidate(candidate_id: str, **overrides: Any) -> BatchCandidate:
+    base: dict[str, Any] = {
+        "candidate_id": candidate_id,
+        "row_id": "row-heloc-t1",
+        "institution_charter": CHARTER,
+        "product_id": "heloc-prime",
+        "source_id": SOURCE_ID,
+        "fetch_run_id": FETCH_RUN,
+        "artifact_id": HTML_ARTIFACT_ID,
+        "product_family": ProductFamily.HELOC,
+        "tiers": (_heloc_t1_tier(),),
+        "raw_text": "Home Equity Line of Credit <= 70% CLTV 7.250%",
+        "observed_at": T0,
+    }
+    base.update(overrides)
+    return BatchCandidate(**base)
+
+
+def test_heloc_with_lower_cltv_tier(store: ArtifactStore) -> None:
+    """The tier bound is proven by the row's explicit labeled CLTV criterion, not the rate cell."""
+    candidate = _heloc_candidate("cand-heloc")
+    disposition, reason, _msg = verify_batch_item_locators(candidate, store)
+    assert disposition is BatchDisposition.STAGED
+    assert reason is None
+
+    # The second tier (70.01% - 80% CLTV) stages from its own row.
+    tier_2 = BatchTier(
+        tier_id="tier-cltv-80",
         bounds=(
             BatchTierBound(
-                dimension=TierDimension.CLTV,
+                dimension=TierDimension.CLTV, lower=Decimal("70.01"), upper=Decimal("80")
+            ),
+        ),
+        note_rate=Decimal("7.750"),
+        raw_text="7.750%",
+        locator=_css("#heloc-rates tr:nth-child(2) td:nth-child(2)", "7.750%"),
+    )
+    candidate_2 = _heloc_candidate(
+        "cand-heloc-t2",
+        row_id="row-heloc-t2",
+        tiers=(tier_2,),
+        raw_text="Home Equity Line of Credit 70.01% - 80% CLTV 7.750%",
+    )
+    result_2 = verify_batch_item_locators(candidate_2, store)
+    assert result_2 == (BatchDisposition.STAGED, None, None)
+
+
+def test_tier_bound_must_match_the_rows_labeled_criterion(store: ArtifactStore) -> None:
+    """A tier bound the row does not state (here 80; the row says <= 70% CLTV) is held."""
+    wrong_upper = _heloc_candidate(
+        "cand-tier-wrong-bound", tiers=(_heloc_t1_tier(upper=Decimal("80")),)
+    )
+    disp, reason, msg = verify_batch_item_locators(wrong_upper, store)
+    assert disp is BatchDisposition.HELD
+    assert reason is HoldReason.RAW_TEXT_MISMATCH
+    assert "does not match the row's disclosed criterion" in str(msg)
+
+
+def test_tier_bound_without_labeled_criterion_is_not_proven_by_rate_fragment(
+    store: ArtifactStore,
+) -> None:
+    """The rate fragment (7.250%) never proves a typed bound; a missing FICO criterion holds."""
+    fico_bound = _heloc_candidate(
+        "cand-tier-fico",
+        tiers=(
+            _heloc_t1_tier(
+                dimension=TierDimension.CREDIT_SCORE,
+                lower=Decimal("700"),
+                upper=Decimal("850"),
+            ),
+        ),
+    )
+    disp, reason, msg = verify_batch_item_locators(fico_bound, store)
+    assert disp is BatchDisposition.HELD
+    assert reason is HoldReason.EVIDENCE_MISSING
+    assert "no explicit labeled criterion" in str(msg)
+
+    unsupported = _heloc_candidate(
+        "cand-tier-amount",
+        tiers=(
+            _heloc_t1_tier(
+                dimension=TierDimension.LOAN_AMOUNT,
                 lower=Decimal("0"),
                 upper=Decimal("70"),
             ),
         ),
-        note_rate=Decimal("7.250"),
-        apr=Decimal("7.250"),
-        raw_text="7.250%",
-        locator=HtmlLocator(
-            selector_type="css",
-            selector="#heloc-rates tr:nth-child(1) td:nth-child(2)",
-            normalized_text_sha256=t1_rate_sha,
+    )
+    disp2, reason2, _msg2 = verify_batch_item_locators(unsupported, store)
+    assert disp2 is BatchDisposition.HELD
+    assert reason2 is HoldReason.LOCATOR_UNSUPPORTED
+
+
+def test_tier_cannot_borrow_sibling_cells_for_a_second_rate_claim(store: ArtifactStore) -> None:
+    """One tier locator is one cell; claiming both rate and APR from it is held."""
+    both = _heloc_candidate(
+        "cand-tier-both",
+        tiers=(_heloc_t1_tier(note_rate=Decimal("7.250"), apr=Decimal("7.250")),),
+    )
+    disp, reason, msg = verify_batch_item_locators(both, store)
+    assert disp is BatchDisposition.HELD
+    assert reason is HoldReason.EVIDENCE_AMBIGUOUS
+    assert "own verified cell" in str(msg)
+
+    # An APR claim located on the note-rate column is a column rebinding.
+    rebound = _heloc_candidate(
+        "cand-tier-apr-on-rate",
+        tiers=(_heloc_t1_tier(note_rate=None, apr=Decimal("7.250"), col=2),),
+    )
+    disp2, reason2, msg2 = verify_batch_item_locators(rebound, store)
+    assert disp2 is BatchDisposition.HELD
+    assert reason2 is HoldReason.RAW_TEXT_MISMATCH
+    assert "non-APR" in str(msg2)
+
+
+def test_heloc_terms_need_their_own_labeled_locator(store: ArtifactStore) -> None:
+    """HELOC attributes (max CLTV, lien, index) are material claims: no locator, no staging."""
+    unlocated = _heloc_candidate(
+        "cand-heloc-unlocated",
+        heloc_terms=BatchHelocTerms(max_cltv=Decimal("70"), lien_position=LienPosition.SECOND),
+    )
+    disp, reason, msg = verify_batch_item_locators(unlocated, store)
+    assert disp is BatchDisposition.HELD
+    assert reason is HoldReason.EVIDENCE_MISSING
+    assert "heloc_terms.max_cltv" in str(msg)
+
+    product_cell = _css(HELOC_T1_SELECTOR.format(col=1), HELOC_T1_PRODUCT)
+    located = _heloc_candidate(
+        "cand-heloc-located",
+        heloc_terms=BatchHelocTerms(max_cltv=Decimal("70")),
+        locators={"heloc_terms.max_cltv": product_cell},
+        field_raw_texts={"heloc_terms.max_cltv": HELOC_T1_PRODUCT},
+    )
+    assert verify_batch_item_locators(located, store) == (BatchDisposition.STAGED, None, None)
+
+    # The same cell cannot prove a different value.
+    wrong_value = located.model_copy(
+        update={"heloc_terms": BatchHelocTerms(max_cltv=Decimal("80"))}
+    )
+    disp2, reason2, msg2 = verify_batch_item_locators(wrong_value, store)
+    assert (disp2, reason2) == (BatchDisposition.HELD, HoldReason.RAW_TEXT_MISMATCH)
+    assert "does not equal claimed" in str(msg2)
+
+    # The rate cell has no CLTV label at all, so it is not sibling evidence for max CLTV.
+    rate_cell = _css(HELOC_T1_SELECTOR.format(col=2), "7.250%")
+    on_rate_cell = located.model_copy(
+        update={
+            "locators": {"heloc_terms.max_cltv": rate_cell},
+            "field_raw_texts": {"heloc_terms.max_cltv": "7.250%"},
+        }
+    )
+    disp3, reason3, msg3 = verify_batch_item_locators(on_rate_cell, store)
+    assert (disp3, reason3) == (BatchDisposition.HELD, HoldReason.RAW_TEXT_MISMATCH)
+    assert "lacks an explicit label" in str(msg3)
+
+    # A lien claim whose cell never states the lien position is held.
+    lien = located.model_copy(
+        update={
+            "heloc_terms": BatchHelocTerms(lien_position=LienPosition.SECOND),
+            "locators": {"heloc_terms.lien_position": product_cell},
+            "field_raw_texts": {"heloc_terms.lien_position": HELOC_T1_PRODUCT},
+        }
+    )
+    disp4, reason4, _msg4 = verify_batch_item_locators(lien, store)
+    assert (disp4, reason4) == (BatchDisposition.HELD, HoldReason.RAW_TEXT_MISMATCH)
+
+
+def test_condition_needs_its_own_located_text_in_the_candidate_row(store: ArtifactStore) -> None:
+    """Conditions are material: no locator holds; a located condition must state its kind."""
+    description = "CLTV at or below 70%"
+    unlocated = _heloc_candidate(
+        "cand-condition-unlocated",
+        conditions=(
+            BatchCondition(
+                kind=ConditionKind.TIER, description=description, raw_text=HELOC_T1_PRODUCT
+            ),
         ),
     )
+    disp, reason, msg = verify_batch_item_locators(unlocated, store)
+    assert (disp, reason) == (BatchDisposition.HELD, HoldReason.EVIDENCE_MISSING)
+    assert "lacks evidence locator" in str(msg)
 
-    candidate = BatchCandidate(
-        candidate_id="cand-heloc",
-        row_id="row-heloc-t1",
-        institution_charter=CHARTER,
-        product_id="heloc-prime",
-        source_id=SOURCE_ID,
-        fetch_run_id=FETCH_RUN,
-        artifact_id=HTML_ARTIFACT_ID,
-        product_family=ProductFamily.HELOC,
-        heloc_terms=BatchHelocTerms(
-            stated_post_intro_apr=Decimal("7.250"),
-            max_cltv=Decimal("70"),
-            lien_position=LienPosition.SECOND,
+    product_locator = _css(HELOC_T1_SELECTOR.format(col=1), HELOC_T1_PRODUCT)
+    located = _heloc_candidate(
+        "cand-condition-located",
+        conditions=(
+            BatchCondition(
+                kind=ConditionKind.TIER,
+                description=description,
+                raw_text=HELOC_T1_PRODUCT,
+                locator=product_locator,
+            ),
         ),
-        tiers=(tier_1,),
-        raw_text="Home Equity Line of Credit <= 70% CLTV 7.250%",
-        observed_at=T0,
     )
+    assert verify_batch_item_locators(located, store) == (BatchDisposition.STAGED, None, None)
 
-    disposition, reason, _msg = verify_batch_item_locators(candidate, store)
-    assert disposition is BatchDisposition.STAGED
-    assert reason is None
+    # The same located text does not state an autopay discount, so the kind is not credited.
+    wrong_kind = _heloc_candidate(
+        "cand-condition-wrong-kind",
+        conditions=(
+            BatchCondition(
+                kind=ConditionKind.AUTOPAY,
+                description="Autopay discount",
+                raw_text=HELOC_T1_PRODUCT,
+                locator=product_locator,
+            ),
+        ),
+    )
+    disp2, reason2, msg2 = verify_batch_item_locators(wrong_kind, store)
+    assert (disp2, reason2) == (BatchDisposition.HELD, HoldReason.RAW_TEXT_MISMATCH)
+    assert "does not state a autopay condition" in str(msg2)
+
+    # A condition located in a different row cannot be attributed to this offer.
+    other_text = "Home Equity Line of Credit 70.01% - 80% CLTV"
+    other_row = _heloc_candidate(
+        "cand-condition-other-row",
+        conditions=(
+            BatchCondition(
+                kind=ConditionKind.TIER,
+                description=description,
+                raw_text=other_text,
+                locator=_css("#heloc-rates tr:nth-child(2) td:nth-child(1)", other_text),
+            ),
+        ),
+    )
+    disp3, reason3, _msg3 = verify_batch_item_locators(other_row, store)
+    assert (disp3, reason3) == (BatchDisposition.HELD, HoldReason.EVIDENCE_AMBIGUOUS)
 
 
 def test_coverage_findings_verification(store: ArtifactStore) -> None:
@@ -804,66 +1032,26 @@ def test_coverage_findings_verification(store: ArtifactStore) -> None:
 
 
 def test_separate_unknown_points_vs_explicit_zero(store: ArtifactStore) -> None:
-    rate_sha = hashlib.sha256(b"6.375%").hexdigest()
-    pts_sha = hashlib.sha256(b"0 Points").hexdigest()
-
     # Explicit zero points
-    cand_zero_pts = BatchCandidate(
-        candidate_id="cand-zero-points",
-        row_id="row-30y",
-        institution_charter=CHARTER,
-        product_id="mortgage-30y-fixed",
-        source_id=SOURCE_ID,
-        fetch_run_id=FETCH_RUN,
-        artifact_id=HTML_ARTIFACT_ID,
-        product_family=ProductFamily.MORTGAGE,
+    cand_zero_pts = _row30y_candidate(
+        "cand-zero-points",
+        ("loan_purpose", "term_months", "note_rate", "points"),
         loan_purpose=LoanPurpose.PURCHASE,
         term_months=360,
         note_rate=Decimal("6.375"),
         points=Decimal("0"),  # Explicit zero
-        raw_text="30-Year Fixed 6.375% 0 Points",
-        field_raw_texts={"note_rate": "6.375%", "points": "0 Points"},
-        locators={
-            "note_rate": HtmlLocator(
-                selector_type="css",
-                selector="#mortgage-rates tr:nth-child(1) td:nth-child(3)",
-                normalized_text_sha256=rate_sha,
-            ),
-            "points": HtmlLocator(
-                selector_type="css",
-                selector="#mortgage-rates tr:nth-child(1) td:nth-child(5)",
-                normalized_text_sha256=pts_sha,
-            ),
-        },
-        observed_at=T0,
     )
     disp, _, _ = verify_batch_item_locators(cand_zero_pts, store)
     assert disp is BatchDisposition.STAGED
 
     # Unknown points (None)
-    cand_unknown_pts = BatchCandidate(
-        candidate_id="cand-unknown-points",
-        row_id="row-30y",
-        institution_charter=CHARTER,
-        product_id="mortgage-30y-fixed",
-        source_id=SOURCE_ID,
-        fetch_run_id=FETCH_RUN,
-        artifact_id=HTML_ARTIFACT_ID,
-        product_family=ProductFamily.MORTGAGE,
+    cand_unknown_pts = _row30y_candidate(
+        "cand-unknown-points",
+        ("loan_purpose", "term_months", "note_rate"),
         loan_purpose=LoanPurpose.PURCHASE,
         term_months=360,
         note_rate=Decimal("6.375"),
         points=None,  # Unknown points preserved as None
-        raw_text="30-Year Fixed 6.375%",
-        field_raw_texts={"note_rate": "6.375%"},
-        locators={
-            "note_rate": HtmlLocator(
-                selector_type="css",
-                selector="#mortgage-rates tr:nth-child(1) td:nth-child(3)",
-                normalized_text_sha256=rate_sha,
-            )
-        },
-        observed_at=T0,
     )
     assert cand_unknown_pts.points is None
     disp, _, _ = verify_batch_item_locators(cand_unknown_pts, store)
@@ -1010,8 +1198,12 @@ def test_json_locator_resolution_and_exact_match(store: ArtifactStore) -> None:
         },
         observed_at=T0,
     )
-    disp, _reason, _ = verify_batch_item_locators(cand_valid_json, store)
-    assert disp is BatchDisposition.STAGED
+    # A JSON scalar proves the value text but cannot bind a product row or term, so a candidate
+    # located only by JSON pointers is held as unsupported rather than staged.
+    disp, reason, msg = verify_batch_item_locators(cand_valid_json, store)
+    assert disp is BatchDisposition.HELD
+    assert reason is HoldReason.LOCATOR_UNSUPPORTED
+    assert "cannot be bound to a product row and term" in str(msg)
 
     # 2. Container pointer resolution (resolves to dict instead of scalar)
     cand_container_json = cand_valid_json.model_copy(
@@ -1172,7 +1364,7 @@ def test_tier_canonical_hash_mismatch_held(store: ArtifactStore) -> None:
 
 def test_tier_apr_mismatch_held(store: ArtifactStore) -> None:
     """Tier claiming mismatched APR must fail closed to HELD with RAW_TEXT_MISMATCH."""
-    t1_rate_sha = hashlib.sha256(b"7.250%").hexdigest()
+    t1_apr_sha = hashlib.sha256(b"7.250%").hexdigest()
     tier = BatchTier(
         tier_id="tier-apr-mismatch",
         bounds=(
@@ -1182,13 +1374,12 @@ def test_tier_apr_mismatch_held(store: ArtifactStore) -> None:
                 upper=Decimal("70"),
             ),
         ),
-        note_rate=Decimal("7.250"),
-        apr=Decimal("8.500"),  # Claims 8.500%, but node discloses 7.250%
+        apr=Decimal("8.500"),  # Claims 8.500%, but the APR cell discloses 7.250%
         raw_text="7.250%",
         locator=HtmlLocator(
             selector_type="css",
-            selector="#heloc-rates tr:nth-child(1) td:nth-child(2)",
-            normalized_text_sha256=t1_rate_sha,
+            selector="#heloc-rates tr:nth-child(1) td:nth-child(3)",
+            normalized_text_sha256=t1_apr_sha,
         ),
     )
     candidate = BatchCandidate(
@@ -1383,54 +1574,14 @@ def test_term_code_rejects_missing_unit_conversion(store: ArtifactStore) -> None
     assert "does not disclose an explicit months/years unit" in str(msg)
 
     # Unit-bearing valid term ("360 Months") in HTML_FIXTURE stages successfully
-    apr_sha = hashlib.sha256(b"6.450%").hexdigest()
-    pts_sha = hashlib.sha256(b"0 Points").hexdigest()
-    term_360_sha = hashlib.sha256(b"360 Months").hexdigest()
-
-    candidate_valid_term = BatchCandidate(
-        candidate_id="cand-term-unit-bearing",
-        row_id="row-30y",
-        institution_charter=CHARTER,
-        product_id="mortgage-30y-fixed",
-        source_id=SOURCE_ID,
-        fetch_run_id=FETCH_RUN,
-        artifact_id=HTML_ARTIFACT_ID,
-        product_family=ProductFamily.MORTGAGE,
+    candidate_valid_term = _row30y_candidate(
+        "cand-term-unit-bearing",
+        ("loan_purpose", "term_months", "note_rate", "apr", "points"),
         loan_purpose=LoanPurpose.PURCHASE,
         term_months=360,
         note_rate=Decimal("6.375"),
         apr=Decimal("6.450"),
         points=Decimal("0"),
-        raw_text="30-Year Fixed Conforming 360 Months 6.375% 6.450% 0 Points",
-        field_raw_texts={
-            "note_rate": "6.375%",
-            "apr": "6.450%",
-            "points": "0 Points",
-            "term_months": "360 Months",
-        },
-        locators={
-            "note_rate": HtmlLocator(
-                selector_type="css",
-                selector="#mortgage-rates tr:nth-child(1) td:nth-child(3)",
-                normalized_text_sha256=rate_sha,
-            ),
-            "apr": HtmlLocator(
-                selector_type="css",
-                selector="#mortgage-rates tr:nth-child(1) td:nth-child(4)",
-                normalized_text_sha256=apr_sha,
-            ),
-            "points": HtmlLocator(
-                selector_type="css",
-                selector="#mortgage-rates tr:nth-child(1) td:nth-child(5)",
-                normalized_text_sha256=pts_sha,
-            ),
-            "term_months": HtmlLocator(
-                selector_type="css",
-                selector="#mortgage-rates tr:nth-child(1) td:nth-child(2)",
-                normalized_text_sha256=term_360_sha,
-            ),
-        },
-        observed_at=T0,
     )
     disp_valid, reason_valid, msg_valid = verify_batch_item_locators(candidate_valid_term, store)
     assert disp_valid is BatchDisposition.STAGED
@@ -1946,3 +2097,425 @@ def test_reject_table_without_headings_or_attributes(store: ArtifactStore) -> No
     assert disp is BatchDisposition.HELD
     assert reason is HoldReason.RAW_TEXT_MISMATCH
     assert "lacks explicit column headings or cell attributes" in str(msg)
+
+
+# ---------------------------------------------------------------------------
+# Opus Review Remediation: every material claim verified, explicit paths, row/column binding
+# ---------------------------------------------------------------------------
+
+RATE_CELL = "#mortgage-rates tr:nth-child(1) td:nth-child(3)"
+
+
+def test_term_and_purpose_claims_need_their_own_verified_locators(store: ArtifactStore) -> None:
+    """A headline-only locator no longer carries an unlocated term or purpose claim."""
+    term_unlocated = _row30y_candidate(
+        "cand-term-unlocated",
+        ("note_rate",),
+        note_rate=Decimal("6.375"),
+        term_months=360,
+    )
+    disp, reason, msg = verify_batch_item_locators(term_unlocated, store)
+    assert (disp, reason) == (BatchDisposition.HELD, HoldReason.EVIDENCE_MISSING)
+    assert "claims term_months without a verified term_months locator" in str(msg)
+
+    purpose_unlocated = _row30y_candidate(
+        "cand-purpose-unlocated",
+        ("term_months", "note_rate"),
+        note_rate=Decimal("6.375"),
+        term_months=360,
+        loan_purpose=LoanPurpose.PURCHASE,
+    )
+    disp2, reason2, msg2 = verify_batch_item_locators(purpose_unlocated, store)
+    assert (disp2, reason2) == (BatchDisposition.HELD, HoldReason.EVIDENCE_MISSING)
+    assert "claims loan_purpose without a verified loan_purpose locator" in str(msg2)
+
+    # The 15-year row never says "purchase": a purchase claim located on its product cell is
+    # not credited, even though the row is otherwise a plain conforming mortgage.
+    product_15y = "15-Year Fixed Conforming"
+    purpose_unstated = BatchCandidate(
+        candidate_id="cand-purpose-unstated",
+        row_id="row-15y",
+        institution_charter=CHARTER,
+        product_id="mortgage-15y-fixed",
+        source_id=SOURCE_ID,
+        fetch_run_id=FETCH_RUN,
+        artifact_id=HTML_ARTIFACT_ID,
+        product_family=ProductFamily.MORTGAGE,
+        loan_purpose=LoanPurpose.PURCHASE,
+        note_rate=Decimal("5.875"),
+        raw_text=f"{product_15y} 5.875%",
+        field_raw_texts={"loan_purpose": product_15y, "note_rate": "5.875%"},
+        locators={
+            "loan_purpose": _css("#mortgage-rates tr:nth-child(2) td:nth-child(1)", product_15y),
+            "note_rate": _css("#mortgage-rates tr:nth-child(2) td:nth-child(3)", "5.875%"),
+        },
+        observed_at=T0,
+    )
+    disp3, reason3, msg3 = verify_batch_item_locators(purpose_unstated, store)
+    assert (disp3, reason3) == (BatchDisposition.HELD, HoldReason.RAW_TEXT_MISMATCH)
+    assert "does not explicitly disclose loan_purpose" in str(msg3)
+
+
+def test_explicit_false_zero_and_attribute_claims_are_still_claims(store: ArtifactStore) -> None:
+    """False/zero/optional attributes are present claims: unlocated holds, unprovable holds."""
+    as_low_as_false = _row30y_candidate(
+        "cand-low-false", ("note_rate",), note_rate=Decimal("6.375"), headline_is_as_low_as=False
+    )
+    disp, reason, msg = verify_batch_item_locators(as_low_as_false, store)
+    assert (disp, reason) == (BatchDisposition.HELD, HoldReason.EVIDENCE_MISSING)
+    assert "headline_is_as_low_as" in str(msg)
+
+    rate_cell = _css(RATE_CELL, "6.375%")
+    located_false = _row30y_candidate(
+        "cand-low-false-located",
+        ("note_rate",),
+        note_rate=Decimal("6.375"),
+        headline_is_as_low_as=False,
+        locators={**_row30y_locators("note_rate"), "headline_is_as_low_as": rate_cell},
+        field_raw_texts={**_row30y_texts("note_rate"), "headline_is_as_low_as": "6.375%"},
+    )
+    disp2, reason2, msg2 = verify_batch_item_locators(located_false, store)
+    assert (disp2, reason2) == (BatchDisposition.HELD, HoldReason.LOCATOR_UNSUPPORTED)
+    assert "cannot be proven" in str(msg2)
+
+    # A true "as low as" claim needs those words in the located text, not just a rate.
+    located_true = located_false.model_copy(update={"headline_is_as_low_as": True})
+    disp3, reason3, msg3 = verify_batch_item_locators(located_true, store)
+    assert (disp3, reason3) == (BatchDisposition.HELD, HoldReason.RAW_TEXT_MISMATCH)
+    assert "as low as" in str(msg3)
+
+    arm_unlocated = _row30y_candidate(
+        "cand-arm-unlocated",
+        ("note_rate",),
+        note_rate=Decimal("6.375"),
+        arm_terms=BatchArmTerms(adjustment_interval_months=12),
+    )
+    disp4, reason4, msg4 = verify_batch_item_locators(arm_unlocated, store)
+    assert (disp4, reason4) == (BatchDisposition.HELD, HoldReason.EVIDENCE_MISSING)
+    assert "arm_terms.adjustment_interval_months" in str(msg4)
+
+    # The term cell is sibling evidence, not proof of the ARM adjustment interval.
+    arm_on_term_cell = arm_unlocated.model_copy(
+        update={
+            "locators": {
+                **_row30y_locators("note_rate"),
+                "arm_terms.adjustment_interval_months": _css(
+                    "#mortgage-rates tr:nth-child(1) td:nth-child(2)", "360 Months"
+                ),
+            },
+            "field_raw_texts": {
+                **_row30y_texts("note_rate"),
+                "arm_terms.adjustment_interval_months": "360 Months",
+            },
+        }
+    )
+    disp5, reason5, msg5 = verify_batch_item_locators(arm_on_term_cell, store)
+    assert (disp5, reason5) == (BatchDisposition.HELD, HoldReason.RAW_TEXT_MISMATCH)
+    assert "lacks an explicit label" in str(msg5)
+
+    # Loan amount limits have no typed parser yet: held as unsupported, never inferred.
+    amount_unlocated = _row30y_candidate(
+        "cand-amount-unlocated",
+        ("note_rate",),
+        note_rate=Decimal("6.375"),
+        max_amount=Decimal("500000"),
+    )
+    disp6, reason6, _msg6 = verify_batch_item_locators(amount_unlocated, store)
+    assert (disp6, reason6) == (BatchDisposition.HELD, HoldReason.EVIDENCE_MISSING)
+
+
+DATED_HTML = b"""<!DOCTYPE html>
+<html>
+<body>
+<div id="dated-rates">
+  <table>
+    <thead>
+      <tr><th>Product</th><th>Term</th><th>Rate</th><th>Effective</th></tr>
+    </thead>
+    <tbody>
+      <tr id="row-dated">
+        <td class="prod">30-Year Fixed Purchase</td>
+        <td class="term">360 Months</td>
+        <td class="rate">6.375%</td>
+        <td class="eff">Effective 11/19/2026</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+</body>
+</html>"""
+
+
+def test_effective_date_claim_needs_a_stated_matching_date(store: ArtifactStore) -> None:
+    capture = store.put(
+        DATED_HTML,
+        media_type="text/html; charset=utf-8",
+        source_url=SOURCE_URL,
+        fetched_at=T0,
+        http_status=200,
+        fetch_run_id="run-dated-rates",
+    )
+    effective_text = "Effective 11/19/2026"
+
+    def dated(effective_at: datetime, *, located: bool = True) -> BatchCandidate:
+        locators: dict[str, Any] = {
+            "note_rate": _css("#dated-rates tr:nth-child(1) td:nth-child(3)", "6.375%")
+        }
+        raw_texts = {"note_rate": "6.375%"}
+        if located:
+            locators["effective_at"] = _css(
+                "#dated-rates tr:nth-child(1) td:nth-child(4)", effective_text
+            )
+            raw_texts["effective_at"] = effective_text
+        return BatchCandidate(
+            candidate_id="cand-dated",
+            row_id="row-dated",
+            institution_charter=CHARTER,
+            product_id="mortgage-30y-fixed",
+            source_id=SOURCE_ID,
+            fetch_run_id=capture.fetch_run_id,
+            artifact_id=capture.artifact_id,
+            product_family=ProductFamily.MORTGAGE,
+            note_rate=Decimal("6.375"),
+            effective_at=effective_at,
+            raw_text="30-Year Fixed Purchase 360 Months 6.375% Effective 11/19/2026",
+            field_raw_texts=raw_texts,
+            locators=locators,
+            observed_at=T0,
+        )
+
+    stated = datetime(2026, 11, 19, tzinfo=UTC)
+    assert verify_batch_item_locators(dated(stated), store) == (
+        BatchDisposition.STAGED,
+        None,
+        None,
+    )
+
+    disp, reason, msg = verify_batch_item_locators(dated(datetime(2026, 11, 20, tzinfo=UTC)), store)
+    assert (disp, reason) == (BatchDisposition.HELD, HoldReason.RAW_TEXT_MISMATCH)
+    assert "does not equal claimed effective_at" in str(msg)
+
+    # A date-only disclosure cannot prove a time of day the model made up.
+    disp2, reason2, msg2 = verify_batch_item_locators(
+        dated(datetime(2026, 11, 19, 12, 0, tzinfo=UTC)), store
+    )
+    assert (disp2, reason2) == (BatchDisposition.HELD, HoldReason.RAW_TEXT_MISMATCH)
+    assert "time of day" in str(msg2)
+
+    disp3, reason3, msg3 = verify_batch_item_locators(dated(stated, located=False), store)
+    assert (disp3, reason3) == (BatchDisposition.HELD, HoldReason.EVIDENCE_MISSING)
+    assert "effective_at" in str(msg3)
+
+
+def test_unknown_and_unbound_locator_paths_are_held(store: ArtifactStore) -> None:
+    """Only explicit supported paths bound to a claimed field can verify; no generic text match."""
+    valid = _row30y_candidate("cand-paths", ("note_rate",), note_rate=Decimal("6.375"))
+    assert verify_batch_item_locators(valid, store) == (BatchDisposition.STAGED, None, None)
+
+    rate_cell = _css(RATE_CELL, "6.375%")
+    unknown_path = valid.model_copy(
+        update={
+            "locators": {**valid.locators, "bogus_field": rate_cell},
+            "field_raw_texts": {**valid.field_raw_texts, "bogus_field": "6.375%"},
+        }
+    )
+    disp, reason, msg = verify_batch_item_locators(unknown_path, store)
+    assert (disp, reason) == (BatchDisposition.HELD, HoldReason.LOCATOR_UNSUPPORTED)
+    assert "not a supported material field path" in str(msg)
+
+    # A points locator for a candidate that claims no points is not silently ignored.
+    absent_field = valid.model_copy(
+        update={
+            "locators": {
+                **valid.locators,
+                "points": _css("#mortgage-rates tr:nth-child(1) td:nth-child(5)", "0 Points"),
+            },
+            "field_raw_texts": {**valid.field_raw_texts, "points": "0 Points"},
+        }
+    )
+    disp2, reason2, msg2 = verify_batch_item_locators(absent_field, store)
+    assert (disp2, reason2) == (BatchDisposition.HELD, HoldReason.LOCATOR_UNSUPPORTED)
+    assert "does not claim" in str(msg2)
+
+    # The rate cell is sibling evidence, not proof of a max CLTV: the value needs its own label.
+    sibling = valid.model_copy(
+        update={
+            "max_cltv": Decimal("6.375"),
+            "locators": {**valid.locators, "max_cltv": rate_cell},
+            "field_raw_texts": {**valid.field_raw_texts, "max_cltv": "6.375%"},
+        }
+    )
+    disp3, reason3, msg3 = verify_batch_item_locators(sibling, store)
+    assert (disp3, reason3) == (BatchDisposition.HELD, HoldReason.RAW_TEXT_MISMATCH)
+    assert "lacks an explicit label" in str(msg3)
+
+    # An allowed alias verifies the same claim as its canonical path.
+    aliased = _row30y_candidate(
+        "cand-alias",
+        ("note_rate",),
+        note_rate=Decimal("6.375"),
+        term_months=360,
+        locators={
+            **_row30y_locators("note_rate"),
+            "details.term_months": _row30y_locators("term_months")["term_months"],
+        },
+        field_raw_texts={**_row30y_texts("note_rate"), "details.term_months": "360 Months"},
+    )
+    assert verify_batch_item_locators(aliased, store) == (BatchDisposition.STAGED, None, None)
+
+
+def test_finding_paths_and_text_must_state_the_claimed_availability(store: ArtifactStore) -> None:
+    blocked_text = "Rate viewing is restricted to authenticated members."
+    blocked_cell = _css("#coverage-findings p:nth-child(2)", blocked_text)
+
+    def finding(**overrides: Any) -> BatchFinding:
+        base: dict[str, Any] = {
+            "finding_id": "find-paths",
+            "institution_charter": CHARTER,
+            "source_id": SOURCE_ID,
+            "fetch_run_id": FETCH_RUN,
+            "artifact_id": HTML_ARTIFACT_ID,
+            "observed_at": T0,
+            "label": "Blocked mortgage rates",
+            "scope": ProductScope.IN_SCOPE,
+            "family": ProductFamily.MORTGAGE,
+            "rate_availability": RateAvailability.BLOCKED,
+            "raw_text": blocked_text,
+            "locators": {"availability": blocked_cell},
+        }
+        base.update(overrides)
+        return BatchFinding(**base)
+
+    assert verify_batch_item_locators(finding(), store) == (BatchDisposition.STAGED, None, None)
+
+    unknown_path = finding(locators={"anything": blocked_cell})
+    disp, reason, _ = verify_batch_item_locators(unknown_path, store)
+    assert (disp, reason) == (BatchDisposition.HELD, HoldReason.LOCATOR_UNSUPPORTED)
+
+    # Located text about a login wall does not prove a quote-only claim.
+    wrong_availability = finding(rate_availability=RateAvailability.QUOTE_ONLY)
+    disp2, reason2, msg2 = verify_batch_item_locators(wrong_availability, store)
+    assert (disp2, reason2) == (BatchDisposition.HELD, HoldReason.RAW_TEXT_MISMATCH)
+    assert "does not disclose rate_availability" in str(msg2)
+
+    # A locator for a field the finding does not claim is unbound.
+    absent = finding(scope=ProductScope.UNKNOWN, family=None, rate_availability=None)
+    disp3, reason3, msg3 = verify_batch_item_locators(absent, store)
+    assert (disp3, reason3) == (BatchDisposition.HELD, HoldReason.LOCATOR_UNSUPPORTED)
+    assert "does not claim" in str(msg3)
+
+    # An availability claim on an unknown-scope finding still needs its locator.
+    unlocated = finding(scope=ProductScope.UNKNOWN, family=None, locators={})
+    disp4, reason4, _ = verify_batch_item_locators(unlocated, store)
+    assert (disp4, reason4) == (BatchDisposition.HELD, HoldReason.EVIDENCE_MISSING)
+
+
+LINK_HTML = b"""<!DOCTYPE html>
+<html>
+<body>
+<p><a href="https://example.test/rate/6.375">Rates</a></p>
+</body>
+</html>"""
+LINK_TARGET = "https://example.test/rate/6.375"
+
+
+def test_xpath_candidate_locator_cannot_stand_in_for_row_product_and_term(
+    store: ArtifactStore,
+) -> None:
+    """XPath resolves no table cell, so it can never prove a row, product, or term for a value."""
+    capture = store.put(
+        LINK_HTML,
+        media_type="text/html; charset=utf-8",
+        source_url=SOURCE_URL,
+        fetched_at=T0,
+        http_status=200,
+        fetch_run_id="run-link-xpath",
+    )
+    xpath = f"//a[@href='{LINK_TARGET}']/@href"
+    candidate = BatchCandidate(
+        candidate_id="cand-xpath",
+        row_id="row-xpath",
+        institution_charter=CHARTER,
+        product_id="mortgage-30y-fixed",
+        source_id=SOURCE_ID,
+        fetch_run_id=capture.fetch_run_id,
+        artifact_id=capture.artifact_id,
+        product_family=ProductFamily.MORTGAGE,
+        note_rate=Decimal("6.375"),
+        raw_text=LINK_TARGET,
+        field_raw_texts={"note_rate": LINK_TARGET},
+        locators={
+            "note_rate": HtmlLocator(
+                selector_type="xpath", selector=xpath, normalized_text_sha256=_sha(LINK_TARGET)
+            )
+        },
+        observed_at=T0,
+    )
+    disp, reason, msg = verify_batch_item_locators(candidate, store)
+    assert (disp, reason) == (BatchDisposition.HELD, HoldReason.LOCATOR_UNSUPPORTED)
+    assert "xpath cannot be bound to a table row and column" in str(msg)
+
+    # The same holds for a tier located by XPath.
+    xpath_tier = BatchTier(
+        tier_id="tier-xpath",
+        bounds=(
+            BatchTierBound(dimension=TierDimension.CLTV, lower=Decimal("0"), upper=Decimal("70")),
+        ),
+        note_rate=Decimal("7.250"),
+        raw_text=LINK_TARGET,
+        locator=HtmlLocator(
+            selector_type="xpath", selector=xpath, normalized_text_sha256=_sha(LINK_TARGET)
+        ),
+    )
+    heloc = _heloc_candidate("cand-xpath-tier", tiers=(xpath_tier,))
+    disp2, reason2, msg2 = verify_batch_item_locators(heloc, store)
+    assert (disp2, reason2) == (BatchDisposition.HELD, HoldReason.LOCATOR_UNSUPPORTED)
+    assert "xpath cannot be bound" in str(msg2)
+
+
+def test_json_candidate_is_held_even_when_every_scalar_matches(store: ArtifactStore) -> None:
+    """JSON pointers prove value text only; the candidate is retained under an unsupported hold."""
+    candidate = BatchCandidate(
+        candidate_id="cand-json-two-fields",
+        row_id="row-json-01",
+        institution_charter=CHARTER,
+        product_id="mortgage-30y-fixed",
+        source_id=SOURCE_ID,
+        fetch_run_id=FETCH_RUN,
+        artifact_id=JSON_ARTIFACT_ID,
+        product_family=ProductFamily.MORTGAGE,
+        note_rate=Decimal("6.375"),
+        apr=Decimal("6.450"),
+        raw_text="6.375% 6.450%",
+        field_raw_texts={"note_rate": "6.375%", "apr": "6.450%"},
+        locators={
+            "note_rate": JsonLocator(
+                pointer="/products/mortgage_30y/note_rate", response_sha256=JSON_ARTIFACT_ID
+            ),
+            "apr": JsonLocator(
+                pointer="/products/mortgage_30y/apr", response_sha256=JSON_ARTIFACT_ID
+            ),
+        },
+        observed_at=T0,
+    )
+    disp, reason, msg = verify_batch_item_locators(candidate, store)
+    assert (disp, reason) == (BatchDisposition.HELD, HoldReason.LOCATOR_UNSUPPORTED)
+    assert "cannot be bound to a product row and term" in str(msg)
+
+    # A JSON scalar that is not a unit-bearing term cannot prove a term claim either: the typed
+    # mismatch is reported first, before the unsupported-binding hold.
+    with_term = candidate.model_copy(
+        update={
+            "term_months": 360,
+            "locators": {
+                **candidate.locators,
+                "term_months": JsonLocator(
+                    pointer="/effective_date", response_sha256=JSON_ARTIFACT_ID
+                ),
+            },
+            "field_raw_texts": {**candidate.field_raw_texts, "term_months": "2026-11-19"},
+        }
+    )
+    disp2, reason2, msg2 = verify_batch_item_locators(with_term, store)
+    assert (disp2, reason2) == (BatchDisposition.HELD, HoldReason.RAW_TEXT_MISMATCH)
+    assert "does not disclose an explicit months/years unit" in str(msg2)

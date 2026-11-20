@@ -129,6 +129,13 @@ Verified items remain **candidate-only**; intake cannot approve, publish, or syn
 evidence. Rows with ambiguous, unsupported, or unverified evidence fail closed to auditable
 holds with stable reason codes.
 
+Every material value a candidate states (rates, points, term, purpose, assumptions,
+HELOC/ARM attributes, conditions, tier bounds, effective date) needs its own locator on a
+supported path in the same table row; the located cell text must state that value. A claim
+with no verified locator, an unknown or unclaimed locator path, and any candidate located
+only by XPath or JSON hold as unsupported, and the submitted values stay in the private
+payload.
+
 Pass UTF-8 JSON or JSONL at schema version `1.0`, up to 10 MiB and 5,000 items.
 Compute the envelope digest with `cu_rates.rate_batch.compute_batch_digest` before
 adding `batch_digest`. Supply decimal strings and the actual UTC capture time;
