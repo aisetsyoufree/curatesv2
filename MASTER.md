@@ -11,7 +11,7 @@
 | Product manager / architect / integrator | Claude (orchestrator), with Codex, Gemini and Claude subagents as workers and independent reviewers |
 | Repository | [aisetsyoufree/curatesv2](https://github.com/aisetsyoufree/curatesv2) |
 | Work tracker | [CU-Rates.org V2 GitHub Project](https://github.com/users/aisetsyoufree/projects/1) |
-| Authoritative local clone | `/Users/sid/Code/cu-rates.org-v2` |
+| Authoritative local clone | Owner-managed checkout outside cloud-synchronized folders (see README) |
 | Last updated | 2026-11-19 |
 
 ## 1. Vision and objective

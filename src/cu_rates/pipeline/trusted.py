@@ -865,7 +865,7 @@ def load_publication_context(
     basis = next(
         (run for run in runs if len(matching) == 1 and run.run_id == matching[0].fetch_run_id), None
     )
-    verified: tuple[RawArtifact, ...] = ()
+    primary: RawArtifact | None = None
     body: bytes | None = None
     comparable = False
     if basis is not None and not any(
@@ -887,7 +887,7 @@ def load_publication_context(
         )
         try:
             raw = store.read(artifact)
-            if store.get_observation(artifact.fetch_run_id, artifact.source_url) != artifact:
+            if store.get_observation(basis.run_id, source.url) != artifact:
                 raise ValueError("stored observation differs from the database")
             if cited != {artifact.artifact_id}:
                 raise ValueError("offer claims must cite the single source artifact")
@@ -897,12 +897,13 @@ def load_publication_context(
             comparable = verification.comparable
             if verification.confidence == "low":
                 raise ValueError("low-confidence extraction is quarantined")
-            body, verified = raw, (artifact,)
+            # Only the verified observation of the selected basis run can be
+            # primary, even when an older run stored exactly the same bytes.
+            body, primary = raw, artifact
         except Exception:
             # A malformed capture or adapter failure must not abort other captures.
             pass
 
-    primary_verified = bool(verified)
     profile = None
     if basis is not None:
         row = conn.execute(
@@ -984,7 +985,7 @@ def load_publication_context(
             approved_at=policy_row.approved_at,
         )
     )
-    if not primary_verified:
+    if primary is None:
         offer = offer.model_copy(update={"status": OfferStatus.QUARANTINED, "published_at": None})
     if (
         offer.status is OfferStatus.CANDIDATE
@@ -998,8 +999,7 @@ def load_publication_context(
     layouts = set()
     statements: tuple[VerifiedScenarioStatement, ...] = ()
     conditions: tuple[VerifiedScenarioCondition, ...] = ()
-    if basis is not None and verified and body is not None:
-        artifact = verified[0]
+    if basis is not None and primary is not None and body is not None:
         layout = body_layout_sha256(source, approval, body, allow_fixture=allow_fixture)
         layouts = {
             _fingerprint(row)
@@ -1007,7 +1007,7 @@ def load_publication_context(
                 select(source_fingerprints).where(
                     source_fingerprints.c.source_id == source.source_id,
                     source_fingerprints.c.fetch_run_id == basis.run_id,
-                    source_fingerprints.c.artifact_id == artifact.artifact_id,
+                    source_fingerprints.c.artifact_id == primary.artifact_id,
                     source_fingerprints.c.structure_sha256 == layout,
                 )
             ).all()
@@ -1024,7 +1024,9 @@ def load_publication_context(
     # Read separate stored offer observations. No inferred captures: missing or
     # unverifiable history remains absent and the publication gate fails closed.
     paths: list[EvidencePath] = []
-    artifacts = {item.artifact_id: item for item in verified}
+    artifacts: dict[tuple[str, str], RawArtifact] = {}
+    if primary is not None:
+        artifacts[(primary.artifact_id, primary.fetch_run_id)] = primary
     all_statements = list(statements)
     captures = conn.execute(
         select(slice_offer_captures).where(slice_offer_captures.c.offer_id == offer_id)
@@ -1085,8 +1087,8 @@ def load_publication_context(
         for proof in proofs:
             if proof not in all_statements:
                 all_statements.append(proof)
-        # artifact_id is the stored content address, not a newly computed hash.
-        artifacts.setdefault(art.artifact_id, art)
+        # Content deduplication belongs to the blob store, not observation history.
+        artifacts.setdefault((art.artifact_id, art.fetch_run_id), art)
         wanted = {path: value for path, value, _ in financial_items(offer)}
         for path, value, provenance in financial_items(observed_offer):
             if wanted.get(path) != value:
@@ -1107,7 +1109,6 @@ def load_publication_context(
                     scenario_statements=proofs,
                 )
             )
-    verified = tuple(artifacts.values())
     statements = tuple(all_statements)
     view = TrustedView(
         offer,
@@ -1122,7 +1123,8 @@ def load_publication_context(
             approved_parsers=()
             if approval is None or approval.adapter is None
             else (approval.adapter,),
-            known_artifacts=verified,
+            primary_capture_id=None if basis is None else basis.run_id,
+            known_artifacts=tuple(artifacts.values()),
             fetch_runs=runs,
             reobservations=reobservations,
             approved_profile=profile,
@@ -1142,7 +1144,7 @@ def load_publication_context(
 
     if (
         basis is not None
-        and verified
+        and primary is not None
         and profile is not None
         and approval is not None
         and prior is not None
@@ -1165,8 +1167,7 @@ def load_publication_context(
                     when > offer.observed_at
                     and claims
                     and all(
-                        _refresh_allowed(item, verified[0], basis, profile, approval)
-                        for item in claims
+                        _refresh_allowed(item, primary, basis, profile, approval) for item in claims
                     )
                 ):
                     offer = offer.model_copy(
