@@ -7,9 +7,10 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 from sqlalchemy import select
+from sqlalchemy.engine import Connection
 
-from cu_rates.artifact_store import ArtifactNotFoundError
-from cu_rates.contracts.audit import Correction
+from cu_rates.artifact_store import ArtifactNotFoundError, ArtifactStore
+from cu_rates.contracts.audit import Correction, PublishedSnapshot
 from cu_rates.contracts.enums import OfferStatus
 from cu_rates.contracts.evidence import RawArtifact
 from cu_rates.contracts.fingerprints import offer_fingerprints
@@ -24,7 +25,7 @@ from cu_rates.db.schema import slice_snapshot_baselines
 from cu_rates.fetch_policy import FetchRegistry, TermsLedger
 from cu_rates.pipeline.slice import _Clock, _worker, record_fixture_capture, run_fixture
 from cu_rates.pipeline.trusted import insert_reobservation, load_publication_context, publish
-from cu_rates.snapshot import Denylist, SnapshotReader
+from cu_rates.snapshot import Denylist, SnapshotError, SnapshotReader, builder
 from cu_rates.snapshot.builder import SnapshotCandidate, SnapshotPublisher, _public_projection
 
 from .pub2_fixtures import reviewed_fixture
@@ -237,6 +238,39 @@ def test_identical_bodies_publish_with_two_independent_captures(
         newest.fetch_run_id,
         oldest.fetch_run_id,
     }
+
+
+def test_shared_blob_cannot_replace_a_missing_older_capture_record(
+    tmp_path: Path,
+    repeated_capture: tuple[StoredFixture, SnapshotCandidate],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stored, row = repeated_capture
+    primary, earlier = row.context.known_artifacts
+    assert primary.artifact_id == earlier.artifact_id
+    load = builder._load_candidate
+
+    def load_then_remove(
+        conn: Connection,
+        store: ArtifactStore,
+        offer_id: str,
+        manifest: PublishedSnapshot,
+        *,
+        allow_fixture: bool,
+    ) -> SnapshotCandidate:
+        candidate = load(conn, store, offer_id, manifest, allow_fixture=allow_fixture)
+        paths = corroborated_paths(candidate.offer, candidate.context)
+        assert {path.capture_id for path in paths} == {earlier.fetch_run_id, primary.fetch_run_id}
+        store._observation_path(earlier.fetch_run_id, earlier.source_url).unlink()
+        assert store.get_observation(primary.fetch_run_id, primary.source_url) == primary
+        assert store.read(primary)
+        return candidate
+
+    monkeypatch.setattr(builder, "_load_candidate", load_then_remove)
+    publisher = SnapshotPublisher(tmp_path / "public", allow_fixture=True)
+    with pytest.raises(SnapshotError, match="could not verify persisted evidence"):
+        publisher.build(release("bad-pair", row), conn=stored.conn, store=stored.run.store)
+    assert not (publisher.root / "current.json").exists()
 
 
 def test_content_lookup_cannot_guess_or_swap_primary_capture(
