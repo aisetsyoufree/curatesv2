@@ -18,7 +18,7 @@ from cu_rates.adapters.registry import verify_offer_against_stored_bytes
 from cu_rates.artifact_store import ArtifactStore, ArtifactStoreError
 from cu_rates.contracts.audit import PublishedSnapshot, ReviewDecision, snapshot_manifest_sha256
 from cu_rates.contracts.base import ContractModel, Identifier
-from cu_rates.contracts.enums import OfferStatus, ReviewSubject
+from cu_rates.contracts.enums import LoanPurpose, OfferStatus, ReviewSubject
 from cu_rates.contracts.fingerprints import OfferSnapshot, offer_fingerprints
 from cu_rates.contracts.offers import NormalizedOffer
 from cu_rates.contracts.publication import (
@@ -191,6 +191,8 @@ def _public_projection(row: SnapshotCandidate, placement: Placement, reviewed: b
         PublicEvidence(path=path, artifact_id=ref.artifact_id, locator=ref.locator)
         for path, ref in offer.iter_labeled_provenance()
     }
+    # This gate rejects scenario-less paths for stated-purpose offers, while allowing
+    # them for explicit unspecified-purpose mortgages. Do not filter by scenario here.
     paths = corroborated_paths(offer, ctx)
     evidence.update(
         PublicEvidence(path=p.path, artifact_id=p.artifact_id, locator=p.provenance.locator)
@@ -213,7 +215,6 @@ def _public_projection(row: SnapshotCandidate, placement: Placement, reviewed: b
             locator=p.provenance.locator,
         )
         for p in paths
-        if p.scenario_id is not None
     )
     details.update(
         PublicAdmission(
@@ -261,6 +262,8 @@ def _public_projection(row: SnapshotCandidate, placement: Placement, reviewed: b
 
 def _admit(row: SnapshotCandidate, manifest: PublishedSnapshot) -> PublicOffer:
     offer = row.offer
+    if offer.purpose is LoanPurpose.UNSPECIFIED and manifest.schema_version == "1.0":
+        raise SnapshotError("unspecified purpose requires snapshot schema 1.1")
     ctx = PublicationContext.model_validate(
         {
             **row.context.model_dump(),

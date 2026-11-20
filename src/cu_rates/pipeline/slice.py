@@ -219,10 +219,10 @@ _CASES = {
     )
 }
 _OPENED = datetime(2026, 11, 16, 15, 0, tzinfo=UTC)
-_PROFILE_PIN = "3cd971eee40da83da83cb6a8c1c338d24eea333657e90e4f9a2dc75e9f5e313d"
+_PROFILE_PIN = "c045ce34d5596c240b9ae5df11e7128cde8a9d3bb0426be6c0f8cc1b85f68a65"
 _OTHER_PROFILE_PINS = {
-    "worcester-style": "e758f79f9a6ae23391c54d4665e0073ab3337963cff373b74df3028562f3ef69",
-    "stoughton-style": "c1830d4a4254763686cc4208b609d2986321e7066b593e9c43cdcc3647836079",
+    "worcester-style": "88211841eea531df89384019f476bb9b719f23062dda611fc2c0482b1cffbbdd",
+    "stoughton-style": "48edcf571636594780ae209c931b7faf8fbccd338548120359f54832b612bc60",
 }
 _PRODUCT_PIN = "c4473ef511c1c1217d386cd781e0fb5c7a53d357e07ecb5e7645c93c0cbcc53c"
 # Authored offline approval of the one dated fixture; never derived from the fetched body.

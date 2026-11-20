@@ -30,7 +30,7 @@ from cu_rates.web.comparison import (
     SCENARIOS_BY_ID,
     SORT_LABELS,
     FormattedOffer,
-    classify_and_format_offer,
+    format_comparison_offer,
     read_snapshot_offers,
     sort_offers,
 )
@@ -541,7 +541,7 @@ def compare() -> Response:
 
     formatted_offers = []
     for raw in raw_offers:
-        item = classify_and_format_offer(raw, now)
+        item = format_comparison_offer(raw, now)
         if item is not None:
             formatted_offers.append(item)
 
@@ -725,7 +725,7 @@ def sitemap_xml() -> Response:
         now = now.replace(tzinfo=UTC)
 
     _info, raw_offers = read_snapshot_offers(at=now)
-    if any(classify_and_format_offer(raw, now) is not None for raw in raw_offers):
+    if any(format_comparison_offer(raw, now) is not None for raw in raw_offers):
         urls.append(f"{origin}/compare")
 
     # Profiles enter the sitemap only with fresh verified offers; the list needs one profile.

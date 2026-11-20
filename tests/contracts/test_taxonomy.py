@@ -132,6 +132,7 @@ def test_existing_persisted_values_are_unchanged() -> None:
         "purchase",
         "rate_term_refinance",
         "cash_out_refinance",
+        "unspecified",
     }
     assert {m.value for m in SourceRelationshipKind} == {
         "first_party",
@@ -372,8 +373,8 @@ def test_a_proposed_finding_carries_no_review_fields_and_unknown_cannot_be_verif
 
 
 def test_taxonomy_version_is_required_and_checked_and_findings_round_trip() -> None:
-    assert finding().taxonomy_version == TAXONOMY_VERSION == "1.0"
-    for bad in ("2.0", "1.1", "1", "01.0", "x", " 1.0", "1.0 ", "1.0\n", ""):
+    assert finding().taxonomy_version == TAXONOMY_VERSION == "1.1"
+    for bad in ("2.0", "1.2", "1", "01.0", "x", " 1.0", "1.0 ", "1.0\n", ""):
         with pytest.raises(ValidationError, match="taxonomy"):
             finding(taxonomy_version=bad)
     payload = finding().model_dump(mode="json")

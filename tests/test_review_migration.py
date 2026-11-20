@@ -42,7 +42,7 @@ def test_frozen_linear_migration_upgrade_preserves_history(tmp_path: Path) -> No
     with closing(sqlite3.connect(path)) as raw:
         before = {name: _rows(raw, name) for name in s.APPEND_ONLY_TABLES if name != TABLE}
     script = ScriptDirectory.from_config(_config(path))
-    assert script.get_heads() == [REVISION]
+    assert script.get_heads() == ["t040c_unspecified_purpose"]
     revision = script.get_revision(REVISION)
     assert revision is not None and revision.down_revision == PREVIOUS
     source = (VERSIONS_DIR / f"{REVISION}.py").read_text()
@@ -62,7 +62,7 @@ def test_frozen_linear_migration_upgrade_preserves_history(tmp_path: Path) -> No
     downgrade_database(path, PREVIOUS)
     assert current_revision(path) == PREVIOUS
     upgrade_database(path)
-    assert current_revision(path) == REVISION
+    assert current_revision(path) == "t040c_unspecified_purpose"
 
 
 @pytest.mark.parametrize("action", ["update", "delete", "replace"])

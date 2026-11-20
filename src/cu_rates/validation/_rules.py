@@ -28,6 +28,7 @@ from cu_rates.contracts import (
     ScenarioDimension,
     TierBound,
     TierDimension,
+    UnspecifiedMortgageDetails,
     evaluate_scenario_match,
 )
 from cu_rates.contracts.enums import EvidenceKind, PostIntroState
@@ -64,7 +65,7 @@ Problems = list[tuple[str, str]]
 Check = tuple[Iterable[str], Problems]
 
 _CONTEXT_PATHS = {"status", "observed_at", "valid_until", "effective_at", "source_id"}
-_MORTGAGE = PurchaseMortgageDetails | RefinanceMortgageDetails
+_MORTGAGE = PurchaseMortgageDetails | RefinanceMortgageDetails | UnspecifiedMortgageDetails
 _LOCATORS = {
     EvidenceKind.HTML: {"html"},
     EvidenceKind.RENDERED_DOM: {"rendered_dom"},

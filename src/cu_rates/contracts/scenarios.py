@@ -109,8 +109,8 @@ class ComparisonScenario(VersionedModel):
     @model_validator(mode="after")
     def _consistent(self) -> Self:
         if self.family is ProductFamily.MORTGAGE:
-            if self.purpose is None:
-                raise ValueError("mortgage scenarios require a purpose")
+            if self.purpose in {None, LoanPurpose.UNSPECIFIED}:
+                raise ValueError("mortgage scenarios require a stated purpose")
             if self.first_lien_balance is not None or self.cltv is not None:
                 raise ValueError("mortgage scenarios use ltv only, with no separate first lien")
             if self.ltv is None:

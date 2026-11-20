@@ -12,8 +12,11 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
+from html import unescape
+from html.parser import HTMLParser
 from typing import Literal
 from zoneinfo import ZoneInfo
 
@@ -42,6 +45,7 @@ from cu_rates.normalize import FieldState, OfferContext, _family, normalize_offe
 from cu_rates.normalize._values import DateFormat, date_pattern, prose_rule_id
 from cu_rates.pipeline.extract import (
     _SECTION_ID,
+    MAX_BODY_BYTES,
     MAX_SECTIONS,
     ScopedDocument,
     _Node,
@@ -54,7 +58,7 @@ from cu_rates.pipeline.extract import (
     selector_section,
 )
 
-PARSER = ParserVersion(name="static-html", version="1.1.0")
+PARSER = ParserVersion(name="static-html", version="1.2.0")
 Confidence = Literal["high", "medium", "low"]
 
 
@@ -124,24 +128,31 @@ class Row(ConfigurationData):
     offer_id: Identifier
     product_id: Identifier
     comparison_target: CanonicalScenarioId | None = None
-    # The source does not state the scenario assumptions (purpose lock days, loan amount,
-    # credit score...). The row is shown for browsing only: no comparison target, no
-    # assumption statements, never ranked. Unstated stays unstated; nothing is configured
-    # in place of what the page does not say.
+    # The source does not state all scenario assumptions (lock days, loan amount,
+    # credit score...). A target names the dimensions to mark unstated, never source
+    # evidence. Only reviewed unspecified-purpose rows omit it. No scenario.* statements.
     browse_only: bool = False
     fields: tuple[Field, ...]
+    # Explicit reviewed declaration of absence, never a literal source value.
+    allow_unspecified_purpose: bool = False
 
     @model_validator(mode="after")
     def unique_paths(self) -> Row:
         if len({f.path for f in self.fields}) != len(self.fields):
             raise ValueError("duplicate configured field paths")
         if self.browse_only and (
-            self.comparison_target is None
+            (self.comparison_target is None and not self.allow_unspecified_purpose)
             or any(f.path.startswith("scenario.") for f in self.fields)
         ):
             raise ValueError(
-                "a browse-only row declares a comparison target and no assumption statements"
+                "a browse-only row declares a comparison target (unless purpose is explicitly "
+                "unspecified) and no assumption statements"
             )
+        if self.allow_unspecified_purpose and (
+            self.comparison_target is not None
+            or any(f.path == "details.purpose" for f in self.fields)
+        ):
+            raise ValueError("unspecified purpose requires no purpose field or comparison target")
         return self
 
 
@@ -229,9 +240,11 @@ def required_paths(row: Row, candidates: tuple[ExtractedCandidate, ...]) -> set[
     except ValueError:
         mortgage = False  # missing/invalid family is independently a required-field failure
     if mortgage:
-        core |= {"details.purpose", "details.rate_type"}
+        core.add("details.rate_type")
         if not row.browse_only:
             core.add("details.lock_days")
+        if not row.allow_unspecified_purpose:
+            core.add("details.purpose")
     if row.comparison_target is not None:
         from cu_rates.contracts.scenarios import CANONICAL_SCENARIOS, REQUIRED_DIMENSIONS
 
@@ -274,8 +287,48 @@ def offer_context(config: SourceConfiguration, row: Row, observed_at: datetime) 
         institution_charter=config.institution_charter,
         observed_at=observed_at,
         comparison_target=row.comparison_target,
+        allow_unspecified_purpose=row.allow_unspecified_purpose,
         effective_date_format=None if rule is None else rule.format,
         effective_timezone=None if rule is None else rule.timezone,
+    )
+
+
+class _PurposeText(HTMLParser):
+    """Whole-page absence veto, never evidence or a replacement for scoped parsing.
+
+    Collect text across tag boundaries, including inert content. This conservative
+    absence veto is independent of the field reader's visibility/scoping rules.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+
+def _page_mentions_purpose(body: bytes) -> bool:
+    if len(body) > MAX_BODY_BYTES:
+        raise ValueError("HTML body size limit exceeded")
+    # Raw markup includes attributes/comments and is independent of section scoping.
+    decoded = unescape(body.decode("utf-8"))
+    parser = _PurposeText()
+    parser.feed(decoded)
+    parser.close()
+    pattern = r"(?:purchas|re-?fi|cash[\s_-]*out|home[\s_-]*buy|buy|compra|refinanci)"
+    # Check both readings: inline splits must not conceal a word, and adjacent block
+    # elements must not concatenate a purpose with unrelated text and conceal it.
+    return any(
+        re.search(
+            pattern,
+            "".join(
+                c for c in unicodedata.normalize("NFKC", text) if unicodedata.category(c) != "Cf"
+            ),
+            re.IGNORECASE,
+        )
+        is not None
+        for text in (decoded, "".join(parser.parts), " ".join(parser.parts))
     )
 
 
@@ -316,6 +369,14 @@ def extract(
         failures = list(errors)
         candidates: list[ExtractedCandidate] = []
         fragmented = False  # anything not the whole stated cell lowers confidence to medium
+        # Conservative whole-page refusal, including headings, footnotes and link text.
+        # A mention anywhere needs a stated-purpose configuration or human clarification.
+        if row.allow_unspecified_purpose and root is not None:
+            try:
+                if _page_mentions_purpose(body):
+                    failures.append("loan purpose is stated or ambiguous on the page")
+            except (ValueError, UnicodeError) as exc:
+                failures.append(f"cannot verify absent loan purpose: {exc}")
         for rule in row.fields if root is not None else ():
             assert root is not None
             try:

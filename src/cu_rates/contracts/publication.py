@@ -40,6 +40,7 @@ from cu_rates.contracts.enums import (
     EvidenceKind,
     FetchMethod,
     InstitutionStatus,
+    LoanPurpose,
     MatchState,
     OfferStatus,
     PostIntroState,
@@ -77,6 +78,7 @@ from cu_rates.contracts.offers import (
     OfferDetails,
     PurchaseMortgageDetails,
     RefinanceMortgageDetails,
+    UnspecifiedMortgageDetails,
 )
 from cu_rates.contracts.registry import (
     Institution,
@@ -970,7 +972,16 @@ def _path_reasons(
         reasons.add(R.EVIDENCE_PATH_VALUE_MISMATCH)
     if p.product_id != offer.product_id:
         reasons.add(R.EVIDENCE_PATH_PRODUCT_MISMATCH)
-    if (
+    # Absence is valid only for the explicit browse-only mortgage shape. Both paths
+    # must assert no scenario and carry no borrowed canonical assumption claims.
+    unstated_purpose = (
+        offer.purpose is LoanPurpose.UNSPECIFIED
+        and offer.scenario_id is None
+        and not offer.scenario_matches
+        and p.scenario_id is None
+        and not p.scenario_statements
+    )
+    if not unstated_purpose and (
         p.scenario_id is None
         or offer.scenario_id is None
         or p.scenario_id != offer.scenario_id
@@ -1421,7 +1432,9 @@ def _shape_reasons(offer: NormalizedOffer) -> set[ReasonCode]:
     reasons: set[ReasonCode] = set()
     details = offer.details
     if (
-        isinstance(details, PurchaseMortgageDetails | RefinanceMortgageDetails)
+        isinstance(
+            details, PurchaseMortgageDetails | RefinanceMortgageDetails | UnspecifiedMortgageDetails
+        )
         and details.arm is not None
         and not details.arm.is_complete
     ):
@@ -1463,7 +1476,9 @@ def _terms_match_scenario(details: OfferDetails, scenario: ComparisonScenario) -
     Unknown values never match where the scenario depends on them (lock days, lien); an
     unstated optional bound (CLTV cap, amount limits) cannot contradict the scenario.
     """
-    if isinstance(details, PurchaseMortgageDetails | RefinanceMortgageDetails):
+    if isinstance(
+        details, PurchaseMortgageDetails | RefinanceMortgageDetails | UnspecifiedMortgageDetails
+    ):
         return (
             details.rate_type is RateType.FIXED
             and details.term_months == scenario.term_months
@@ -1571,6 +1586,8 @@ def _verified_conditions(offer: NormalizedOffer, ctx: PublicationContext) -> boo
 
 def _placement_reasons(offer: NormalizedOffer, ctx: PublicationContext) -> set[ReasonCode]:
     reasons = _tier_reasons(offer)
+    if offer.purpose is LoanPurpose.UNSPECIFIED:
+        reasons.add(R.SCENARIO_UNSTATED)
     product, details = ctx.product, offer.details
     if isinstance(details, HelocDetails):
         if details.post_intro().state is PostIntroState.INCOMPLETE:

@@ -15,6 +15,7 @@ from sqlalchemy import Engine
 from cu_rates.artifact_store import ArtifactStore
 from cu_rates.contracts import (
     FindingReviewState,
+    LoanPurpose,
     ProductFamily,
     ProductFinding,
     ProductScope,
@@ -807,3 +808,36 @@ def test_a_finding_dated_after_the_audit_time_never_creates_verified_coverage(
     report = audit(alter(registry, "product_findings", observed_at=NOW + timedelta(days=1)))
     assert mortgage_state(report) is not CoverageState.VERIFIED
     assert has(report, Reason.INVALID_RECORD, "product_findings")
+
+
+def test_unspecified_finding_roundtrips_registry_and_requires_both_new_versions(
+    database: tuple[Engine, Path], tmp_path: Path
+) -> None:
+    engine, _ = database
+    seed(engine, tmp_path, finding=False)
+    item = ProductFinding(
+        schema_version="1.1",
+        taxonomy_version="1.1",
+        finding_id="purpose-absent",
+        institution_charter=f.CHARTER,
+        source_id=f.SOURCE_ID,
+        product_id=f.PRODUCT_ID,
+        observed_at=f.T0,
+        label="Source does not state mortgage purpose",
+        scope=ProductScope.IN_SCOPE,
+        family=ProductFamily.MORTGAGE,
+        purposes=(LoanPurpose.UNSPECIFIED,),
+        rate_availability=RateAvailability.PUBLIC_RATE,
+        evidence=(f.provenance(),),
+    )
+    with engine.begin() as conn:
+        insert_finding(conn, item)
+    with engine.connect() as conn:
+        registry = read_registry(conn)
+    assert registry.rows("finding_purposes")[0]["purpose"] == "unspecified"
+    assert not has(audit(registry), Reason.INVALID_RECORD)
+    for version_field in ("schema_version", "taxonomy_version"):
+        assert has(
+            audit(alter(registry, "product_findings", **{version_field: "1.0"})),
+            Reason.INVALID_RECORD,
+        )

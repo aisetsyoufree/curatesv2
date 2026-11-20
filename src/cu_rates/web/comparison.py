@@ -309,6 +309,8 @@ def format_term(offer: PublicOffer) -> str:
 def format_loan_type(offer: PublicOffer) -> str:
     """Format loan type using only verified attributes present in snapshot data."""
     parts: list[str] = []
+    if offer.purpose is LoanPurpose.UNSPECIFIED:
+        parts.append("Loan purpose not stated by the source")
 
     rate_type = offer.details.get("rate_type")
     if rate_type == "fixed":
@@ -339,7 +341,7 @@ def format_loan_type(offer: PublicOffer) -> str:
         parts.append("HELOC")
 
     purpose_str: str | None = None
-    if offer.purpose is not None:
+    if offer.purpose not in {None, LoanPurpose.UNSPECIFIED}:
         if offer.purpose is LoanPurpose.PURCHASE:
             purpose_str = "Purchase"
         elif offer.purpose is LoanPurpose.RATE_TERM_REFINANCE:
@@ -369,6 +371,13 @@ def format_loan_type(offer: PublicOffer) -> str:
     if qualifiers:
         return f"{base} ({', '.join(qualifiers)})"
     return base
+
+
+def format_comparison_offer(offer: PublicOffer, now: datetime) -> FormattedOffer | None:
+    """Shared comparison-page and sitemap eligibility; unspecified stays detail-only."""
+    if offer.purpose is LoanPurpose.UNSPECIFIED:
+        return None
+    return classify_and_format_offer(offer, now)
 
 
 def classify_and_format_offer(offer: PublicOffer, now: datetime) -> FormattedOffer | None:
@@ -423,6 +432,8 @@ def classify_and_format_offer(offer: PublicOffer, now: datetime) -> FormattedOff
         return None
 
     reasons: list[str] = []
+    if offer.purpose is LoanPurpose.UNSPECIFIED:
+        reasons.append("loan purpose not stated by the source")
     if note_rate is None and offer.family is not ProductFamily.HELOC:
         reasons.append("Missing note rate disclosure")
     if offer.placement is Placement.BROWSE_ONLY:
