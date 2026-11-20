@@ -19,6 +19,7 @@ from cu_rates.artifact_store import ArtifactCorruptError, ArtifactStore, Artifac
 from cu_rates.contracts.audit import PublishedSnapshot, ReviewDecision, snapshot_manifest_sha256
 from cu_rates.contracts.base import ContractModel, Identifier
 from cu_rates.contracts.enums import OfferStatus, ReviewSubject
+from cu_rates.contracts.evidence import RawArtifact
 from cu_rates.contracts.fingerprints import OfferSnapshot, offer_fingerprints
 from cu_rates.contracts.offers import NormalizedOffer
 from cu_rates.contracts.publication import (
@@ -267,14 +268,26 @@ def _public_projection(
     )
 
 
-def _recheck_corroboration(
-    store: ArtifactStore, ctx: PublicationContext, paths: tuple[EvidencePath, ...]
+def _recheck_admission_evidence(
+    store: ArtifactStore,
+    ctx: PublicationContext,
+    paths: tuple[EvidencePath, ...],
+    primary_artifacts: tuple[RawArtifact, ...],
 ) -> None:
-    """Re-read each selected observation and body after context and offer validation."""
-    for artifact_id, capture_id in dict.fromkeys((p.artifact_id, p.capture_id) for p in paths):
-        artifact = ctx.artifact_for(artifact_id, capture_id=capture_id)
-        if artifact is None or store.get_observation(capture_id, ctx.source.url) != artifact:
-            raise ArtifactCorruptError("corroborating capture does not match verified metadata")
+    """Re-read both T045's direct evidence and the selected corroboration observations."""
+    artifacts = {(item.artifact_id, item.fetch_run_id): item for item in primary_artifacts}
+    for path in paths:
+        key = (path.artifact_id, path.capture_id)
+        if key in artifacts:
+            continue
+        artifact = ctx.artifact_for(path.artifact_id, capture_id=path.capture_id)
+        if artifact is None:
+            raise ArtifactCorruptError("corroborating capture is missing from verified evidence")
+        artifacts[key] = artifact
+    for artifact in artifacts.values():
+        # Render responses can originate at a distinct approved URL in the same fetch.
+        if store.get_observation(artifact.fetch_run_id, artifact.source_url) != artifact:
+            raise ArtifactCorruptError("capture does not match verified metadata")
         store.read(artifact)  # verifies the content address and length
 
 
@@ -317,6 +330,13 @@ def _admit(
         reasons = ", ".join(reason.value for reason in decision.reasons)
         raise SnapshotError(f"publication gate refused offer: {offer.offer_id}: {reasons}")
 
+    # T045 verifies this offer's direct capture, not the other proven
+    # corroboration observations (which may have the same content address).
+    primary_artifacts = tuple(
+        artifact
+        for artifact in ctx.known_artifacts
+        if ctx.artifact_for(artifact.artifact_id) == artifact
+    )
     proof = validate_offer(
         offer.model_copy(update={"status": OfferStatus.CANDIDATE, "published_at": None}),
         ValidationContext(
@@ -324,13 +344,7 @@ def _admit(
             source=ctx.source,
             product=ctx.product,
             fetch_runs=ctx.fetch_runs,
-            # T045 verifies this offer's direct capture, not the other proven
-            # corroboration observations (which may have the same content address).
-            artifacts=tuple(
-                artifact
-                for artifact in ctx.known_artifacts
-                if ctx.artifact_for(artifact.artifact_id) == artifact
-            ),
+            artifacts=primary_artifacts,
             candidates=row.candidates,
         ),
     )
@@ -344,7 +358,7 @@ def _admit(
     placement = decision.placement
     if placement is Placement.RANKED and (decision.degraded or proof.comparison_blockers):
         placement = Placement.BROWSE_ONLY
-    _recheck_corroboration(store, ctx, paths)
+    _recheck_admission_evidence(store, ctx, paths, primary_artifacts)
     return _public_projection(row, placement, reviewed, paths=paths)
 
 

@@ -273,6 +273,78 @@ def test_shared_blob_cannot_replace_a_missing_older_capture_record(
     assert not (publisher.root / "current.json").exists()
 
 
+@pytest.mark.parametrize("removed", ["blob", "observation"])
+def test_primary_must_survive_admission_when_corroboration_uses_older_pair(
+    tmp_path: Path,
+    repeated_capture: tuple[StoredFixture, SnapshotCandidate],
+    monkeypatch: pytest.MonkeyPatch,
+    removed: str,
+) -> None:
+    stored, row = repeated_capture
+    previous, oldest = row.context.known_artifacts
+    profile = row.context.approved_profile
+    assert profile is not None
+    worker_root = stored.run.database.parent
+    registry = FetchRegistry(
+        stored.run.database,
+        TermsLedger(worker_root / "private" / "terms.json"),
+        Denylist(worker_root / "independent" / "withdrawals.json"),
+        automatic=None,
+    )
+    cold_root = tmp_path / "third-worker"
+    cold_root.mkdir()
+    store = stored.run.store
+    worker = _worker(
+        cold_root,
+        store,
+        _Clock(previous.fetched_at + timedelta(hours=3)),
+        store.read(previous) + b"\n",
+        registry,
+    )
+    direct = worker.fetch(row.context.source, profile)
+    assert direct.run is not None and direct.artifact is not None
+    primary = direct.artifact
+    assert primary.artifact_id != previous.artifact_id
+    record_fixture_capture(stored.conn, "athol-style-dated", store, direct.run, primary)
+    row = stored.row(now=direct.run.finished_at + timedelta(minutes=1))
+    assert row.context.primary_capture_id == primary.fetch_run_id
+    assert len(row.context.known_artifacts) == 3
+    pair = {path.capture_id for path in corroborated_paths(row.offer, row.context)}
+    assert pair == {previous.fetch_run_id, oldest.fetch_run_id}
+
+    publisher = SnapshotPublisher(tmp_path / "public", allow_fixture=True)
+    publisher.build(release("intact-primary", row), conn=stored.conn, store=store)
+    load = builder._load_candidate
+
+    def load_then_remove_primary(
+        conn: Connection,
+        store: ArtifactStore,
+        offer_id: str,
+        manifest: PublishedSnapshot,
+        *,
+        allow_fixture: bool,
+    ) -> SnapshotCandidate:
+        candidate = load(conn, store, offer_id, manifest, allow_fixture=allow_fixture)
+        assert candidate.context.primary_capture_id == primary.fetch_run_id
+        if removed == "blob":
+            store._blob_path(primary.artifact_id).unlink()
+        else:
+            store._observation_path(primary.fetch_run_id, primary.source_url).unlink()
+        for earlier in (previous, oldest):
+            assert store.get_observation(earlier.fetch_run_id, earlier.source_url) == earlier
+            assert store.read(earlier)
+        return candidate
+
+    monkeypatch.setattr(builder, "_load_candidate", load_then_remove_primary)
+    with pytest.raises(SnapshotError, match="could not verify persisted evidence"):
+        publisher.build(
+            release("missing-primary", row, supersedes="intact-primary"),
+            conn=stored.conn,
+            store=store,
+        )
+    assert not (publisher.root / "versions" / "missing-primary").exists()
+
+
 def test_content_lookup_cannot_guess_or_swap_primary_capture(
     repeated_capture: tuple[StoredFixture, SnapshotCandidate],
 ) -> None:
