@@ -1361,6 +1361,146 @@ def test_install_script_rejects_unsafe_roots_and_symlinks(tmp_path: Path) -> Non
     assert "path traversal" in res_trav.stderr.lower()
 
 
+def _real_tmp(tmp_path: Path) -> Path:
+    """Resolve platform temp aliases (macOS /var -> /private/var) so only test-made links count."""
+    return tmp_path.resolve()
+
+
+def _dry_run_install(root: str) -> subprocess.CompletedProcess[str]:
+    """Run install.sh in dry-run mode only (never --apply) against an isolated root."""
+    return subprocess.run(
+        ["bash", str(DEPLOY_DIR / "install.sh"), "--dry-run"],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "CU_RATES_ROOT": root},
+        check=False,
+    )
+
+
+def _assert_rejected_before_any_action(
+    res: subprocess.CompletedProcess[str], expected: str
+) -> None:
+    assert res.returncode != 0, f"install.sh accepted an unsafe path: {res.stdout}"
+    assert expected in res.stderr.lower(), res.stderr
+    assert "[DRY-RUN]" not in res.stdout, "validation must fail before any planned operation"
+    assert "Directory '" not in res.stdout
+
+
+def test_install_rejects_symlinked_ancestors(tmp_path: Path) -> None:
+    """#101d: a target beneath a symlinked parent must not resolve outside the storage."""
+    base = _real_tmp(tmp_path)
+    outside = base / "outside"
+    (outside / "nested").mkdir(parents=True)
+
+    direct_link = base / "link-parent"
+    direct_link.symlink_to(outside, target_is_directory=True)
+    res = _dry_run_install(str(direct_link / "cu-rates"))
+    _assert_rejected_before_any_action(res, "symlink")
+
+    # A symlink higher up the chain is also rejected, not only the immediate parent.
+    res_deep = _dry_run_install(str(direct_link / "nested" / "cu-rates"))
+    _assert_rejected_before_any_action(res_deep, "symlink")
+
+    # A dangling symlink ancestor (mkdir -p would follow it) is rejected too.
+    dangling = base / "dangling-parent"
+    dangling.symlink_to(base / "does-not-exist", target_is_directory=True)
+    res_dangling = _dry_run_install(str(dangling / "cu-rates"))
+    _assert_rejected_before_any_action(res_dangling, "symlink")
+
+    assert not (outside / "cu-rates").exists()
+    assert not (outside / "nested" / "cu-rates").exists()
+    assert not (base / "does-not-exist").exists()
+
+
+def test_install_rejects_non_directory_ancestor(tmp_path: Path) -> None:
+    """#101d: an ancestor that exists but is a regular file is rejected."""
+    base = _real_tmp(tmp_path)
+    plain_file = base / "plain-file"
+    plain_file.write_text("placeholder", encoding="utf-8")
+    res = _dry_run_install(str(plain_file / "cu-rates"))
+    _assert_rejected_before_any_action(res, "not a directory")
+
+
+def test_install_rejects_group_or_world_writable_ancestor(tmp_path: Path) -> None:
+    """#101d: another user able to rewrite an ancestor could swap it for a symlink."""
+    base = _real_tmp(tmp_path)
+    for name, mode in (("world-writable", 0o777), ("group-writable", 0o775)):
+        parent = base / name
+        parent.mkdir()
+        parent.chmod(mode)
+        res = _dry_run_install(str(parent / "inner" / "cu-rates"))
+        _assert_rejected_before_any_action(res, "writable by group or others")
+
+
+def test_install_sticky_shared_ancestor_requires_existing_owned_component(tmp_path: Path) -> None:
+    """#101d: under a sticky shared dir (like /tmp) the next component must already exist."""
+    base = _real_tmp(tmp_path)
+    shared = base / "shared"
+    shared.mkdir()
+    shared.chmod(0o1777)
+
+    res_missing = _dry_run_install(str(shared / "missing" / "cu-rates"))
+    _assert_rejected_before_any_action(res_missing, "shared writable directory")
+    res_terminal = _dry_run_install(str(shared / "cu-rates"))
+    _assert_rejected_before_any_action(res_terminal, "shared writable directory")
+    assert not (shared / "missing").exists()
+    assert not (shared / "cu-rates").exists()
+
+    owned = shared / "owned"
+    owned.mkdir()
+    owned.chmod(0o755)
+    res_ok = _dry_run_install(str(owned / "cu-rates"))
+    assert res_ok.returncode == 0, res_ok.stderr
+    assert not (owned / "cu-rates").exists()
+
+
+def test_install_rejects_unnormalized_paths(tmp_path: Path) -> None:
+    """#101d: repeated, trailing, or '.' components are rejected rather than reinterpreted."""
+    base = _real_tmp(tmp_path)
+    (base / "real").mkdir()
+    for root in (
+        f"{base}//real/cu-rates",
+        f"{base}/real/cu-rates/",
+        f"{base}/./real/cu-rates",
+        f"{base}/real/cu-rates/.",
+    ):
+        res = _dry_run_install(root)
+        _assert_rejected_before_any_action(res, "normalized")
+
+
+def test_install_accepts_real_ancestors_in_dry_run(tmp_path: Path) -> None:
+    """Positive control: real directories, existing or not yet created, still dry-run cleanly."""
+    base = _real_tmp(tmp_path)
+    existing = base / "a" / "b"
+    existing.mkdir(parents=True)
+    for root in (existing / "cu-rates", base / "x" / "y" / "cu-rates"):
+        res = _dry_run_install(str(root))
+        assert res.returncode == 0, res.stderr
+        assert "[DRY-RUN]" in res.stdout
+        assert not root.exists()
+    assert not (base / "x").exists()
+
+
+def test_install_documented_default_root_passes_ancestor_checks() -> None:
+    """The documented Linux default /var/lib/cu-rates is accepted when /var/lib is a real dir."""
+    var, var_lib = Path("/var"), Path("/var/lib")
+    if var.is_symlink() or var_lib.is_symlink() or not var_lib.is_dir():
+        pytest.skip("host /var or /var/lib is not a real directory (for example macOS)")
+    if Path("/var/lib/cu-rates").exists():
+        pytest.skip("host already has /var/lib/cu-rates; not touching a real installation")
+    env = {k: v for k, v in os.environ.items() if k != "CU_RATES_ROOT"}
+    res = subprocess.run(
+        ["bash", str(DEPLOY_DIR / "install.sh"), "--dry-run"],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert res.returncode == 0, res.stderr
+    assert "Target root: /var/lib/cu-rates" in res.stdout
+    assert "[DRY-RUN]" in res.stdout
+
+
 def test_ops_systemd_units_exist_and_hardened() -> None:
     """Verify backup, health, and quality service units exist and enforce strict hardening."""
     ops_services = [
