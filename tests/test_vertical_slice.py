@@ -1,5 +1,6 @@
 """T014 integration checks over stored, synthetic offline evidence."""
 
+import gc
 from datetime import timedelta
 from decimal import Decimal
 from hashlib import sha256
@@ -48,6 +49,7 @@ from cu_rates.pipeline.slice import (
     PRODUCT_ID,
     REVIEWER,
     SOURCE_ID,
+    FixtureWorkspaceError,
     SliceRun,
     claim_text,
     classify_fixture,
@@ -150,6 +152,109 @@ def _later_200(
             )
         record_fixture_capture(conn, _DATED, run.store, fresh, artifact)
     return fresh, artifact
+
+
+def _tree(root: Path) -> dict[str, tuple[bytes | None, int]]:
+    """Every entry's bytes and mtime, so a refused run provably wrote nothing."""
+    return {
+        p.relative_to(root).as_posix(): (
+            None if p.is_dir() else p.read_bytes(),
+            p.lstat().st_mtime_ns,
+        )
+        for p in root.rglob("*")
+    }
+
+
+def _symlink(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("this platform or account cannot create symlinks")
+
+
+@pytest.mark.parametrize(
+    "seeded",
+    [
+        {"operational.sqlite": b"fictional prior database bytes"},
+        {"operational.sqlite-wal": b"fictional"},
+        {"evidence/fictional.txt": b"fictional evidence"},
+        {".hidden": b""},
+        {"empty-subfolder/": b""},
+    ],
+)
+def test_nonempty_workspace_is_refused_before_any_write(
+    tmp_path: Path, seeded: dict[str, bytes]
+) -> None:
+    root = tmp_path / "used"
+    root.mkdir()
+    for name, content in seeded.items():
+        path = root / name
+        if name.endswith("/"):
+            path.mkdir()
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+    before = _tree(tmp_path)
+    with pytest.raises(FixtureWorkspaceError, match="not empty"):
+        run_fixture(root)
+    assert _tree(tmp_path) == before
+
+
+def test_completed_workspace_cannot_be_reused(tmp_path: Path) -> None:
+    root = tmp_path / "once"
+    run_fixture(root, "athol-style")
+    gc.collect()  # close the finished run's engine so SQLite cannot checkpoint mid-comparison
+    before = _tree(tmp_path)
+    assert "once/operational.sqlite" in before
+    with pytest.raises(FixtureWorkspaceError, match="not empty"):
+        run_fixture(root)
+    assert _tree(tmp_path) == before
+
+
+def test_symlinked_workspace_or_ancestor_is_refused(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    _symlink(link, real)
+    before = _tree(real)
+    with pytest.raises(FixtureWorkspaceError, match="aliased"):
+        run_fixture(link)
+    with pytest.raises(FixtureWorkspaceError, match="aliased"):
+        run_fixture(link / "new")
+    assert _tree(real) == before == {}
+
+
+def test_dangling_symlink_workspace_is_refused(tmp_path: Path) -> None:
+    missing = tmp_path / "missing"
+    link = tmp_path / "dangling"
+    _symlink(link, missing)
+    with pytest.raises(FixtureWorkspaceError):
+        run_fixture(link)
+    assert not missing.exists()
+    assert link.is_symlink()
+
+
+def test_file_or_missing_parent_workspace_is_refused(tmp_path: Path) -> None:
+    file = tmp_path / "not-a-folder"
+    file.write_bytes(b"fictional")
+    before = _tree(tmp_path)
+    with pytest.raises(FixtureWorkspaceError, match="not a directory"):
+        run_fixture(file)
+    with pytest.raises(FixtureWorkspaceError, match="parent does not exist"):
+        run_fixture(tmp_path / "absent" / "child")
+    with pytest.raises(KeyError):
+        run_fixture(tmp_path / "unknown-case", "no-such-case")
+    assert _tree(tmp_path) == before
+
+
+def test_fresh_disposable_workspaces_still_run(tmp_path: Path) -> None:
+    existing = tmp_path / "empty"
+    existing.mkdir()
+    for root in (existing, tmp_path / "new"):
+        run = run_fixture(root, "athol-style")
+        assert run.database == root / "operational.sqlite"
+        assert run.database.is_file() and _THIRTY in run.offers
+        assert _count_snapshots(run) == 0
 
 
 def test_dated_review_then_verified_304_rank_only_30y(tmp_path: Path) -> None:

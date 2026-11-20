@@ -15,7 +15,11 @@
       {% endif %}
     </dl>
     {% if not institution.has_verified %}
+    {% if institution.has_detail_only %}
+    <p role="status">There are no fresh verified offers for this credit union that are eligible for comparison. Rates below marked APR not published appear only on this page and are never ranked or compared.</p>
+    {% else %}
     <p role="status">There are no fresh verified offers for this credit union, so nothing is presented as a current rate. Coverage below is unknown.</p>
+    {% endif %}
     {% endif %}
   </section>
 
@@ -41,7 +45,14 @@
               <ul>
                 {% for offer in row.offers %}
                 <li>
-                  {{ offer.loan_type_display }}: note rate {{ offer.note_rate_display }}, APR {{ offer.apr_display }}, points {{ offer.points_display }}, term {{ offer.term_display }}.
+                  {{ offer.loan_type_display }}: note rate {{ offer.note_rate_display }}, {% if offer.detail_only %}{{ offer.apr_display }}{% else %}APR {{ offer.apr_display }}{% endif %}, points {{ offer.points_display }}, term {{ offer.term_display }}.
+                  {# "None published" is the comparison formatter's empty sentinel: absence of a
+                      recorded condition is unknown, never a claim that no conditions apply. #}
+                  {% if offer.conditions_display == "None published" %}
+                  Conditions: none recorded in the verified snapshot; this does not mean none apply.
+                  {% else %}
+                  Conditions: {{ offer.conditions_display }}.
+                  {% endif %}
                   Observed {{ offer.freshness_display }}.
                   {% if offer.separation_reason %}Not comparable: {{ offer.separation_reason }}.{% endif %}
                   <a href="{{ offer.source_url }}" class="source-link" rel="nofollow noopener noreferrer" target="_blank" aria-label="Source reference for {{ institution.name }} {{ row.label }}">Source</a>

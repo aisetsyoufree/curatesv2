@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import stat
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -617,12 +619,56 @@ def record_fixture_capture(
     return offers, tuple(findings)
 
 
+class FixtureWorkspaceError(ValueError):
+    """The fixture root is not a fresh, unaliased, disposable directory."""
+
+
+def _claim_fixture_workspace(root: Path) -> Path:
+    """Fail closed, before any write, unless ``root`` is a new or empty real directory.
+
+    Accepted: a nonexistent child of an existing directory (created here, without parents), or
+    an existing empty directory. Rejected: any symlink or junction in the path, a non-directory,
+    any existing entry (including hidden files or prior operational state), or a missing parent.
+    These are path checks only: they cannot detect bind mounts, hard links, or a directory that
+    another process populates after the check.
+    """
+    lexical = Path(os.path.abspath(root))
+    try:
+        resolved = lexical.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise FixtureWorkspaceError("fixture workspace path cannot be resolved") from exc
+    if os.path.normcase(resolved) != os.path.normcase(lexical):
+        raise FixtureWorkspaceError("fixture workspace path is aliased through a link")
+    try:
+        status = os.lstat(lexical)
+    except FileNotFoundError:
+        if not lexical.parent.is_dir():
+            raise FixtureWorkspaceError("fixture workspace parent does not exist") from None
+        try:
+            lexical.mkdir()
+        except FileExistsError as exc:
+            raise FixtureWorkspaceError("fixture workspace appeared concurrently") from exc
+        return lexical
+    if stat.S_ISLNK(status.st_mode) or lexical.is_junction():
+        raise FixtureWorkspaceError("fixture workspace is a link")
+    if not stat.S_ISDIR(status.st_mode):
+        raise FixtureWorkspaceError("fixture workspace is not a directory")
+    with os.scandir(lexical) as entries:
+        if next(entries, None) is not None:
+            raise FixtureWorkspaceError("fixture workspace is not empty")
+    return lexical
+
+
 def run_fixture(
     root: Path, case_id: str = "athol-style-dated", *, body: bytes | None = None
 ) -> SliceRun:
-    """Run the offline smoke test; unknown or altered captures cannot self-approve."""
+    """Run the offline smoke test; unknown or altered captures cannot self-approve.
+
+    ``root`` must be a disposable workspace: a new child of an existing directory or an existing
+    empty directory, with no links in its path. Anything else is refused before any write.
+    """
     identity = _CASES[case_id]
-    root.mkdir(parents=True, exist_ok=True)
+    root = _claim_fixture_workspace(root)
     database = root / "operational.sqlite"
     upgrade_database(database)
     store = ArtifactStore(root / "evidence")

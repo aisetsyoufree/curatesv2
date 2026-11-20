@@ -183,6 +183,26 @@ class FormattedOffer:
     repayment_period_months: int | None = None
     structure_label: str = ""
     intro_rate_display: str = ""
+    # D-05: a note rate without APR, projected only for its institution's own profile.
+    # Such a row is never comparable and is never produced by classify_and_format_offer.
+    detail_only: bool = False
+
+
+DETAIL_ONLY_APR_LABEL = "APR not published"
+DETAIL_ONLY_REASON = (
+    "APR not published, so this rate is shown only on this institution page "
+    "and is excluded from rankings and comparisons"
+)
+
+
+@dataclass(frozen=True)
+class _OfferRates:
+    note_rate: Decimal | None
+    apr: Decimal | None
+    draw_period: int | None
+    repay_period: int | None
+    structure_label: str
+    intro_label: str
 
 
 def exact_decimal(value: Decimal, minimum_places: int = 3) -> str:
@@ -371,16 +391,12 @@ def format_loan_type(offer: PublicOffer) -> str:
     return base
 
 
-def classify_and_format_offer(offer: PublicOffer, now: datetime) -> FormattedOffer | None:
-    """Return a formatted offer projection or None if stale/withdrawn/denylisted/detail-only."""
-    if (
-        offer.placement is Placement.INSTITUTION_DETAIL_ONLY
-        or offer.placement is Placement.NONE
-        or now >= offer.valid_until
-        or now - offer.observed_at > WITHDRAW_AFTER
-    ):
-        return None
+def _expired(offer: PublicOffer, now: datetime) -> bool:
+    """Independent read-time expiry and 96-hour withdrawal, regardless of placement."""
+    return now >= offer.valid_until or now - offer.observed_at > WITHDRAW_AFTER
 
+
+def _offer_rates(offer: PublicOffer) -> _OfferRates:
     rates_by_path = {r.path: r.value for r in offer.rates}
     note_rate = rates_by_path.get("note_rate")
     apr = rates_by_path.get("apr")
@@ -418,11 +434,56 @@ def classify_and_format_offer(offer: PublicOffer, now: datetime) -> FormattedOff
             else:
                 intro_label = f"Intro: {exact_decimal(intro_rate)}% (duration not published)"
 
-    # Decision D-05: Rate without APR is excluded from comparison tables entirely
-    if apr is None:
+    return _OfferRates(note_rate, apr, draw_period, repay_period, structure_label, intro_label)
+
+
+def classify_and_format_offer(offer: PublicOffer, now: datetime) -> FormattedOffer | None:
+    """Return a formatted offer projection or None if stale/withdrawn/denylisted/detail-only.
+
+    This is the comparison projection (compare page, sitemap compare predicate, profile
+    comparable rows). Detail-only offers never pass here; see format_institution_detail_offer.
+    """
+    if (
+        offer.placement is Placement.INSTITUTION_DETAIL_ONLY
+        or offer.placement is Placement.NONE
+        or _expired(offer, now)
+    ):
         return None
+    rates = _offer_rates(offer)
+    # Decision D-05: Rate without APR is excluded from comparison tables entirely
+    if rates.apr is None:
+        return None
+    return _project(offer, now, rates, detail_only=False)
+
+
+def format_institution_detail_offer(offer: PublicOffer, now: datetime) -> FormattedOffer | None:
+    """Profile-only projection of a verified note-rate-without-APR offer (D-05 / MASTER §4).
+
+    Only for the institution's own profile page; never for rankings, the compare page,
+    headlines, sitemap predicates, or exports. Fails closed (None) unless the offer is
+    INSTITUTION_DETAIL_ONLY, unexpired, within the withdrawal window, has a note rate, and
+    has no APR (any APR here would contradict the gate, so it is not shown at all).
+    """
+    if offer.placement is not Placement.INSTITUTION_DETAIL_ONLY or _expired(offer, now):
+        return None
+    rates = _offer_rates(offer)
+    if rates.apr is not None or rates.note_rate is None:
+        return None
+    return _project(offer, now, rates, detail_only=True)
+
+
+def _project(
+    offer: PublicOffer, now: datetime, rates: _OfferRates, *, detail_only: bool
+) -> FormattedOffer:
+    note_rate = rates.note_rate
+    apr = rates.apr
+    intro_label = rates.intro_label
 
     reasons: list[str] = []
+    if detail_only:
+        reasons.append(DETAIL_ONLY_REASON)
+        if now - offer.observed_at > DEGRADE_AFTER:
+            reasons.append("Degraded freshness (observed over 72 hours ago)")
     if note_rate is None and offer.family is not ProductFamily.HELOC:
         reasons.append("Missing note rate disclosure")
     if offer.placement is Placement.BROWSE_ONLY:
@@ -454,7 +515,7 @@ def classify_and_format_offer(offer: PublicOffer, now: datetime) -> FormattedOff
     if any(a.state is MatchState.CONFLICTS for a in offer.assumptions):
         reasons.append("Borrower requirements conflict with canonical scenario assumptions")
 
-    is_comparable = len(reasons) == 0 and offer.placement is Placement.RANKED
+    is_comparable = not detail_only and len(reasons) == 0 and offer.placement is Placement.RANKED
     separation_reason = "; ".join(reasons) if reasons else ""
 
     if note_rate is not None:
@@ -468,7 +529,10 @@ def classify_and_format_offer(offer: PublicOffer, now: datetime) -> FormattedOff
         note_rate_display = f"Post-intro not published ({intro_label})"
     else:
         note_rate_display = "Not published"
-    apr_display = f"{exact_decimal(apr)}%" if apr is not None else "Not published"
+    if apr is not None:
+        apr_display = f"{exact_decimal(apr)}%"
+    else:
+        apr_display = DETAIL_ONLY_APR_LABEL if detail_only else "Not published"
     points_display = (
         f"{exact_decimal(offer.points)}" if offer.points is not None else "Not published"
     )
@@ -514,10 +578,11 @@ def classify_and_format_offer(offer: PublicOffer, now: datetime) -> FormattedOff
         sort_apr=apr,
         sort_rate=note_rate,
         sort_freshness=offer.observed_at,
-        draw_period_months=draw_period,
-        repayment_period_months=repay_period,
-        structure_label=structure_label,
+        draw_period_months=rates.draw_period,
+        repayment_period_months=rates.repay_period,
+        structure_label=rates.structure_label,
         intro_rate_display=intro_label,
+        detail_only=detail_only,
     )
 
 
