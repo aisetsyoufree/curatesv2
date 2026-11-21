@@ -11,20 +11,21 @@ comparison project.
   [Issues](https://github.com/aisetsyoufree/curatesv2/issues) for all stories and
   execution status.
 
-The pilot uses operator-led, AI-assisted research and extraction, with independent
-checking against saved lender evidence. The website and publication gate do not use a
-runtime model. Model batch intake is planned but not implemented; there is no supported
-way to publish rates from an AI workbook. See `MASTER.md` decision D-23 and the
-[release roadmap](https://github.com/aisetsyoufree/curatesv2/issues/157).
+The planned pilot uses operator-led, AI-assisted research and extraction, with
+independent checking against saved lender evidence. The default branch includes
+the website and a synthetic offline pipeline, not a verified real-lender release.
+Candidate batch intake is tracked in [issue #159](https://github.com/aisetsyoufree/curatesv2/issues/159)
+and is not part of the default branch. The website and publication gate do not
+use a runtime model. AI workbooks are research inputs, not publishable data.
+See `MASTER.md` decision D-23.
 
 ## Authoritative clone and runtime location
 
-The authoritative active clone is `~/Code/cu-rates.org-v2`, a full clone (not a
-`git worktree`) outside iCloud. All integration happens there. The copy in the iCloud
-folder is a checkpoint mirror updated only by the integrator after accepted commits;
-it is not an implementation or runtime location. The `.venv`, caches, databases,
-WAL/SHM files, Playwright caches, and raw artifacts must never live in a
-cloud-synchronized folder.
+Use a full authoritative clone outside cloud-synchronized folders. An iCloud copy
+is optional and never an implementation or runtime location. GitHub holds the
+code and task history; a fresh clone does not recover private databases or
+lender evidence. Keep the `.venv`, caches, databases, WAL/SHM files, Playwright
+caches, and raw artifacts outside cloud-synchronized folders.
 
 ## Bootstrap
 
@@ -32,7 +33,7 @@ Requires [`uv`](https://docs.astral.sh/uv/). It installs the pinned Python 3.12
 (`.python-version`) and the locked dependencies; no global packages are needed.
 
 ```sh
-git clone <repository-url> ~/Code/cu-rates.org-v2
+git clone https://github.com/aisetsyoufree/curatesv2.git ~/Code/cu-rates.org-v2
 cd ~/Code/cu-rates.org-v2
 uv sync --locked
 ```
@@ -85,6 +86,9 @@ uv run ruff format --check .
   [`CONTRIBUTING.md`](CONTRIBUTING.md) describe how work is done.
 - Task status lives only in the GitHub Project and Issues; pull requests and commits hold
   the code and review history.
+- Branches under `archive/` preserve reviewed or unfinished work without merging it.
+  Check the linked issue before resuming an archive. An archive branch is not a release
+  or authorization to deploy, collect, or publish.
 - Security issues: see [`SECURITY.md`](SECURITY.md). Licensing: see [`LICENSE`](LICENSE) and
   `MASTER.md` decision D-06.
 
